@@ -61,6 +61,7 @@ fn cell(temperature: Option<i16>, status: FeatureStatus) -> CellularSnapshot {
 
 fn snapshot(cellular: CellularSnapshot) -> ControllerSnapshot {
     ControllerSnapshot {
+        rates_sampled_at: None,
         module_network_check: None,
         host_network: dji4g_application::HostNetworkSnapshot::default(),
         publication_revision: 7,

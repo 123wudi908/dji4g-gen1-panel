@@ -218,6 +218,8 @@ pub enum CheckResult<T> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControllerSnapshot {
+    /// Timestamp of the actual bound-adapter counter read, not the UI frame or publication.
+    pub rates_sampled_at: Option<SystemTime>,
     pub module_network_check: Option<crate::ModuleNetworkCheckSnapshot>,
     pub host_network: crate::HostNetworkSnapshot,
     pub publication_revision: u64,
@@ -439,6 +441,7 @@ pub struct ReducerState {
     hotspot: HotspotStatus,
     consecutive_public_failures: u8,
     rate_state: Option<RateState>,
+    rates_sampled_at: Option<SystemTime>,
     /// SIM-session counter (research document §4.3): advances only when a card change is proven by
     /// a fingerprint difference while the device epoch stays put. ICCID 不可读（`sim_identity ==
     /// None`）时不做 epoch 推断——保守语义：无法确认连续性时，阶段 C 在 UI 侧按 None 处理旧号码
@@ -501,6 +504,7 @@ impl ReducerState {
             ),
             consecutive_public_failures: 0,
             rate_state: None,
+            rates_sampled_at: None,
             sim_epoch: 0,
             sim_fingerprint: None,
             features: None,
@@ -866,6 +870,7 @@ impl ReducerState {
         now: SystemTime,
     ) -> ControllerSnapshot {
         ControllerSnapshot {
+            rates_sampled_at: self.rates_sampled_at,
             module_network_check: None,
             host_network: crate::HostNetworkSnapshot::default(),
             publication_revision: self.publication_revision,
@@ -1231,6 +1236,7 @@ impl ReducerState {
         );
         self.consecutive_public_failures = 0;
         self.rate_state = None;
+        self.rates_sampled_at = None;
         self.adapter_metrics = None;
         // The device context is gone: cached capability verdicts may no longer apply to whatever
         // is enumerated next and are dropped. SIM continuity fields are deliberately retained so a
@@ -1521,6 +1527,9 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
             if epoch == next.epoch
                 && next.accept_observed(sampled_at, now)
                 && next
+                    .rates_sampled_at
+                    .is_none_or(|last| sampled_at > last || now < last)
+                && next
                     .network
                     .as_ref()
                     .is_some_and(|network| network.adapter_id == adapter_id)
@@ -1537,6 +1546,7 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
                     network.down_bytes_per_sec = down_bytes_per_sec;
                     network.up_bytes_per_sec = up_bytes_per_sec;
                 }
+                next.rates_sampled_at = Some(sampled_at);
                 next.publish_only_change();
             }
         }
@@ -2031,14 +2041,17 @@ impl ReducerState {
                     && rx >= previous.prev_rx
                     && tx >= previous.prev_tx =>
             {
-                let secs = now
+                let nanos = now
                     .duration_since(previous.prev_at)
                     .unwrap_or_default()
-                    .as_secs()
+                    .as_nanos()
                     .max(1);
+                let per_second = |delta: u64| {
+                    (u128::from(delta) * 1_000_000_000 / nanos).min(u128::from(u64::MAX)) as u64
+                };
                 (
-                    Some(rx.saturating_sub(previous.prev_rx) / secs),
-                    Some(tx.saturating_sub(previous.prev_tx) / secs),
+                    Some(per_second(rx - previous.prev_rx)),
+                    Some(per_second(tx - previous.prev_tx)),
                 )
             }
             _ => (None, None),
@@ -2090,14 +2103,29 @@ impl ReducerState {
                     },
                     observed_at,
                 ));
-                let (down_bytes_per_sec, up_bytes_per_sec) = Self::measured_rates(
-                    &mut self.rate_state,
-                    &value.binding.adapter_id,
-                    epoch,
-                    value.rx_bytes,
-                    value.tx_bytes,
-                    observed_at,
-                );
+                // An adapter observation may finish before AT. Preserve a newer rates-only
+                // read instead of rewinding its baseline when the full cycle is applied.
+                let keep_rates = self
+                    .network
+                    .as_ref()
+                    .is_some_and(|network| network.adapter_id == value.binding.adapter_id)
+                    && self
+                        .rates_sampled_at
+                        .is_some_and(|last| last >= observed_at && last <= now);
+                let (down_bytes_per_sec, up_bytes_per_sec) = if keep_rates {
+                    let network = self.network.as_ref().expect("matching adapter");
+                    (network.down_bytes_per_sec, network.up_bytes_per_sec)
+                } else {
+                    self.rates_sampled_at = Some(observed_at);
+                    Self::measured_rates(
+                        &mut self.rate_state,
+                        &value.binding.adapter_id,
+                        epoch,
+                        value.rx_bytes,
+                        value.tx_bytes,
+                        observed_at,
+                    )
+                };
                 self.network = Some(NetworkSnapshot {
                     adapter_id: value.binding.adapter_id,
                     addresses: value.addresses,

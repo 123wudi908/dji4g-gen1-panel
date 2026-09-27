@@ -2063,3 +2063,152 @@ fn stale_wrong_id_and_device_changed_reports_cannot_prepare_repair() {
         assert_eq!(runner.controller().executor_call_count(), 0);
     }
 }
+
+#[test]
+fn rates_preserve_fractional_seconds_and_ignore_late_adapter_baselines() {
+    let epoch = DeviceEpoch(1);
+    let mut state = ReducerState::test_ready(NOW);
+    state = reduce_state(
+        &state,
+        adapter_finished(epoch, RefreshCycleId(1), Some(1000), Some(500), NOW),
+        NOW,
+    );
+    let later = NOW + Duration::from_millis(1500);
+    state = reduce_state(
+        &state,
+        BackendEvent::RatesSampled {
+            adapter_id: "{adapter}".into(),
+            epoch,
+            rx: Some(2500),
+            tx: Some(800),
+            sampled_at: later,
+        },
+        later,
+    );
+    assert_eq!(network_rates(&state), (Some(1000), Some(200)));
+    assert_eq!(state.snapshot().rates_sampled_at, Some(later));
+    // A slow full cycle delivers counters captured before the latest independent read.
+    state = reduce_state(
+        &state,
+        adapter_finished(
+            epoch,
+            RefreshCycleId(2),
+            Some(1500),
+            Some(600),
+            NOW + Duration::from_millis(500),
+        ),
+        later,
+    );
+    assert_eq!(network_rates(&state), (Some(1000), Some(200)));
+    assert_eq!(state.snapshot().rates_sampled_at, Some(later));
+    let next = later + Duration::from_millis(500);
+    state = reduce_state(
+        &state,
+        BackendEvent::RatesSampled {
+            adapter_id: "{adapter}".into(),
+            epoch,
+            rx: Some(3000),
+            tx: Some(900),
+            sampled_at: next,
+        },
+        next,
+    );
+    assert_eq!(network_rates(&state), (Some(1000), Some(200)));
+}
+
+struct GatedRateAt {
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl AtPort for GatedRateAt {
+    fn observe(&self, _: &TargetContext) -> PortFuture<'_, Result<AtObservation, PortError>> {
+        Box::pin(async move {
+            if self.armed.load(Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Ok(AtObservation {
+                availability: AtControlAvailability::Available,
+                cellular: None,
+            })
+        })
+    }
+    fn invalidate(&self, _: DeviceEpoch) {}
+}
+
+#[test]
+fn slow_at_refresh_keeps_real_rate_samples_flowing() {
+    let epoch = DeviceEpoch(1);
+    let clock = Arc::new(FakeClock::new(NOW));
+    let adapter = Arc::new(RateTickAdapter {
+        observation: counted_adapter(epoch, Some(1000), Some(500)),
+        counters: Mutex::new(Some((1000, 500))),
+        reads: AtomicUsize::new(0),
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let at = Arc::new(GatedRateAt {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let controller = Controller::new(
+        ReducerState::new(NOW),
+        Arc::new(FakeActionExecutor::new()),
+        clock.clone(),
+    );
+    let (handle, runner) = ControllerRunner::new(controller);
+    let mut runner = runner.with_ports(MonitorPorts {
+        inventory: Arc::new(StaticInventory {
+            result: Ok(full_inventory(epoch)),
+        }),
+        at: at.clone(),
+        adapter: adapter.clone(),
+        probe: Arc::new(StaticProbe {
+            result: Ok(full_probe(epoch)),
+            calls: AtomicUsize::new(0),
+        }),
+        hotspot: None,
+        sms: None,
+        device_tools: None,
+    });
+    runner.run_one_refresh();
+    at.armed.store(true, Ordering::SeqCst);
+    clock.advance_wall(Duration::from_secs(10));
+    let task = std::thread::spawn(move || {
+        runner.run_one_refresh();
+        runner
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    adapter.set_counters(Some((12000, 2700)));
+    clock.advance_wall(Duration::from_secs(1));
+    let expected = NOW + Duration::from_secs(11);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while handle.subscribe().borrow().rates_sampled_at != Some(expected)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let during = handle.subscribe().borrow();
+    release_tx.send(()).unwrap();
+    let runner = task.join().unwrap();
+    assert_eq!(
+        during.rates_sampled_at,
+        Some(expected),
+        "must publish new counters while AT is still blocked"
+    );
+    assert_eq!(
+        during.app.network.as_ref().unwrap().down_bytes_per_sec,
+        Some(1000)
+    );
+    assert_eq!(
+        runner.controller().snapshot().rates_sampled_at,
+        Some(expected),
+        "late adapter observation cannot replace this baseline"
+    );
+}

@@ -201,6 +201,7 @@ mod capture {
             "single-query" | "single-query-detail" => vec![Screen::ToolsPreset],
             "wireless" => vec![Screen::Wireless],
             "overview" => vec![Screen::Overview],
+            mode if mode.starts_with("rate-") => vec![Screen::Overview],
             mode if mode.starts_with("module-") => vec![Screen::Overview],
             "host-normal-tun"
             | "host-missing-binding"
@@ -1471,7 +1472,53 @@ mod capture {
                         ..Default::default()
                     },
                     |ctx| {
-                        app.render_ui(ctx);
+                        if mode.starts_with("rate-") {
+                            let mut history = dji4g_panel::ui::RateHistory::new();
+                            let base = SystemTime::now() - Duration::from_secs(59);
+                            if mode != "rate-empty" {
+                                for i in 0..60_u64 {
+                                    if mode == "rate-gap" && (32..40).contains(&i) {
+                                        continue;
+                                    }
+                                    let down = (5.5
+                                        + 2.1 * (i as f64 * 0.19).sin()
+                                        + 0.9 * (i as f64 * 0.73).sin())
+                                        * 1048576.0;
+                                    let up = if mode == "rate-burst" && (38..44).contains(&i) {
+                                        12582912.0
+                                    } else {
+                                        1048576.0 * (0.9 + 0.35 * (i as f64 * 0.3).sin())
+                                    };
+                                    let (down, up) = match mode {
+                                        "rate-missing" => (None, None),
+                                        "rate-zero" => (Some(0), Some(0)),
+                                        _ => (Some(down as u64), Some(up as u64)),
+                                    };
+                                    history.push((base + Duration::from_secs(i), down, up));
+                                }
+                            }
+                            let (_, down, up) =
+                                history.last().copied().unwrap_or((base, None, None));
+                            egui::CentralPanel::default()
+                                .frame(
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::WHITE)
+                                        .inner_margin(28.0),
+                                )
+                                .show(ctx, |ui| {
+                                    ui.label("模拟数据 · 速率组件验收");
+                                    ui.add_space(18.0);
+                                    dji4g_panel::ui::render_rate_section(
+                                        ui,
+                                        &history,
+                                        down,
+                                        up,
+                                        dji4g_panel::localization::Language::ZhCn,
+                                    );
+                                });
+                        } else {
+                            app.render_ui(ctx);
+                        }
                     },
                 );
                 for (id, delta) in &frame.textures_delta.set {

@@ -1732,6 +1732,10 @@ impl Controller {
         crate::RefreshCycleId(self.state.current_cycle().0.saturating_add(1))
     }
 
+    pub(crate) fn sampling_clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
     pub(crate) fn now(&self) -> SystemTime {
         self.clock.system_now()
     }

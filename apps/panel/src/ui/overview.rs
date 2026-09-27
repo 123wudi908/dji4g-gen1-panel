@@ -506,7 +506,15 @@ pub(crate) fn render_summary(
     probes: Option<&FeatureProbeView>,
 ) -> Option<crate::app::Page> {
     let mut destination = None;
-    let vm = overview_vm_with_probes(snapshot, language, probes);
+    let mut vm = overview_vm_with_probes(snapshot, language, probes);
+    if !snapshot.rates_sampled_at.is_some_and(|time| {
+        std::time::SystemTime::now()
+            .duration_since(time)
+            .is_ok_and(|age| age <= std::time::Duration::from_secs(3))
+    }) {
+        vm.down_rate = None;
+        vm.up_rate = None;
+    }
     let availability = super::availability_vm(
         &snapshot.app,
         &snapshot.diagnostics,
@@ -579,7 +587,15 @@ pub(crate) fn render(
     probes: Option<&FeatureProbeView>,
 ) -> Option<crate::app::Page> {
     let mut destination = None;
-    let vm = overview_vm_with_probes(snapshot, language, probes);
+    let mut vm = overview_vm_with_probes(snapshot, language, probes);
+    if !snapshot.rates_sampled_at.is_some_and(|time| {
+        std::time::SystemTime::now()
+            .duration_since(time)
+            .is_ok_and(|age| age <= std::time::Duration::from_secs(3))
+    }) {
+        vm.down_rate = None;
+        vm.up_rate = None;
+    }
     let cellular = snapshot.app.cellular.as_ref();
     section_frame(ui, |ui| {
         let tab_id = egui::Id::new("overview-chart-tab");

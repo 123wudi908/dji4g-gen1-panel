@@ -391,6 +391,7 @@ pub struct PanelApp {
     /// Wall clock of the last ring sample, so the chart records exactly one point per second
     /// regardless of how often the snapshot's rates change.
     last_rate_sample_at: Option<SystemTime>,
+    rate_context: (Option<u64>, Option<String>),
     /// Module-temperature trend of the current device (§7.5): one point per published evidence
     /// cycle, cleared when the device epoch changes so two modules are never charted as one line.
     temperature_history: crate::ui::TemperatureHistory,
@@ -675,6 +676,7 @@ impl PanelApp {
             tray_tooltip_last: None,
             rate_history: crate::ui::RateHistory::default(),
             last_rate_sample_at: None,
+            rate_context: Default::default(),
             temperature_history: crate::ui::TemperatureHistory::default(),
             last_temperature_sample: None,
             notifier: AvailabilityNotifier::default(),
@@ -732,6 +734,7 @@ impl PanelApp {
             tray_tooltip_last: None,
             rate_history: crate::ui::RateHistory::default(),
             last_rate_sample_at: None,
+            rate_context: Default::default(),
             temperature_history: crate::ui::TemperatureHistory::default(),
             last_temperature_sample: None,
             notifier: AvailabilityNotifier::default(),
@@ -1163,25 +1166,36 @@ impl PanelApp {
         self.tray_tooltip_last = Some(tooltip);
     }
 
-    /// Feed the overview chart on a fixed one-point-per-second cadence, wall-clock driven: the
-    /// ring holds an honest sample every second even while the link is idle and the snapshot's
-    /// rates never change (the previous change-driven sampling went silent in exactly that case).
-    /// The sample reads the latest applied snapshot, so the ring and the hero numbers can never
-    /// disagree. The first call samples immediately, then one full period apart.
-    pub fn sample_rates_on_cadence(&mut self, now: SystemTime) {
-        let due = self.last_rate_sample_at.is_none_or(|last| {
-            now.duration_since(last)
-                .is_ok_and(|elapsed| elapsed >= crate::ui::RATE_SAMPLE_PERIOD)
-        });
-        if !due {
+    /// Consume each actual counter observation once. Repaint and unrelated publications must
+    /// never turn stale rates into fresh samples. Equal values with new timestamps are valid.
+    pub fn sample_rates_on_cadence(&mut self, _now: SystemTime) {
+        let network = self.snapshot.app.network.as_ref();
+        let context = (
+            self.snapshot.app.device.as_ref().map(|d| d.epoch.0),
+            network.map(|n| n.adapter_id.clone()),
+        );
+        if context != self.rate_context {
+            self.rate_history = crate::ui::RateHistory::default();
+            self.last_rate_sample_at = None;
+            self.rate_context = context;
+        }
+        let Some(sampled_at) = self.snapshot.rates_sampled_at else {
+            return;
+        };
+        if self.last_rate_sample_at == Some(sampled_at) {
             return;
         }
-        self.last_rate_sample_at = Some(now);
-        let network = self.snapshot.app.network.as_ref();
+        if self
+            .last_rate_sample_at
+            .is_some_and(|last| sampled_at < last)
+        {
+            self.rate_history = crate::ui::RateHistory::default();
+        }
+        self.last_rate_sample_at = Some(sampled_at);
         self.rate_history.push((
-            now,
-            network.and_then(|network| network.down_bytes_per_sec),
-            network.and_then(|network| network.up_bytes_per_sec),
+            sampled_at,
+            network.and_then(|n| n.down_bytes_per_sec),
+            network.and_then(|n| n.up_bytes_per_sec),
         ));
     }
 
@@ -2516,20 +2530,29 @@ mod tests {
     }
 
     #[test]
-    fn rate_sampling_records_exactly_one_point_per_second() {
-        // The chart ring is wall-clock driven: the first call samples immediately, then exactly
-        // one point per period — even while the snapshot's rates never change (an idle link must
-        // still fill the chart instead of going silent).
+    fn rate_sampling_does_not_retimestamp_old_snapshot_values() {
         let mut app = panel();
         let start = SystemTime::now();
+        Arc::make_mut(&mut app.snapshot).rates_sampled_at = Some(start);
         app.sample_rates_on_cadence(start);
         assert_eq!(app.rate_history_len(), 1);
-        app.sample_rates_on_cadence(start + Duration::from_millis(900));
-        assert_eq!(app.rate_history_len(), 1, "inside the period adds nothing");
-        app.sample_rates_on_cadence(start + Duration::from_secs(1));
-        assert_eq!(app.rate_history_len(), 2);
-        app.sample_rates_on_cadence(start + Duration::from_secs(2));
-        assert_eq!(app.rate_history_len(), 3);
+        app.sample_rates_on_cadence(start + Duration::from_secs(10));
+        assert_eq!(
+            app.rate_history_len(),
+            1,
+            "old snapshot cannot create new samples"
+        );
+        Arc::make_mut(&mut app.snapshot).rates_sampled_at = Some(start + Duration::from_secs(10));
+        app.sample_rates_on_cadence(start + Duration::from_secs(10));
+        assert_eq!(
+            app.rate_history_len(),
+            2,
+            "same values with a fresh timestamp still count"
+        );
+        assert_eq!(
+            app.rate_history.last().unwrap().0,
+            start + Duration::from_secs(10)
+        );
     }
 
     /// A snapshot with a bound device and one temperature reading, for the trend-sampling tests.

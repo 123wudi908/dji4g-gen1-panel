@@ -448,11 +448,10 @@ impl ControllerRunner {
                 self.refresh_deferred = false;
                 self.run_refresh();
                 self.publish();
-            } else if self.rate_cadence_due() {
-                // Rates-only tick: re-read just the bound adapter's byte counters and republish the
-                // throughput, without running the refresh DAG or advancing evidence freshness. The
-                // refresh branch above takes precedence, and `run_refresh` realigns the rates
-                // baseline, so the two cadences never double-sample in one iteration.
+            }
+            if self.rate_cadence_due() {
+                // An attempted refresh can defer while host work is busy. It must not starve
+                // independent counter sampling; the timestamp guard prevents duplicate ticks.
                 self.run_rate_tick();
                 self.publish();
             }
@@ -1182,6 +1181,7 @@ impl ControllerRunner {
             return;
         };
         let adapter_port = ports.adapter;
+        let clock = self.controller.sampling_clock();
         let receiver = spawn_stage({
             let adapter_id = adapter_id.clone();
             move || {
@@ -1191,22 +1191,23 @@ impl ControllerRunner {
                     || Err(stage_timeout_error()),
                 )
                 .ok();
+                let sampled_at = clock.system_now();
                 let metrics = poll_ready(
                     adapter_port.read_metrics(&adapter_id),
                     RATE_READ_TIMEOUT,
                     || Err(stage_timeout_error()),
                 )
                 .ok();
-                Ok((counters, metrics))
+                Ok((counters, metrics, sampled_at))
             }
         });
         let deadline = Instant::now() + RATE_READ_TIMEOUT;
         // An unreadable counter, a port error, or a watchdog timeout all collapse to `None` values,
         // which the reducer turns into honest `None` rates/metrics — never stale or fabricated
         // numbers.
-        let (counters, metrics) = match join_stage(receiver, deadline) {
+        let (counters, metrics, sampled_at) = match join_stage(receiver, deadline) {
             Some(Ok(sampled)) => sampled,
-            _ => (None, None),
+            _ => (None, None, self.controller.now()),
         };
         let (rx, tx) = counters.map_or((None, None), |(rx, tx)| (Some(rx), Some(tx)));
         self.controller
@@ -1215,14 +1216,14 @@ impl ControllerRunner {
                 epoch,
                 rx,
                 tx,
-                sampled_at: now,
+                sampled_at,
             });
         self.controller
             .apply_backend_event(BackendEvent::AdapterMetricsSampled {
                 adapter_id,
                 epoch,
                 metrics,
-                sampled_at: now,
+                sampled_at,
             });
     }
 
@@ -1640,6 +1641,30 @@ impl ControllerRunner {
         }
     }
 
+    /// Keep bound-interface telemetry alive while waiting for slow diagnostic stages.
+    /// Counter reads are read-only and never use the serial port; events remain runner-ordered.
+    fn join_stage_with_rates<T>(
+        &mut self,
+        receiver: mpsc::Receiver<Result<T, crate::PortError>>,
+        deadline: Instant,
+    ) -> Option<Result<T, crate::PortError>> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining.min(IDLE_POLL_INTERVAL)) {
+                Ok(result) => return Some(result),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if self.rate_cadence_due() {
+                self.run_rate_tick();
+                self.publish();
+            }
+        }
+    }
+
     fn run_refresh(&mut self) {
         if self.controller.interaction_in_flight(self.controller.now())
             || self.controller.host_work_busy()
@@ -1699,7 +1724,7 @@ impl ControllerRunner {
         // Stage 1 — inventory. Sequential by design: it produces the epoch and the target the
         // rest of the cycle depends on, and a missing device ends the cycle early.
         let inventory = stage_check(
-            join_stage(
+            self.join_stage_with_rates(
                 spawn_stage(move || {
                     poll_ready(inventory_port.scan(), stage_timeout, || {
                         Err(stage_timeout_error())
@@ -1771,18 +1796,24 @@ impl ControllerRunner {
         });
         let adapter_receiver = spawn_stage({
             let target = target.clone();
+            let clock = self.controller.sampling_clock();
             move || {
                 poll_ready(adapter_port.resolve(&target), stage_timeout, || {
                     Err(stage_timeout_error())
                 })
+                .map(|value| (value, clock.system_now()))
             }
         });
         let deadline = Instant::now() + self.stage_timeout;
-        let at = stage_check(join_stage(at_receiver, deadline), self.controller.now());
-        let adapter = stage_check(
-            join_stage(adapter_receiver, deadline),
+        let at = stage_check(
+            self.join_stage_with_rates(at_receiver, deadline),
             self.controller.now(),
         );
+        let adapter = match self.join_stage_with_rates(adapter_receiver, deadline) {
+            Some(Ok((value, observed_at))) => CheckResult::Passed { value, observed_at },
+            Some(Err(error)) => stage_check(Some(Err(error)), self.controller.now()),
+            None => stage_check(None, self.controller.now()),
+        };
         self.controller
             .apply_backend_event(BackendEvent::AtFinished {
                 cycle,
@@ -1843,15 +1874,17 @@ impl ControllerRunner {
         let deadline = Instant::now() + self.stage_timeout;
         let probe = match probe_plan {
             StagePlan::Decided(result) => result,
-            StagePlan::Running(receiver) => {
-                stage_check(join_stage(receiver, deadline), self.controller.now())
-            }
+            StagePlan::Running(receiver) => stage_check(
+                self.join_stage_with_rates(receiver, deadline),
+                self.controller.now(),
+            ),
         };
         let hotspot = match hotspot_plan {
             StagePlan::Decided(result) => result,
-            StagePlan::Running(receiver) => {
-                stage_check(join_stage(receiver, deadline), self.controller.now())
-            }
+            StagePlan::Running(receiver) => stage_check(
+                self.join_stage_with_rates(receiver, deadline),
+                self.controller.now(),
+            ),
         };
         self.controller
             .apply_backend_event(BackendEvent::ProbeFinished {

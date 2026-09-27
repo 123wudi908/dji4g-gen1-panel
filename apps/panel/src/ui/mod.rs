@@ -26,6 +26,7 @@ pub mod module_network_check;
 pub mod network_assistance;
 pub mod onboarding;
 pub mod overview;
+mod rate_chart;
 pub mod repairs;
 pub mod settings;
 pub mod sms;
@@ -518,7 +519,7 @@ pub(crate) fn detail_text(text: impl Into<String>) -> RichText {
 /// Presentation-side ring of the measured throughput samples backing the overview chart.
 /// Snapshots are immutable, so the rolling window lives here and only the newest sample ever
 /// enters; `None` samples render as an honest gap.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RateHistory {
     samples: std::collections::VecDeque<(SystemTime, Option<u64>, Option<u64>)>,
     capacity: usize,
@@ -527,10 +528,16 @@ pub struct RateHistory {
 /// Ring capacity: 60 samples at the 1 s cadence cover the last minute of throughput.
 pub(crate) const RATE_HISTORY_CAPACITY: usize = 60;
 
-/// Sampling cadence behind the ring: the panel records one sample per second from the latest
-/// published snapshot for the chart, independent of the slower evidence refresh. The dashboard
-/// derives its 「最近 N」 window label from `capacity × period` instead of hardcoding a duration.
+/// Nominal backend sampling cadence. The UI records actual counter timestamps once each,
+/// rather than repeating the latest publication on every frame. The dashboard derives its
+/// window label from capacity × nominal period.
 pub(crate) const RATE_SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+
+impl Default for RateHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RateHistory {
     #[must_use]
@@ -797,6 +804,7 @@ pub(crate) fn rate_axis(peak_bytes: Option<u64>) -> RateAxis {
 }
 
 /// Highest down or up sample in the ring; `None` while the ring is empty or holds only gaps.
+#[cfg(test)]
 fn rate_history_peak(history: &RateHistory) -> Option<u64> {
     history
         .iter()
@@ -853,7 +861,7 @@ pub fn render_rate_section(
     let width = ui.available_width();
     ui.set_min_width(width);
     ui.set_max_width(width);
-    let peak = rate_history_peak(history);
+    let (down_peak, up_peak) = rate_chart::peaks(history);
     let window = format_age(RATE_SAMPLE_PERIOD * RATE_HISTORY_CAPACITY as u32, language).text;
     let window_text = format_text_in(language, TextKey::RateWindow, &TextArgs::age(window)).text;
     egui::Frame::none()
@@ -890,27 +898,17 @@ pub fn render_rate_section(
                 rate_hero_block(ui, TextKey::RateCaptionUp, "↑", up, UP_COLOR, language);
             });
             ui.add_space(11.0);
-            paint_rate_chart(ui, history, language);
+            rate_chart::paint(ui, history, language);
             ui.add_space(8.0);
-            // Peak caption: 最近 1 分钟峰值 <strong>N KB/s</strong>.
-            if let Some(peak) = peak {
-                let peak_text = format_text_in(
-                    language,
-                    TextKey::RatePeak,
-                    &TextArgs::detail(format_rate_peak(peak)),
-                )
-                .text;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    wrapped_label(
-                        ui,
-                        RichText::new(window_text)
-                            .size(scale::RATE_AUX)
-                            .color(scale::SECONDARY),
-                    );
-                    wrapped_label(ui, RichText::new(peak_text).size(scale::RATE_AUX).strong());
-                });
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 24.0;
+                for (caption, value) in [("下载峰值", down_peak), ("上传峰值", up_peak)] {
+                    let value = value
+                        .map(format_rate_peak)
+                        .unwrap_or_else(|| "未获取".into());
+                    ui.label(detail_text(format!("{caption}  {value}")));
+                }
+            });
         })
         .response
 }
@@ -987,133 +985,6 @@ fn rate_hero_block(
     let galley = ui.painter().layout_job(job);
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     ui.painter().galley(rect.min, galley, scale::INK);
-}
-
-/// Hand-rolled dual-series line chart matching the reference's ECharts options: white plot,
-/// adaptive y-scale (visible peak plus 8%, with four labelled grid intervals), a −60s…现在 x-scale with
-/// a label every 15 seconds, download as a solid 2px blue line, upload as a dashed 1.8px orange
-/// line, no fill, no animation, no symbols. `None` samples stay honest gaps; a partially filled
-/// ring right-anchors its samples against 现在.
-fn paint_rate_chart(ui: &mut Ui, history: &RateHistory, language: Language) {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(
-        egui::Vec2::new(width, RATE_CHART_HEIGHT),
-        egui::Sense::hover(),
-    );
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::WHITE);
-
-    // The axis follows the window's own peak, so a fast 4G window is never clipped by the old
-    // fixed 160 KB/s ceiling while quiet windows keep the reference's compact scale.
-    let axis = rate_axis(rate_history_peak(history));
-
-    // Plot insets leave room for the y labels (left), the x labels (bottom) and the unit name.
-    let plot = egui::Rect::from_min_max(
-        egui::Pos2::new(rect.left() + 42.0, rect.top() + 8.0),
-        egui::Pos2::new(rect.right() - 8.0, rect.bottom() - 22.0),
-    );
-    let y_of = |value: f32| plot.bottom() - (value / axis.max_bytes) * plot.height();
-
-    // Horizontal gridlines and y labels at the axis's own intervals, zero baseline in the darker
-    // axis colour and the tick text in whichever unit the axis selected.
-    for index in 0..=axis.step_count {
-        let y = y_of(axis.step_bytes() * index as f32);
-        let baseline = index == 0;
-        painter.line_segment(
-            [
-                egui::Pos2::new(plot.left(), y),
-                egui::Pos2::new(plot.right(), y),
-            ],
-            Stroke::new(1.0_f32, if baseline { scale::AXIS } else { scale::GRID }),
-        );
-        painter.text(
-            egui::Pos2::new(plot.left() - 6.0, y),
-            egui::Align2::RIGHT_CENTER,
-            axis.tick_label(index),
-            egui::FontId::proportional(scale::META),
-            scale::AXIS_LABEL,
-        );
-    }
-    // Unit name at the top right of the plot, like the reference's axis name.
-    painter.text(
-        egui::Pos2::new(plot.right(), plot.top()),
-        egui::Align2::RIGHT_TOP,
-        axis.unit,
-        egui::FontId::proportional(scale::META),
-        scale::AXIS_LABEL,
-    );
-    // X labels every 15 seconds: 「N 秒前」 up to 现在. The oldest edge label is skipped so it
-    // never clips at the plot border.
-    for sec in [-45, -30, -15, 0] {
-        let x = plot.right() - ((-sec) as f32 / RATE_CHART_X_SPAN_SECS) * plot.width();
-        let text = if sec == 0 {
-            "现在".to_owned()
-        } else {
-            format!("{} 秒前", -sec)
-        };
-        painter.text(
-            egui::Pos2::new(x, plot.bottom() + 15.0),
-            egui::Align2::CENTER_CENTER,
-            text,
-            egui::FontId::proportional(scale::META),
-            scale::AXIS_LABEL,
-        );
-    }
-
-    let samples: Vec<_> = history.iter().collect();
-    if samples.len() < 2 {
-        painter.text(
-            plot.center(),
-            egui::Align2::CENTER_CENTER,
-            LocalizedText::new(language, TextKey::RateSampling).text,
-            egui::FontId::proportional(scale::RATE_AUX),
-            scale::SECONDARY,
-        );
-        return;
-    }
-
-    // Right-anchored time axis: the newest sample sits on 现在 at the right edge, history grows
-    // leftward at one second per sample, so a partially filled ring reads as live data of the
-    // last N seconds instead of a stub hugging the left.
-    let last = samples.len() - 1;
-    let x_of = |index: usize| {
-        let age = (last - index) as f32;
-        plot.right() - (age / RATE_CHART_X_SPAN_SECS) * plot.width()
-    };
-    let series_painter = painter.with_clip_rect(plot);
-    for (series_index, color, dashed) in [(1_usize, DOWN_COLOR, false), (2_usize, UP_COLOR, true)] {
-        let mut runs: Vec<Vec<egui::Pos2>> = Vec::new();
-        let mut points: Vec<egui::Pos2> = Vec::new();
-        for (index, (_, down, up)) in samples.iter().enumerate() {
-            let value = match series_index {
-                1 => *down,
-                _ => *up,
-            };
-            match value {
-                Some(value) => points.push(egui::Pos2::new(x_of(index), y_of(value as f32))),
-                None if !points.is_empty() => runs.push(std::mem::take(&mut points)),
-                None => {}
-            }
-        }
-        if !points.is_empty() {
-            runs.push(points);
-        }
-        for run in runs {
-            if run.len() >= 2 {
-                if dashed {
-                    // egui 0.29 has no dashed stroke; epaint provides the dashed line shape.
-                    series_painter.add(Shape::dashed_line(
-                        &run,
-                        Stroke::new(1.8_f32, color),
-                        4.0_f32,
-                        3.0_f32,
-                    ));
-                } else {
-                    series_painter.add(Shape::line(run, Stroke::new(2.0_f32, color)));
-                }
-            }
-        }
-    }
 }
 
 /// Hand-rolled compact trend for the measured module temperature: white plot, the window's own

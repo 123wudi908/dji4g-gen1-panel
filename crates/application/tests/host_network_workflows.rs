@@ -143,3 +143,17 @@ fn host_diagnosis_runs_without_a_dji_device_and_repair_requires_ids() {
         HostNetworkPhase::AwaitingRestart
     );
 }
+
+#[test]
+fn repeated_startup_host_checks_coalesce_without_error_feedback() {
+    let mut controller = Controller::for_test(SystemTime::UNIX_EPOCH);
+    controller
+        .handle_command(UiCommand::InspectHostNetwork)
+        .unwrap();
+    assert!(
+        controller
+            .handle_command(UiCommand::InspectHostNetwork)
+            .is_ok()
+    );
+    assert!(controller.snapshot().feedback.is_none());
+}

@@ -1822,7 +1822,9 @@ pub fn stable_code_text(code: &str) -> Option<TextKey> {
         | "app:hotspot_unavailable"
         | "app:stage_missing"
         | "app:target_not_ready" => TextKey::ErrorCapabilityUnavailable,
-        "app:busy" => TextKey::CommandFeedbackBusy,
+        "app:busy" | "host:unavailable_or_busy" | "tool:busy" | "sms:busy" => {
+            TextKey::CommandFeedbackBusy
+        }
         "app:confirm_rejected" => TextKey::CommandFeedbackConfirmRejected,
         "app:unsupported_action" | "app:safety_rejected" => TextKey::ErrorUnsupported,
         "app:plan_expired" => TextKey::PlanExpired,

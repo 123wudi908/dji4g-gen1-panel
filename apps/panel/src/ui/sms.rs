@@ -304,6 +304,16 @@ pub(crate) fn render(
             ui.label(RichText::new("短信").size(28.0).color(scale::INK));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let details_label = if state.refresh_error.is_some() || state.auto_refresh_paused {
+                "读取详情 · 需注意"
+            } else {
+                "读取详情"
+            };
+            ui.menu_button(details_label, |ui| {
+                ui.set_max_width(420.0);
+                render_history_controls(ui, snapshot, sink, state);
+                render_inbox_notes(ui, &vm, snapshot, state);
+            });
             if ui.add(super::theme::primary_button("新建短信")).clicked() {
                 state.open = true;
             }
@@ -318,8 +328,10 @@ pub(crate) fn render(
             }
         });
     });
-    render_history_controls(ui, snapshot, sink, state);
-    ui.add_space(8.0);
+    if snapshot.sms_refresh_pending {
+        render_history_controls(ui, snapshot, sink, state);
+    }
+    ui.add_space(4.0);
     compose::render(ui, state, snapshot, sink);
     if let Some(deletion) = &snapshot.sms_delete {
         render_delete_result(ui, deletion);
@@ -401,7 +413,11 @@ fn render_history_controls(
             }
         });
     }
-    if let Some(report) = &snapshot.sms_read_report {
+    if let Some(report) = snapshot
+        .sms_read_report
+        .as_ref()
+        .filter(|_| !snapshot.sms_refresh_pending)
+    {
         let location = report
             .storage
             .as_ref()
@@ -481,13 +497,11 @@ fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
     });
 }
 
-fn render_inbox(
+fn render_inbox_notes(
     ui: &mut Ui,
     vm: &SmsVm,
     snapshot: &ControllerSnapshot,
-    language: Language,
-    sink: &dyn UiCommandSink,
-    state: &mut SmsComposeState,
+    state: &SmsComposeState,
 ) {
     // Query evidence has its own quiet status strip; sending results remain independent.
     ui.horizontal_wrapped(|ui| {
@@ -544,11 +558,21 @@ fn render_inbox(
                 }
             });
     }
-    ui.add_space(12.0);
+}
+
+fn render_inbox(
+    ui: &mut Ui,
+    vm: &SmsVm,
+    snapshot: &ControllerSnapshot,
+    language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    ui.add_space(4.0);
     egui::Frame::none()
         .fill(egui::Color32::WHITE)
         .rounding(14.0)
-        .inner_margin(18.0)
+        .inner_margin(0.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let incoming = vm
@@ -1506,13 +1530,18 @@ mod tests {
     /// the workspace and the message list really received. Two passes are run so the values from
     /// the first frame (used by egui to size scroll areas) are settled by the second.
     fn measured_heights(width: f32, height: f32) -> (f32, f32) {
-        let snapshot = snapshot(SmsInboxSummary {
+        let mut snapshot = snapshot(SmsInboxSummary {
             message_count: 3,
             unread_count: 1,
             capacity: Some((2, 30)),
             status: FeatureStatus::Supported,
-            has_incomplete: false,
+            has_incomplete: true,
             evicted: 0,
+        });
+        snapshot.sms_read_report = Some(dji4g_domain::SmsReadReport {
+            raw_records: 23,
+            decoded_records: 23,
+            ..Default::default()
         });
         let messages = vec![
             message(1, Some(true), SmsStatus::Received),
@@ -1522,6 +1551,7 @@ mod tests {
         let sink = NoopSink;
         let mut state = SmsComposeState::default();
         let context = egui::Context::default();
+        crate::ui::initialize_visuals(&context);
         for _ in 0..2 {
             let _ = context.run(
                 egui::RawInput {
@@ -1551,6 +1581,12 @@ mod tests {
                 data.get_temp::<f32>(list_viewport_id()).unwrap_or(0.0),
             )
         })
+    }
+
+    #[test]
+    fn material_sms_page_keeps_three_message_rows_with_read_report() {
+        let (_, list) = measured_heights(800.0, 500.0);
+        assert!(list >= 180.0, "usable message viewport is only {list}");
     }
 
     /// The user-visible regression: the list viewport used to be capped, so making the window

@@ -1119,6 +1119,11 @@ impl PanelApp {
             if let Some(feedback) = self.snapshot.feedback.as_ref() {
                 if feedback.seq > self.last_feedback_seq {
                     self.last_feedback_seq = feedback.seq;
+                    crate::logging::append_event(&format!(
+                        "ui_feedback seq={} code={}",
+                        feedback.seq,
+                        feedback.code.stable().as_str()
+                    ));
                     let key = crate::localization::failure_text(&feedback.code, self.language).key;
                     self.show_toast(key);
                 }
@@ -1492,7 +1497,12 @@ impl PanelApp {
                         if self.support_report.busy() {
                             ui.spinner();
                         }
-                        ui.label(&self.support_report.status);
+                        if self.support_report.path.is_some() && !self.support_report.busy() {
+                            ui.label("详细日志已导出")
+                                .on_hover_text(&self.support_report.status);
+                        } else {
+                            ui.label(&self.support_report.status);
+                        }
                         if let Some(path) = &self.support_report.path {
                             if ui.button("打开所在文件夹").clicked() {
                                 if let Err(error) = crate::support_report::open_report_folder(path)

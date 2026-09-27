@@ -799,6 +799,11 @@ impl Controller {
             }
             UiCommand::Refresh => Ok(CommandReceipt::Accepted),
             UiCommand::InspectHostNetwork => {
+                // Startup, network notifications and the user can request the same read.
+                // A check already queued/running satisfies them; it is not an internal error.
+                if self.host_network.phase == crate::HostNetworkPhase::Checking {
+                    return Ok(CommandReceipt::Accepted);
+                }
                 if self.host_work_busy() {
                     return self.reject_host_busy();
                 }

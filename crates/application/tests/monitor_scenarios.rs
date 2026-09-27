@@ -2212,3 +2212,51 @@ fn slow_at_refresh_keeps_real_rate_samples_flowing() {
         "late adapter observation cannot replace this baseline"
     );
 }
+
+#[test]
+fn slow_diagnostics_leave_a_full_interval_for_terminal_results() {
+    struct ClockAdvancingAt(Arc<FakeClock>);
+    impl AtPort for ClockAdvancingAt {
+        fn observe(&self, _: &TargetContext) -> PortFuture<'_, Result<AtObservation, PortError>> {
+            Box::pin(async move {
+                self.0.advance_wall(Duration::from_secs(12));
+                Ok(AtObservation {
+                    availability: AtControlAvailability::Available,
+                    cellular: None,
+                })
+            })
+        }
+        fn invalidate(&self, _: DeviceEpoch) {}
+    }
+    let epoch = DeviceEpoch(1);
+    let clock = Arc::new(FakeClock::new(NOW));
+    let controller = Controller::new(
+        ReducerState::new(NOW),
+        Arc::new(FakeActionExecutor::new()),
+        clock.clone(),
+    );
+    let (_, runner) = ControllerRunner::new(controller);
+    let mut runner = runner.with_ports(MonitorPorts {
+        inventory: Arc::new(StaticInventory {
+            result: Ok(full_inventory(epoch)),
+        }),
+        at: Arc::new(ClockAdvancingAt(clock.clone())),
+        adapter: Arc::new(StaticAdapter {
+            result: Ok(full_adapter(epoch)),
+        }),
+        probe: Arc::new(StaticProbe {
+            result: Ok(full_probe(epoch)),
+            calls: AtomicUsize::new(0),
+        }),
+        hotspot: None,
+        sms: None,
+        device_tools: None,
+    });
+    runner.run_one_refresh();
+    assert!(
+        !runner.poll_monitoring_cadence(),
+        "completed results must not immediately become Running again"
+    );
+    clock.advance_wall(REFRESH_INTERVAL);
+    assert!(runner.poll_monitoring_cadence());
+}

@@ -428,6 +428,7 @@ impl ControllerRunner {
             let signaled = self.refresh.take();
             if signaled
                 && self.host_port.is_some()
+                && !self.controller.host_work_busy()
                 && self
                     .last_host_trigger
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
@@ -1750,6 +1751,8 @@ impl ControllerRunner {
         let Some(device) = snapshot.app.device.as_ref() else {
             self.controller
                 .apply_backend_event(BackendEvent::RefreshFinished { cycle, epoch });
+            // Leave a full observation interval after completion, even when a stage is slow.
+            self.last_refresh_at = Some(self.controller.now());
             return;
         };
         let target = match self.controller.state().target_context().or_else(|| {
@@ -1778,6 +1781,8 @@ impl ControllerRunner {
                     });
                 self.controller
                     .apply_backend_event(BackendEvent::RefreshFinished { cycle, epoch });
+                // Leave a full observation interval after completion, even when a stage is slow.
+                self.last_refresh_at = Some(self.controller.now());
                 return;
             }
         };
@@ -1900,6 +1905,8 @@ impl ControllerRunner {
             });
         self.controller
             .apply_backend_event(BackendEvent::RefreshFinished { cycle, epoch });
+        // Leave a full observation interval after completion, even when a stage is slow.
+        self.last_refresh_at = Some(self.controller.now());
     }
 
     fn publish(&self) {

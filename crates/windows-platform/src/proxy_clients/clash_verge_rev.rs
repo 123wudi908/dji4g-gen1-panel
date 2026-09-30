@@ -24,6 +24,8 @@ const DEFAULT_SCRIPT: &str = "// Define main function (script entry)\n\nfunction
 pub struct ClashError(pub &'static str);
 
 pub struct ClashInspection {
+    /// Whether current runtime evidence is complete; disk inspection alone cannot establish it.
+    pub inspection_complete: bool,
     pub binding: Option<ProxyBinding>,
     pub candidate: Option<RepairCandidate>,
 }
@@ -273,6 +275,7 @@ pub fn inspect_directory(
     }
     let Some((index, alias)) = found.last() else {
         return Ok(ClashInspection {
+            inspection_complete: false,
             binding: None,
             candidate: None,
         });
@@ -298,7 +301,9 @@ pub fn inspect_directory(
         None
     };
     Ok(ClashInspection {
+        inspection_complete: false,
         binding: Some(ProxyBinding {
+            source: dji4g_domain::ProxyBindingSource::ConfigurationOnly,
             client: ProxyClient::ClashVergeRev,
             version: version.map(str::to_owned),
             interface_alias: alias.clone(),
@@ -621,6 +626,40 @@ mod tests {
         assert!(!inspection.binding.unwrap().repairable);
         assert!(inspection.candidate.is_none());
         remove_fixture(&root);
+    }
+
+    #[test]
+
+    fn disk_scripts_and_unknown_versions_never_prove_runtime_bindings() {
+        for script in [
+            "delete config['interface-name'];",
+            "config['interface-name'] = 'other';",
+        ] {
+            for version in [None, Some("unknown"), Some("2.5.5")] {
+                let root = fixture_root();
+                let profiles = root.join("profiles.yaml");
+                let mut content = fs::read_to_string(&profiles).unwrap();
+                content.push_str("  - uid: Script\n    type: script\n    file: custom.js\n");
+                fs::write(&profiles, content).unwrap();
+                fs::write(
+                    root.join("profiles/custom.js"),
+                    format!("function main(config) {{ {script} return config; }}"),
+                )
+                .unwrap();
+                let inspected = inspect_directory(&root, version).unwrap();
+                assert!(!inspected.inspection_complete);
+                assert_eq!(
+                    inspected.binding.unwrap().source,
+                    dji4g_domain::ProxyBindingSource::ConfigurationOnly
+                );
+                assert!(inspected.candidate.is_none());
+                fs::write(root.join("profiles/global.yaml"), "profile: test\n").unwrap();
+                let empty = inspect_directory(&root, version).unwrap();
+                assert!(empty.binding.is_none());
+                assert!(!empty.inspection_complete);
+                remove_fixture(&root);
+            }
+        }
     }
 
     #[test]

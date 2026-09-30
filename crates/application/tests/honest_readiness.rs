@@ -27,7 +27,7 @@ fn settings_event_disables_probe_and_late_success_cannot_restore_green() {
                     route_choices: Vec::new(),
                     epoch: DeviceEpoch(1),
                     adapter_id: "{adapter}".into(),
-                    gateway: dji4g_application::ProbeStageDto::Passed,
+                    bound_route: dji4g_application::ProbeStageDto::Passed,
                     public: dji4g_application::ProbeStageDto::Passed,
                     dns: dji4g_application::ProbeStageDto::Passed,
                     protocol_coverage: Some(dji4g_domain::ProtocolCoverage::AllRequiredFamilies),
@@ -194,7 +194,7 @@ fn disabling_active_probe_immediately_retracts_previous_success() {
     assert_ne!(snapshot.app.availability, Availability::Available);
     assert!(!snapshot.settings.active_probe);
     for id in [
-        DiagnosticCheckId::BoundGateway,
+        DiagnosticCheckId::BoundRoute,
         DiagnosticCheckId::BoundPublic,
         DiagnosticCheckId::BoundDns,
     ] {

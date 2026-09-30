@@ -13,7 +13,7 @@ struct Pending {
     draft: Draft,
     after_id: Option<u64>,
     request_id: Option<u64>,
-    after_feedback: u64,
+    after_send_rejected: u64,
     context_changed: bool,
 }
 
@@ -26,9 +26,16 @@ pub(super) enum ReplyStartResult {
     Busy,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorFocus {
+    Recipient,
+    Body,
+}
+
 #[derive(Default)]
 pub(crate) struct SmsComposeState {
     pub open: bool,
+    editor_focus: Option<EditorFocus>,
     draft: Draft,
     confirmation: Option<Draft>,
     pending: Option<Pending>,
@@ -48,11 +55,30 @@ pub(crate) struct SmsComposeState {
     pub serial_busy: bool,
     reply_recipient: Option<String>,
     pub error: Option<String>,
-    last_feedback: u64,
+    last_send_rejected: u64,
     context: Option<(Option<dji4g_domain::DeviceEpoch>, u64)>,
 }
 
 impl SmsComposeState {
+    /// Observe snapshot updates, including while another page is visible. Durable, send-specific
+    /// rejection evidence survives a feedback notice being replaced before the next UI frame.
+    pub(crate) fn observe_snapshot(&mut self, controller: &dji4g_application::ControllerSnapshot) {
+        self.observe_context((
+            controller.app.device.as_ref().map(|device| device.epoch),
+            controller.sim_epoch,
+        ));
+        self.synchronize(controller.sms_send.as_ref());
+        self.observe_send_rejection(controller.command_state.sms_send_rejected_seq);
+        self.serial_busy = controller.serial_work_busy;
+    }
+
+    pub(super) fn open_editor(&mut self) {
+        if !self.open {
+            self.editor_focus = Some(EditorFocus::Recipient);
+        }
+        self.open = true;
+    }
+
     pub(super) fn begin_reply(&mut self, recipient: &str) -> ReplyStartResult {
         if self.serial_busy || self.pending.is_some() || self.confirmation.is_some() {
             self.error = Some("当前任务或发送确认尚未结束，草稿已保留。".into());
@@ -73,6 +99,7 @@ impl SmsComposeState {
                 body: String::new(),
             };
             self.open = true;
+            self.editor_focus = Some(EditorFocus::Body);
             ReplyStartResult::Opened
         }
     }
@@ -87,6 +114,7 @@ impl SmsComposeState {
                 body: String::new(),
             };
             self.open = true;
+            self.editor_focus = Some(EditorFocus::Body);
         }
     }
 
@@ -110,6 +138,14 @@ impl SmsComposeState {
     pub(crate) fn review_editor(&mut self) {
         self.review_confirmation();
         self.confirmation = None;
+        self.editor_focus = Some(EditorFocus::Recipient);
+    }
+
+    /// Simulated, UI-only queue failure for visual checks; it never dispatches a send.
+    #[cfg(debug_assertions)]
+    pub(crate) fn review_queue_error(&mut self) {
+        self.review_editor();
+        self.error = Some(enqueue_error(UiSendError::QueueFull).to_owned());
     }
 
     pub(super) fn request_refresh(&mut self, now: std::time::Instant, sink: &dyn UiCommandSink) {
@@ -137,7 +173,17 @@ impl SmsComposeState {
             self.last_refresh_attempt = None;
         }
         self.last_visible = Some(now);
-        if self.auto_refresh_paused || !available || busy || query_pending || self.pending.is_some()
+        // Background reads share the module's serial channel. Keep that channel free while the
+        // user edits or reviews a draft, so synchronization cannot disable the focused fields.
+        if self.auto_refresh_paused
+            || self.open
+            || self.confirmation.is_some()
+            || self.reply_recipient.is_some()
+            || self.storage_confirmation.is_some()
+            || !available
+            || busy
+            || query_pending
+            || self.pending.is_some()
         {
             return;
         }
@@ -154,6 +200,7 @@ impl SmsComposeState {
 
     fn edited(&mut self) {
         self.confirmation = None;
+        self.error = None;
     }
 
     fn confirm(&mut self, sink: &dyn UiCommandSink, snapshot: Option<&SmsSendSnapshot>) {
@@ -176,7 +223,7 @@ impl SmsComposeState {
                     draft: frozen,
                     after_id: snapshot.map(|s| s.request_id),
                     request_id: None,
-                    after_feedback: self.last_feedback,
+                    after_send_rejected: self.last_send_rejected,
                     context_changed: false,
                 });
             }
@@ -209,6 +256,13 @@ impl SmsComposeState {
     }
 
     fn observe_context(&mut self, context: (Option<dji4g_domain::DeviceEpoch>, u64)) {
+        if self
+            .storage_confirmation
+            .as_ref()
+            .is_some_and(|(epoch, sim, _)| (*epoch, *sim) != context)
+        {
+            self.storage_confirmation = None;
+        }
         if self.context.is_some_and(|old| old != context) {
             self.confirmation = None;
             self.reply_recipient = None;
@@ -221,18 +275,15 @@ impl SmsComposeState {
         self.context = Some(context);
     }
 
-    fn observe_rejection(&mut self, seq: u64, code: &str) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.request_id.is_none() && seq > pending.after_feedback)
-            && code == "sms:busy"
-        {
+    fn observe_send_rejection(&mut self, seq: u64) {
+        if self.pending.as_ref().is_some_and(|pending| {
+            pending.request_id.is_none() && seq > pending.after_send_rejected
+        }) {
             self.pending = None;
             self.error =
                 Some("后台正忙，本条短信未提交。请等待当前任务结束后重试；草稿已保留。".into());
         }
-        self.last_feedback = self.last_feedback.max(seq);
+        self.last_send_rejected = self.last_send_rejected.max(seq);
     }
 }
 
@@ -250,18 +301,10 @@ pub(super) fn render(
     sink: &dyn UiCommandSink,
 ) {
     let snapshot = controller.sms_send.as_ref();
-    state.observe_context((
-        controller.app.device.as_ref().map(|device| device.epoch),
-        controller.sim_epoch,
-    ));
-    state.synchronize(snapshot);
-    if let Some(feedback) = &controller.feedback {
-        state.observe_rejection(feedback.seq, feedback.code.stable.as_str());
-    }
-    state.serial_busy = controller.serial_work_busy;
-    let busy = state.serial_busy
-        || state.pending.is_some()
-        || snapshot.is_some_and(|s| s.phase != SmsSendPhase::Finished);
+    state.observe_snapshot(controller);
+    let sending =
+        state.pending.is_some() || snapshot.is_some_and(|s| s.phase != SmsSendPhase::Finished);
+    let busy = state.serial_busy || sending;
     if let Some(snapshot) = snapshot {
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(0xf3, 0xf5, 0xfc))
@@ -320,7 +363,9 @@ pub(super) fn render(
     } else if state.pending.is_some() {
         ui.label("短信已排队，请勿重复发送");
     }
-    if let Some(error) = &state.error {
+    if !state.open
+        && let Some(error) = &state.error
+    {
         ui.colored_label(super::StatusTone::Negative.color(), error);
     }
     if state.open && state.confirmation.is_none() {
@@ -360,11 +405,12 @@ pub(super) fn render(
                                 ui.label(crate::ui::meta_text("通过当前连接的 4G 模块发送"));
                             });
                         });
-                        ui.add_space(18.0);
+                        ui.add_space(12.0);
                         ui.label(egui::RichText::new("收件人").strong());
                         let recipient = ui.add_enabled(
                             !busy,
                             egui::TextEdit::singleline(&mut state.draft.recipient)
+                                .id(egui::Id::new("sms-compose-recipient"))
                                 .hint_text("+86 手机号码")
                                 .desired_width(f32::INFINITY)
                                 .margin(egui::vec2(12.0, 10.0)),
@@ -372,7 +418,7 @@ pub(super) fn render(
                         ui.label(crate::ui::meta_text(
                             "请输入含国家码的完整号码，例如 +8613800138000",
                         ));
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("短信内容").strong());
                             ui.with_layout(
@@ -388,6 +434,7 @@ pub(super) fn render(
                         let body = ui.add_enabled(
                             !busy,
                             egui::TextEdit::multiline(&mut state.draft.body)
+                                .id(egui::Id::new("sms-compose-body"))
                                 .hint_text("在这里输入短信内容…")
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(4)
@@ -395,6 +442,13 @@ pub(super) fn render(
                         );
                         if recipient.changed() || body.changed() {
                             state.edited();
+                        }
+                        if !busy {
+                            match state.editor_focus.take() {
+                                Some(EditorFocus::Recipient) => recipient.request_focus(),
+                                Some(EditorFocus::Body) => body.request_focus(),
+                                None => {}
+                            }
                         }
                         ui.add_space(10.0);
                         egui::Frame::none()
@@ -410,10 +464,20 @@ pub(super) fn render(
                                 ));
                             });
                     });
+                if let Some(error) = &state.error {
+                    crate::ui::wrapped_label(
+                        ui,
+                        egui::RichText::new(error).color(super::StatusTone::Negative.color()),
+                    );
+                }
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(crate::ui::meta_text(if busy {
+                    ui.label(crate::ui::meta_text(if sending {
                         "正在发送，请等待结果"
+                    } else if busy {
+                        "模块正在处理其他任务，请稍候"
+                    } else if state.error.is_some() {
+                        "草稿已保留"
                     } else if !state.ready() {
                         "填写有效号码和内容后即可继续"
                     } else {
@@ -434,30 +498,38 @@ pub(super) fn render(
                 ui.add_space(6.0);
             });
         state.open = opened;
+        if !opened {
+            state.editor_focus = None;
+        }
     }
     if let Some(frozen) = state.confirmation.clone() {
         let mut open = true;
         egui::Window::new("确认发送短信")
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .auto_sized()
             .default_width(460.0)
             .max_width((ui.ctx().screen_rect().width() - 48.0).min(460.0))
-            .max_height((ui.ctx().screen_rect().height() - 80.0).max(180.0))
-            .vscroll(true)
-            .resizable(false)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label("请核对以下完整号码和正文：");
-                ui.label(egui::RichText::new(&frozen.recipient).strong());
-                ui.separator();
-                ui.add(egui::Label::new(&frozen.body).wrap());
-                ui.separator();
-                ui.add(
-                    egui::Label::new(
-                        "本次发送 1 条短信，可能产生运营商费用。模块接受不代表对方收到。",
-                    )
-                    .wrap(),
-                );
+                // Bound the review text, while keeping both decisions visible below it.
+                egui::ScrollArea::vertical()
+                    .id_salt("sms-confirmation-content")
+                    .max_height((ui.ctx().screen_rect().height() - 180.0).max(64.0))
+                    .auto_shrink([true, true])
+                    .show(ui, |ui| {
+                        ui.label("请核对以下完整号码和正文：");
+                        ui.label(egui::RichText::new(&frozen.recipient).strong());
+                        ui.separator();
+                        ui.add(egui::Label::new(&frozen.body).wrap());
+                        ui.separator();
+                        ui.add(
+                            egui::Label::new(
+                                "本次发送 1 条短信，可能产生运营商费用。模块接受不代表对方收到。",
+                            )
+                            .wrap(),
+                        );
+                    });
                 ui.horizontal_wrapped(|ui| {
                     if crate::ui::components::action_button(
                         ui,
@@ -857,15 +929,13 @@ mod tests {
     }
 
     #[test]
-    fn newer_command_rejection_unlocks_and_keeps_draft() {
+    fn newer_send_rejection_unlocks_and_keeps_draft() {
         let mut s = ready();
-        s.observe_rejection(4, "sms:busy");
+        s.observe_send_rejection(4);
         s.confirm(&Sink(Ok(())), None);
-        s.observe_rejection(4, "sms:busy");
+        s.observe_send_rejection(4);
         assert!(s.pending.is_some());
-        s.observe_rejection(5, "other:failure");
-        assert!(s.pending.is_some());
-        s.observe_rejection(6, "sms:busy");
+        s.observe_send_rejection(5);
         assert!(s.pending.is_none());
         assert_eq!(s.draft.body, "测试");
         assert!(s.error.is_some());
@@ -882,7 +952,7 @@ mod tests {
             failure: None,
         };
         s.synchronize(Some(&active));
-        s.observe_rejection(1, "sms:busy");
+        s.observe_send_rejection(1);
         assert!(s.pending.is_some());
     }
 
@@ -934,6 +1004,7 @@ mod tests {
         let sink = RefreshSink(std::sync::atomic::AtomicUsize::new(0));
         let now = std::time::Instant::now();
         let mut state = ready();
+        state.confirmation = None;
         state.selected = Some([7; 32]);
         let draft = state.draft.clone();
         state.auto_refresh(now, false, false, false, &sink);
@@ -949,5 +1020,377 @@ mod tests {
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(state.draft == draft);
         assert_eq!(state.selected, Some([7; 32]));
+    }
+
+    #[test]
+    fn automatic_refresh_waits_for_editor_and_confirmations_then_resumes_once() {
+        struct RefreshSink(std::sync::atomic::AtomicUsize);
+        impl UiCommandSink for RefreshSink {
+            fn try_send(&self, command: UiCommand) -> Result<(), UiSendError> {
+                assert!(matches!(command, UiCommand::SmsRefresh));
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        for dialog in [
+            "editor",
+            "send confirmation",
+            "replace draft",
+            "storage location",
+        ] {
+            let sink = RefreshSink(std::sync::atomic::AtomicUsize::new(0));
+            let now = std::time::Instant::now();
+            let mut state = ready();
+            let draft = state.draft.clone();
+            state.confirmation = None;
+            match dialog {
+                "editor" => state.open_editor(),
+                "send confirmation" => state.confirmation = Some(state.draft.clone()),
+                "replace draft" => state.reply_recipient = Some("+8613900000000".into()),
+                _ => {
+                    state.storage_confirmation =
+                        Some((None, 0, dji4g_domain::SmsStorageId("SM".into())))
+                }
+            }
+            state.auto_refresh(now, true, false, false, &sink);
+            let later = now + std::time::Duration::from_secs(16);
+            state.auto_refresh(later, true, false, false, &sink);
+            assert_eq!(
+                sink.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{dialog}"
+            );
+            assert!(state.draft == draft);
+
+            state.open = false;
+            state.confirmation = None;
+            state.reply_recipient = None;
+            state.storage_confirmation = None;
+            state.auto_refresh(later, true, false, false, &sink);
+            state.auto_refresh(later, true, false, false, &sink);
+            assert_eq!(
+                sink.0.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{dialog}"
+            );
+            assert!(state.draft == draft);
+        }
+    }
+
+    #[test]
+    fn editor_focus_starts_on_recipient_or_reply_body_and_does_not_repeat() {
+        let snapshot =
+            dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH).snapshot();
+        let context = egui::Context::default();
+        let mut state = SmsComposeState::default();
+        state.open_editor();
+        let render_frame = |state: &mut SmsComposeState| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        render(ui, state, &snapshot, &Sink(Ok(())));
+                    });
+                },
+            );
+        };
+        render_frame(&mut state);
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(egui::Id::new("sms-compose-recipient"))
+        );
+        context.memory_mut(|memory| memory.request_focus(egui::Id::new("sms-compose-body")));
+        render_frame(&mut state);
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(egui::Id::new("sms-compose-body"))
+        );
+
+        state.open = false;
+        assert_eq!(
+            state.begin_reply("+8613800138000"),
+            ReplyStartResult::Opened
+        );
+        render_frame(&mut state);
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(egui::Id::new("sms-compose-body"))
+        );
+        assert!(state.editor_focus.is_none());
+    }
+
+    #[test]
+    fn send_rejection_survives_feedback_clearing_before_any_ui_observation() {
+        let mut controller =
+            dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH);
+        let mut state = ready();
+        state.observe_snapshot(&controller.snapshot());
+        let draft = state.draft.clone();
+        state.confirm(&Sink(Ok(())), None);
+        assert!(state.pending.is_some());
+        controller.set_sms_refresh_pending(true);
+        assert!(
+            controller
+                .handle_command(UiCommand::SmsSend {
+                    recipient: draft.recipient.clone(),
+                    body: draft.body.clone(),
+                })
+                .is_err()
+        );
+        // The watch receiver coalesces both updates: the UI never sees the feedback notice.
+        controller
+            .handle_command(UiCommand::ClearToolHistory)
+            .unwrap();
+        let snapshot = controller.snapshot();
+        assert!(snapshot.feedback.is_none());
+        assert!(snapshot.sms_send.is_none());
+        assert_eq!(snapshot.command_state.sms_send_rejected_seq, 1);
+        state.observe_snapshot(&snapshot);
+        assert!(state.pending.is_none());
+        assert!(state.draft == draft);
+        assert!(
+            state
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("未提交"))
+        );
+        state.observe_snapshot(&snapshot);
+        assert!(state.pending.is_none());
+        assert!(state.draft == draft);
+    }
+
+    #[test]
+    fn a_read_rejection_cannot_unlock_an_unbound_send() {
+        let mut controller =
+            dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH);
+        let mut state = ready();
+        state.observe_snapshot(&controller.snapshot());
+        state.confirm(&Sink(Ok(())), None);
+        controller.set_sms_refresh_pending(true);
+        assert!(
+            controller
+                .handle_command(UiCommand::SmsReadStorage {
+                    storage: dji4g_domain::SmsStorageId("ME".into())
+                })
+                .is_err()
+        );
+        let snapshot = controller.snapshot();
+        assert_eq!(
+            snapshot.feedback.as_ref().unwrap().code.stable.as_str(),
+            "sms:busy"
+        );
+        assert_eq!(snapshot.command_state.sms_send_rejected_seq, 0);
+        state.observe_snapshot(&snapshot);
+        assert!(state.pending.is_some());
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn accepted_send_binds_before_a_later_send_rejection_is_observed() {
+        let mut controller =
+            dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH);
+        let mut state = ready();
+        state.observe_snapshot(&controller.snapshot());
+        let draft = state.draft.clone();
+        state.confirm(&Sink(Ok(())), None);
+        let send = || UiCommand::SmsSend {
+            recipient: draft.recipient.clone(),
+            body: draft.body.clone(),
+        };
+        controller.handle_command(send()).unwrap();
+        assert!(controller.handle_command(send()).is_err());
+        controller
+            .handle_command(UiCommand::ClearToolHistory)
+            .unwrap();
+        let snapshot = controller.snapshot();
+        assert!(snapshot.feedback.is_none());
+        assert_eq!(snapshot.command_state.sms_send_rejected_seq, 1);
+        state.observe_snapshot(&snapshot);
+        assert_eq!(state.pending.as_ref().unwrap().request_id, Some(1));
+        assert!(state.error.is_none());
+        assert!(state.draft == draft);
+    }
+
+    #[test]
+    fn hidden_context_change_invalidates_storage_confirmation_and_keeps_draft() {
+        let mut snapshot =
+            dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH).snapshot();
+        let mut state = ready();
+        state.observe_snapshot(&snapshot);
+        let draft = state.draft.clone();
+        state.storage_confirmation = Some((
+            snapshot.app.device.as_ref().map(|device| device.epoch),
+            snapshot.sim_epoch,
+            dji4g_domain::SmsStorageId("SM".into()),
+        ));
+        snapshot.sim_epoch += 1;
+        state.observe_snapshot(&snapshot);
+        assert!(state.storage_confirmation.is_none());
+        assert!(state.confirmation.is_none());
+        assert!(state.draft == draft);
+    }
+
+    #[test]
+    fn confirmation_fits_the_viewport_and_both_decisions_remain_clickable() {
+        struct RecordingSink(std::sync::Mutex<Vec<UiCommand>>);
+        impl UiCommandSink for RecordingSink {
+            fn try_send(&self, command: UiCommand) -> Result<(), UiSendError> {
+                self.0.lock().unwrap().push(command);
+                Ok(())
+            }
+        }
+        for size in [
+            egui::vec2(552.0, 400.0),
+            egui::vec2(800.0, 600.0),
+            egui::vec2(1100.0, 760.0),
+        ] {
+            for body in [
+                "测试".to_owned(),
+                "确认的正文".repeat(14),
+                "验\n".repeat(35),
+            ] {
+                for confirm in [false, true] {
+                    let snapshot =
+                        dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH)
+                            .snapshot();
+                    let context = egui::Context::default();
+                    crate::ui::initialize_visuals(&context);
+                    context.style_mut(|style| style.animation_time = 0.0);
+                    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    let mut state = ready();
+                    state.open_editor();
+                    state.draft.body = body.clone();
+                    state.confirmation = Some(state.draft.clone());
+                    let draft = state.draft.clone();
+                    let sink = RecordingSink(Default::default());
+                    let mut action = None;
+                    for tick in 0..6 {
+                        let events = if tick == 3 || tick == 4 {
+                            let point = action.expect("the confirmation action must be visible");
+                            vec![
+                                egui::Event::PointerMoved(point),
+                                egui::Event::PointerButton {
+                                    pos: point,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: tick == 3,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        };
+                        let output = context.run(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                events,
+                                ..Default::default()
+                            },
+                            |context| {
+                                egui::CentralPanel::default().show(context, |ui| {
+                                    render(ui, &mut state, &snapshot, &sink);
+                                });
+                            },
+                        );
+                        if tick == 2 {
+                            let window = context
+                                .read_response(egui::Id::new("确认发送短信"))
+                                .expect("the confirmation window must be rendered")
+                                .rect;
+                            assert!(screen.contains_rect(window), "{size:?}: {window:?}");
+                            for label in ["取消", "确认发送这条短信"] {
+                                let text = output.shapes.iter().find_map(|shape| {
+                                    if let egui::Shape::Text(text) = &shape.shape
+                                        && text.galley.text() == label
+                                    {
+                                        Some(egui::Rect::from_min_size(
+                                            text.pos,
+                                            text.galley.size(),
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let text = text.expect("both decisions must be visible");
+                                assert!(screen.contains_rect(text));
+                                assert!(window.contains_rect(text));
+                                if label
+                                    == if confirm {
+                                        "确认发送这条短信"
+                                    } else {
+                                        "取消"
+                                    }
+                                {
+                                    action = Some(text.center());
+                                }
+                            }
+                        }
+                    }
+                    assert!(state.confirmation.is_none());
+                    assert!(state.draft == draft);
+                    assert_eq!(sink.0.lock().unwrap().len(), usize::from(confirm));
+                    assert_eq!(state.pending.is_some(), confirm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queue_failure_is_visible_inside_the_editor_and_keeps_the_draft() {
+        for failure in [UiSendError::QueueFull, UiSendError::Closed] {
+            let snapshot =
+                dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH)
+                    .snapshot();
+            let context = egui::Context::default();
+            let mut state = ready();
+            state.open_editor();
+            let draft = state.draft.clone();
+            state.confirm(&Sink(Err(failure.clone())), None);
+            let expected = enqueue_error(failure);
+            let mut visible_error = None;
+            for _ in 0..2 {
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            render(ui, &mut state, &snapshot, &Sink(Ok(())));
+                        });
+                    },
+                );
+                visible_error = output.shapes.iter().find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == expected
+                    {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    } else {
+                        None
+                    }
+                });
+            }
+            let point = visible_error.expect("queue error should be drawn in the editor");
+            assert_eq!(
+                context.layer_id_at(point),
+                Some(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("sms-compose-window"),
+                ))
+            );
+            assert!(state.draft == draft);
+            assert!(state.open);
+            assert!(state.confirmation.is_none());
+            assert!(state.pending.is_none());
+        }
     }
 }

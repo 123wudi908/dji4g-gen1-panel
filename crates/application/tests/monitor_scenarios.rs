@@ -131,77 +131,100 @@ fn network_repair_runs_once_and_schedules_one_read_only_recheck() {
         dhcp_v4: true,
         dns_automatic: Some(true),
     });
-    let controller = Controller::for_test(NOW);
-    let (_, runner) = ControllerRunner::new(controller);
-    let mut runner = runner.with_ports(MonitorPorts {
-        inventory: Arc::new(StaticInventory {
-            result: Ok(full_inventory(epoch)),
-        }),
-        at: Arc::new(StaticAt {
-            result: Ok(AtObservation {
-                availability: AtControlAvailability::Available,
-                cellular: None,
-            }),
-        }),
-        adapter: Arc::new(StaticAdapter {
-            result: Ok(adapter),
-        }),
-        probe: Arc::new(StaticProbe {
+    for (active, once) in [(false, false), (false, true), (true, false)] {
+        let mut controller = Controller::for_test(NOW);
+        controller.set_active_probe(active);
+        let probe = Arc::new(StaticProbe {
             result: Ok(full_probe(epoch)),
             calls: AtomicUsize::new(0),
-        }),
-        hotspot: None,
-        sms: None,
-        device_tools: None,
-    });
-    runner
-        .controller_mut()
-        .handle_command(UiCommand::CheckModuleNetwork {
-            allow_probe_once: true,
-        })
-        .unwrap();
-    runner.run_one_refresh();
-    let check = runner.controller().snapshot().module_network_check.unwrap();
-    assert_eq!(
-        check.recommended_repairs(),
-        vec![NetworkRepairKind::RenewDhcp]
-    );
-    runner
-        .controller_mut()
-        .handle_command(UiCommand::PrepareNetworkRepair {
-            request_id: check.request_id,
-            repair: NetworkRepairKind::RenewDhcp,
-        })
-        .unwrap();
-    let plan = runner.controller().snapshot().prepared_action.unwrap().id;
-    runner.controller_mut().confirm_action(plan).unwrap();
-    assert!(runner.controller_mut().confirm_action(plan).is_err());
-    assert_eq!(runner.controller().executor_call_count(), 1);
-    let recheck = runner.controller().snapshot().module_network_check.unwrap();
-    assert_eq!(recheck.phase, ModuleNetworkCheckPhase::Queued);
-    assert!(recheck.after_operation.is_some());
-    assert!(recheck.dhcp_attempted);
-    runner.run_one_refresh();
-    assert_eq!(
+        });
+        let (_, runner) = ControllerRunner::new(controller);
+        let mut runner = runner.with_ports(MonitorPorts {
+            inventory: Arc::new(StaticInventory {
+                result: Ok(full_inventory(epoch)),
+            }),
+            at: Arc::new(StaticAt {
+                result: Ok(AtObservation {
+                    availability: AtControlAvailability::Available,
+                    cellular: None,
+                }),
+            }),
+            adapter: Arc::new(StaticAdapter {
+                result: Ok(adapter.clone()),
+            }),
+            probe: probe.clone(),
+            hotspot: None,
+            sms: None,
+            device_tools: None,
+        });
         runner
-            .controller()
-            .snapshot()
-            .module_network_check
-            .unwrap()
-            .recommended_repairs(),
-        vec![NetworkRepairKind::RestartAdapter]
-    );
-    runner.run_one_refresh();
-    assert_eq!(
+            .controller_mut()
+            .handle_command(UiCommand::CheckModuleNetwork {
+                allow_probe_once: once,
+            })
+            .unwrap();
+        runner.run_one_refresh();
+        let check = runner.controller().snapshot().module_network_check.unwrap();
+        assert_eq!(
+            check.recommended_repairs(),
+            vec![NetworkRepairKind::RenewDhcp]
+        );
         runner
-            .controller()
-            .snapshot()
-            .module_network_check
-            .unwrap()
-            .request_id,
-        recheck.request_id
-    );
-    assert_eq!(runner.controller().executor_call_count(), 1);
+            .controller_mut()
+            .handle_command(UiCommand::PrepareNetworkRepair {
+                request_id: check.request_id,
+                repair: NetworkRepairKind::RenewDhcp,
+            })
+            .unwrap();
+        let plan = runner.controller().snapshot().prepared_action.unwrap().id;
+        runner.controller_mut().confirm_action(plan).unwrap();
+        assert!(runner.controller_mut().confirm_action(plan).is_err());
+        assert_eq!(runner.controller().executor_call_count(), 1);
+        let recheck = runner.controller().snapshot().module_network_check.unwrap();
+        assert_eq!(recheck.phase, ModuleNetworkCheckPhase::Queued);
+        assert!(recheck.after_operation.is_some());
+        let calls_before = probe.calls.load(Ordering::SeqCst);
+        assert!(recheck.dhcp_attempted);
+        assert!(!recheck.allow_probe_once);
+        assert_eq!(runner.controller().snapshot().settings.active_probe, active);
+        runner.run_one_refresh();
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            calls_before + usize::from(active)
+        );
+        if !active {
+            assert!(matches!(
+                runner
+                    .controller()
+                    .snapshot()
+                    .module_network_check
+                    .unwrap()
+                    .evidence
+                    .public,
+                dji4g_domain::NetworkEvidenceState::NotRun
+            ));
+        }
+        assert_eq!(
+            runner
+                .controller()
+                .snapshot()
+                .module_network_check
+                .unwrap()
+                .recommended_repairs(),
+            vec![NetworkRepairKind::RestartAdapter]
+        );
+        runner.run_one_refresh();
+        assert_eq!(
+            runner
+                .controller()
+                .snapshot()
+                .module_network_check
+                .unwrap()
+                .request_id,
+            recheck.request_id
+        );
+        assert_eq!(runner.controller().executor_call_count(), 1);
+    }
 }
 
 fn target() -> StableDeviceIdentity {
@@ -280,7 +303,7 @@ fn full_probe(epoch: DeviceEpoch) -> ProbeObservationDto {
         route_choices: Vec::new(),
         epoch,
         adapter_id: "{adapter}".into(),
-        gateway: ProbeStageDto::Passed,
+        bound_route: ProbeStageDto::Passed,
         public: ProbeStageDto::Passed,
         dns: ProbeStageDto::Passed,
         protocol_coverage: Some(ProtocolCoverage::AllRequiredFamilies),
@@ -753,7 +776,7 @@ fn absent_inventory_marks_dependent_checks_unavailable() {
         DiagnosticCheckId::AtControl,
         DiagnosticCheckId::Cellular,
         DiagnosticCheckId::WindowsAdapter,
-        DiagnosticCheckId::BoundGateway,
+        DiagnosticCheckId::BoundRoute,
         DiagnosticCheckId::BoundPublic,
         DiagnosticCheckId::BoundDns,
         DiagnosticCheckId::SystemRoute,
@@ -1082,7 +1105,7 @@ fn runner_executes_inventory_at_adapter_probe_dag_and_publishes_one_snapshot() {
         DiagnosticCheckState::Passed
     );
     for id in [
-        DiagnosticCheckId::BoundGateway,
+        DiagnosticCheckId::BoundRoute,
         DiagnosticCheckId::BoundPublic,
         DiagnosticCheckId::BoundDns,
         DiagnosticCheckId::SystemRoute,

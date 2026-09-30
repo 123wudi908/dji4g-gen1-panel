@@ -10,9 +10,13 @@ use std::time::Duration;
 pub fn sms_delete_checked(
     device: &DjiDevice,
     epoch: DeviceEpoch,
+    expected_sim: Option<[u8; 8]>,
     expected: &SmsFragmentKey,
     control: SmsDeleteControl,
 ) -> SmsDeleteReceipt {
+    if expected_sim.is_none() {
+        return refused("sms:sim_identity_required");
+    }
     if epoch.0 != expected.device_epoch {
         return refused("sms:stale_epoch");
     }
@@ -37,7 +41,8 @@ pub fn sms_delete_checked(
                 Ok(value) => value,
                 Err(error) => return actor_failure(error, &control),
             };
-            let receipt = actor.execute_checked_delete(expected.clone(), control.clone());
+            let receipt =
+                actor.execute_checked_delete(expected_sim, expected.clone(), control.clone());
             let _ = actor.close_delete_and_wait(&control, Duration::from_secs(3));
             if control.cleanup_pending()
                 || control.delete_attempted()
@@ -60,10 +65,14 @@ pub fn sms_delete_checked(
 
 pub(crate) fn delete_in_session(
     epoch: DeviceEpoch,
+    expected_sim: Option<[u8; 8]>,
     expected: &SmsFragmentKey,
     control: &SmsDeleteControl,
     mut transact: impl FnMut(AtCommand) -> Result<AtResponse, ActorError>,
 ) -> SmsDeleteReceipt {
+    let Some(expected_sim) = expected_sim else {
+        return refused("sms:sim_identity_required");
+    };
     let mut execute = |command| {
         let response = transact(command)?;
         if response.final_code == AtFinalCode::Ok {
@@ -122,6 +131,13 @@ pub(crate) fn delete_in_session(
         if holder != Some(expected.storage.0.as_str()) {
             return Ok(refused("sms:storage_mismatch"));
         }
+        let identity = match execute(AtCommand::Iccid) {
+            Ok(response) => response,
+            Err(_) => return Ok(refused("sms:sim_identity_unverified")),
+        };
+        if let Err(error) = crate::sms::verify_sim_response(&identity, expected_sim) {
+            return Ok(refused(error.code));
+        }
         let read = execute(AtCommand::SmsRead {
             index: expected.index,
         })?;
@@ -130,6 +146,13 @@ pub(crate) fn delete_in_session(
         };
         if message.payload_fingerprint() != expected.payload_fingerprint {
             return Ok(refused("sms:payload_mismatch"));
+        }
+        let identity = match execute(AtCommand::Iccid) {
+            Ok(response) => response,
+            Err(_) => return Ok(refused("sms:sim_identity_unverified")),
+        };
+        if let Err(error) = crate::sms::verify_sim_response(&identity, expected_sim) {
+            return Ok(refused(error.code));
         }
         execute(AtCommand::SmsDelete {
             index: expected.index,

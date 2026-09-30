@@ -156,7 +156,7 @@ impl ModuleNetworkCheckSnapshot {
             }
             self.probe = Some(value.clone());
         }
-        self.evidence.gateway = step_state(&diagnostics.get(Id::BoundGateway).state);
+        self.evidence.bound_route = step_state(&diagnostics.get(Id::BoundRoute).state);
         self.evidence.public = step_state(&diagnostics.get(Id::BoundPublic).state);
         self.evidence.dns = step_state(&diagnostics.get(Id::BoundDns).state);
         if matches!(event, BackendEvent::RefreshFinished { .. }) {

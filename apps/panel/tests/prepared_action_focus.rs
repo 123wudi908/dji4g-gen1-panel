@@ -546,3 +546,93 @@ fn a_rejected_command_surfaces_exactly_one_toast() {
         "a new rejection must replace the toast with its own message"
     );
 }
+
+#[test]
+fn a_republished_old_plan_is_never_confirmed_by_a_new_click() {
+    let (mut app, snapshot_tx, sink) = harness();
+    // Publish ahead of the UI receiver: click correlation must use the live stream's baseline.
+    snapshot_tx.send(Arc::new(prepared_snapshot(41))).unwrap();
+    let dialog = FakeDialog::new(true);
+    app.set_dialog_backend(Arc::new(dialog.clone()));
+    app.prepare_action_now(ActionKind::ToggleHotspot { enabled: true });
+    dialog.wait_for_calls();
+    snapshot_tx.send(Arc::new(prepared_snapshot(41))).unwrap();
+    std::thread::sleep(Duration::from_millis(40));
+    assert!(sink.commands().iter().all(|command| !matches!(
+        command,
+        UiCommand::ConfirmAction { .. } | UiCommand::CancelAction { .. }
+    )));
+    snapshot_tx.send(Arc::new(prepared_snapshot(42))).unwrap();
+    assert!(matches!(
+        wait_for_command(&sink, |c| matches!(c, UiCommand::ConfirmAction { .. })),
+        UiCommand::ConfirmAction { id } if id == ActionPlanId::from_u128(42)
+    ));
+}
+
+struct FailingSink {
+    reject_prepare: bool,
+    error: dji4g_application::UiSendError,
+    failed: AtomicBool,
+}
+
+impl dji4g_panel::app::UiCommandSink for FailingSink {
+    fn try_send(&self, command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+        if self.reject_prepare || matches!(command, UiCommand::ConfirmAction { .. }) {
+            self.failed.store(true, Ordering::Release);
+            Err(self.error.clone())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn failed_prepare_reports_dispatch_failure_without_opening_a_dialog() {
+    for error in [
+        dji4g_application::UiSendError::QueueFull,
+        dji4g_application::UiSendError::Closed,
+    ] {
+        let sink = Arc::new(FailingSink {
+            reject_prepare: true,
+            error,
+            failed: AtomicBool::new(false),
+        });
+        let mut app = PanelApp::from_snapshot(Arc::new(base_snapshot()), sink);
+        let dialog = FakeDialog::new(true);
+        app.set_dialog_backend(Arc::new(dialog.clone()));
+        app.prepare_action_now(ActionKind::ToggleHotspot { enabled: true });
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render_ui(ctx));
+        assert!(app.toast_text().is_some(), "queue failure must be visible");
+        assert!(dialog.calls().is_empty(), "no prepare, no confirmation box");
+    }
+}
+
+#[test]
+fn worker_confirm_queue_failure_reaches_the_existing_ui_toast() {
+    let (snapshot_tx, snapshot_rx) =
+        dji4g_application::sync::watch::channel(Arc::new(base_snapshot()));
+    let sink = Arc::new(FailingSink {
+        reject_prepare: false,
+        error: dji4g_application::UiSendError::QueueFull,
+        failed: AtomicBool::new(false),
+    });
+    let mut app = PanelApp::headless(PanelInputs::new(snapshot_rx, sink.clone(), None, None));
+    let dialog = FakeDialog::new(true);
+    app.set_dialog_backend(Arc::new(dialog.clone()));
+    app.prepare_action_now(ActionKind::ToggleHotspot { enabled: true });
+    dialog.wait_for_calls();
+    snapshot_tx.send(Arc::new(prepared_snapshot(51))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !sink.failed.load(Ordering::Acquire) {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The worker records its failure after the test sink returns.
+    let ctx = egui::Context::default();
+    while app.toast_text().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render_ui(ctx));
+    }
+    assert!(app.toast_text().unwrap().contains("队列"));
+}

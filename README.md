@@ -2,9 +2,11 @@
 
 面向普通 Windows 用户的 DJI 第一代 4G 模块管理工具。打开后可按引导检查模块和驱动，查看信号、网络与短信；遇到连接问题时可按证据逐步排查。
 
-[项目官网](https://lincodex.cn/index.php/archives/59/) · [下载最新版](https://github.com/zhu-hailin/dji4g-gen1-panel/releases/latest) · [使用说明](docs/使用说明.txt) · [更新记录](docs/RELEASE_NOTES_0.1.11.md) · [安全说明](SECURITY.md)
+[项目官网](https://lincodex.cn/index.php/archives/59/) · [下载最新版](https://github.com/zhu-hailin/dji4g-gen1-panel/releases/latest) · [使用说明](docs/使用说明.txt) · [更新记录](docs/RELEASE_NOTES_0.1.12.md) · [安全说明](SECURITY.md)
 
-> v0.1.11 修复启动重复检查导致的错误提示、诊断完成状态难以看见及短信列表空间不足。读取详情集中到菜单，列表保留更多阅读空间。
+> v0.1.12 收紧字体、控件、加载提示和留白，补全禁用原因与操作反馈；修复维修确认参数、DNS 设置、热点状态读取崩溃及结果判定。
+
+具体改动和验证范围见 [v0.1.12 更新记录](docs/RELEASE_NOTES_0.1.12.md) 与 [界面与维修检查记录](docs/UI_AND_REPAIR_REVIEW_20260930.md)。
 
 ## Material 3 全新界面
 

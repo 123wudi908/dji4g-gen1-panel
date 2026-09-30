@@ -16,6 +16,7 @@ fn observed(alias: &str, up: bool, binding: &str) -> HostNetworkObservation {
         default_routes: vec![],
         system_proxy: HostProxyMode::Manual,
         binding: Some(ProxyBinding {
+            source: dji4g_domain::ProxyBindingSource::RuntimeVerified,
             client: ProxyClient::ClashVergeRev,
             version: Some("2.5.5".into()),
             interface_alias: binding.into(),
@@ -60,4 +61,24 @@ fn duplicate_alias_and_age_never_authorize_a_repair() {
         observation.observed_at,
         observation.observed_at + Duration::from_secs(31)
     ));
+}
+
+#[test]
+fn configuration_and_incomplete_inventory_cannot_prove_runtime_faults() {
+    for up in [false, true] {
+        let mut observation = observed("Wi-Fi", up, "missing-port");
+        observation.binding.as_mut().unwrap().source =
+            dji4g_domain::ProxyBindingSource::ConfigurationOnly;
+        assert_eq!(
+            classify_host_network(&observation),
+            HostNetworkFinding::EvidenceIncomplete
+        );
+        observation.binding.as_mut().unwrap().source =
+            dji4g_domain::ProxyBindingSource::RuntimeVerified;
+        observation.proxy_inspection_complete = false;
+        assert_eq!(
+            classify_host_network(&observation),
+            HostNetworkFinding::EvidenceIncomplete
+        );
+    }
 }

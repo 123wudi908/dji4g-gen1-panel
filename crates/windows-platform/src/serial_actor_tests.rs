@@ -971,6 +971,7 @@ fn checked_delete_refuses_unverified_slot_before_cmgd() {
         Ok(b"+CMGF: 1\r\nOK\r\n".to_vec()),
     ]);
     let result = actor.execute_checked_delete(
+        Some(delete_sim()),
         delete_key(),
         dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1)),
     );
@@ -993,12 +994,13 @@ const DELETE_PDU: &str = "00040B912120550521F300004210203040502305E8329BFD06";
 
 #[test]
 fn checked_delete_each_preflight_error_prevents_delete() {
-    for stage in 0..5 {
+    for stage in 0..7 {
         let mut reads = delete_reads("OK\r\n");
         reads[stage] = Ok(b"ERROR\r\n".to_vec());
         let (actor, state) = actor_with_reads(reads);
         let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
-        let receipt = actor.execute_checked_delete(delete_key(), control.clone());
+        let receipt =
+            actor.execute_checked_delete(Some(delete_sim()), delete_key(), control.clone());
         assert_ne!(receipt.result, dji4g_domain::SmsDeleteItemResult::Deleted);
         assert!(!control.delete_attempted());
         assert_eq!(state.lock().unwrap().writes.len(), stage + 1);
@@ -1033,7 +1035,7 @@ fn checked_delete_deadline_cancels_blocked_open_before_any_at_write() {
         },
     )
     .unwrap();
-    let result = actor.execute_checked_delete(delete_key(), control.clone());
+    let result = actor.execute_checked_delete(Some(delete_sim()), delete_key(), control.clone());
     assert_eq!(
         result.result,
         dji4g_domain::SmsDeleteItemResult::NotAttempted
@@ -1061,7 +1063,7 @@ impl SerialIo for DeleteBlockingSerial {
         let mut state = lock.lock().unwrap();
         state.writes.push(bytes.to_vec());
         changed.notify_all();
-        if state.writes.len() == 6 && self.block_write {
+        if state.writes.len() == 8 && self.block_write {
             let _state = changed.wait_while(state, |state| !state.released).unwrap();
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -1070,7 +1072,7 @@ impl SerialIo for DeleteBlockingSerial {
     fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().unwrap();
-        if state.writes.len() == 6 {
+        if state.writes.len() == 8 {
             let _state = changed.wait_while(state, |state| !state.released).unwrap();
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -1108,13 +1110,14 @@ fn checked_delete_cancel_and_deadline_reach_actual_delete_read_and_write() {
                 let control = control.clone();
                 let state = state.clone();
                 Some(thread::spawn(move || {
-                    wait_for_writes(&state, 6);
+                    wait_for_writes(&state, 8);
                     control.cancel();
                 }))
             } else {
                 None
             };
-            let result = actor.execute_checked_delete(delete_key(), control.clone());
+            let result =
+                actor.execute_checked_delete(Some(delete_sim()), delete_key(), control.clone());
             if let Some(canceller) = canceller {
                 canceller.join().unwrap();
             }
@@ -1127,7 +1130,7 @@ fn checked_delete_cancel_and_deadline_reach_actual_delete_read_and_write() {
                 state.0.lock().unwrap().released,
                 "native cancellation handle was not invoked"
             );
-            assert_eq!(state.0.lock().unwrap().writes.len(), 6);
+            assert_eq!(state.0.lock().unwrap().writes.len(), 8);
         }
     }
 }
@@ -1156,7 +1159,9 @@ fn delete_reads(final_response: &str) -> Vec<io::Result<Vec<u8>>> {
         "Quectel\r\nOK\r\n".into(),
         "+CMGF: 0\r\nOK\r\n".into(),
         "+CPMS: \"SM\",3,20,\"ME\",0,20,\"ME\",0,20\r\nOK\r\n".into(),
+        "+QCCID: 89860123456789012345\r\nOK\r\n".into(),
         format!("+CMGR: 1,,24\r\n{DELETE_PDU}\r\nOK\r\n"),
+        "+QCCID: 89860123456789012345\r\nOK\r\n".into(),
         final_response.into(),
     ]
     .into_iter()
@@ -1175,7 +1180,8 @@ fn checked_delete_matches_payload_and_requires_final_ok_without_retry() {
     ] {
         let (actor, state) = actor_with_reads(delete_reads(final_response));
         let control = SmsDeleteControl::new(Duration::from_secs(2));
-        let result = actor.execute_checked_delete(delete_key(), control.clone());
+        let result =
+            actor.execute_checked_delete(Some(delete_sim()), delete_key(), control.clone());
         assert_eq!(result.result, expected);
         assert!(control.delete_attempted());
         assert_eq!(
@@ -1185,7 +1191,9 @@ fn checked_delete_matches_payload_and_requires_final_ok_without_retry() {
                 b"ATI\r".to_vec(),
                 b"AT+CMGF?\r".to_vec(),
                 b"AT+CPMS?\r".to_vec(),
+                b"AT+QCCID\r".to_vec(),
                 b"AT+CMGR=1\r".to_vec(),
+                b"AT+QCCID\r".to_vec(),
                 b"AT+CMGD=1\r".to_vec()
             ]
         );
@@ -1205,7 +1213,7 @@ fn checked_delete_refuses_changed_payload_unknown_storage_and_other_holder() {
         }
         let (actor, state) = actor_with_reads(reads);
         let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
-        let result = actor.execute_checked_delete(key, control.clone());
+        let result = actor.execute_checked_delete(Some(delete_sim()), key, control.clone());
         assert_eq!(
             result.result,
             dji4g_domain::SmsDeleteItemResult::NotAttempted
@@ -1226,20 +1234,21 @@ fn checked_delete_refuses_changed_payload_unknown_storage_and_other_holder() {
 fn checked_delete_partial_write_and_missing_final_are_unknown_and_never_retried() {
     for fail_write in [true, false] {
         let mut reads = delete_reads("OK\r\n");
-        reads[5] = Err(io::Error::from(io::ErrorKind::NotConnected));
+        reads[7] = Err(io::Error::from(io::ErrorKind::NotConnected));
         let (actor, state) = actor_with_state(FakeState {
             reads: reads.into_iter().collect(),
-            fail_write_at: fail_write.then_some(5),
+            fail_write_at: fail_write.then_some(7),
             ..FakeState::default()
         });
         let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
-        let result = actor.execute_checked_delete(delete_key(), control.clone());
+        let result =
+            actor.execute_checked_delete(Some(delete_sim()), delete_key(), control.clone());
         assert_eq!(
             result.result,
             dji4g_domain::SmsDeleteItemResult::OutcomeUnknown
         );
         assert!(control.delete_attempted());
-        assert_eq!(state.lock().unwrap().write_attempts, 6);
+        assert_eq!(state.lock().unwrap().write_attempts, 8);
     }
 }
 
@@ -1250,7 +1259,7 @@ fn checked_delete_deadline_actively_cancels_blocked_preflight_io() {
     key.device_epoch = 8;
     let control = dji4g_domain::SmsDeleteControl::new(Duration::from_millis(40));
     let start = std::time::Instant::now();
-    let result = actor.execute_checked_delete(key, control.clone());
+    let result = actor.execute_checked_delete(Some(delete_sim()), key, control.clone());
     assert!(start.elapsed() < Duration::from_secs(1));
     assert_eq!(
         result.result,
@@ -1588,5 +1597,49 @@ fn history_actor_changed_or_missing_sim_after_listing_discards_and_restores_stor
                 .count(),
             2
         );
+    }
+}
+
+fn delete_sim() -> [u8; 8] {
+    dji4g_domain::sha256(b"89860123456789012345")[..8]
+        .try_into()
+        .unwrap()
+}
+
+#[test]
+fn checked_delete_requires_live_sim_before_read_and_before_delete() {
+    for case in 0..4 {
+        let mut reads = delete_reads("OK\r\n");
+        let expected = if case == 0 { None } else { Some(delete_sim()) };
+        if case == 1 {
+            reads[4] = Ok(b"ERROR\r\n".to_vec());
+        }
+        if case == 2 {
+            reads[4] = Ok(b"+QCCID: 89860123456789012346\r\nOK\r\n".to_vec());
+        }
+        if case == 3 {
+            reads[6] = Ok(b"+QCCID: 89860123456789012346\r\nOK\r\n".to_vec());
+        }
+        let (actor, state) = actor_with_reads(reads);
+        let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
+        let receipt = actor.execute_checked_delete(expected, delete_key(), control.clone());
+        assert_eq!(
+            receipt.result,
+            dji4g_domain::SmsDeleteItemResult::NotAttempted
+        );
+        assert_eq!(
+            receipt.code.as_deref(),
+            Some(match case {
+                0 => "sms:sim_identity_required",
+                1 => "sms:sim_identity_unverified",
+                _ => "sms:sim_changed",
+            })
+        );
+        assert!(!control.delete_attempted());
+        let state = state.lock().unwrap();
+        assert!(state.writes.iter().all(|w| !w.starts_with(b"AT+CMGD")));
+        if case < 3 {
+            assert!(state.writes.iter().all(|w| !w.starts_with(b"AT+CMGR")));
+        }
     }
 }

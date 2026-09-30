@@ -301,7 +301,7 @@ pub(crate) fn render(
     state.serial_busy = snapshot.serial_work_busy;
     ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new("短信").size(28.0).color(scale::INK));
+            ui.label(RichText::new("短信").size(scale::PAGE).color(scale::INK));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let details_label = if state.refresh_error.is_some() || state.auto_refresh_paused {
@@ -315,22 +315,15 @@ pub(crate) fn render(
                 render_inbox_notes(ui, &vm, snapshot, state);
             });
             if ui.add(super::theme::primary_button("新建短信")).clicked() {
-                state.open = true;
+                state.open_editor();
             }
-            if ui
-                .add_enabled(
-                    !snapshot.sms_refresh_pending && !snapshot.serial_work_busy,
-                    egui::Button::new("刷新列表"),
-                )
-                .clicked()
-            {
-                refresh(sink, state);
-            }
+            refresh_button(ui, snapshot, sink, state, "刷新列表");
         });
     });
     if snapshot.sms_refresh_pending {
         render_history_controls(ui, snapshot, sink, state);
     }
+    render_storage_confirmation(ui, snapshot, sink, state);
     ui.add_space(4.0);
     compose::render(ui, state, snapshot, sink);
     if let Some(deletion) = &snapshot.sms_delete {
@@ -361,6 +354,25 @@ fn refresh(sink: &dyn UiCommandSink, state: &mut SmsComposeState) {
     state.request_refresh(Instant::now(), sink);
 }
 
+fn refresh_button(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+    label: &str,
+) -> egui::Response {
+    let response = ui
+        .add_enabled(
+            !snapshot.sms_refresh_pending && !snapshot.serial_work_busy,
+            egui::Button::new(label),
+        )
+        .on_disabled_hover_text("当前通信任务尚未结束，请稍后刷新");
+    if response.clicked() {
+        refresh(sink, state);
+    }
+    response
+}
+
 fn render_history_controls(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
@@ -372,16 +384,9 @@ fn render_history_controls(
         snapshot.app.device.as_ref().map(|device| device.epoch),
         snapshot.sim_epoch,
     );
-    if state
-        .storage_confirmation
-        .as_ref()
-        .is_some_and(|(epoch, sim, _)| (*epoch, *sim) != context)
-    {
-        state.storage_confirmation = None;
-    }
     if snapshot.sms_refresh_pending {
         ui.horizontal_wrapped(|ui| {
-            ui.spinner();
+            crate::ui::components::loading_spinner(ui);
             let label = match snapshot.sms_read_phase {
                 None => "等候读取",
                 Some(SmsReadPhase::Verifying) => "正在确认模块与 SIM",
@@ -437,15 +442,40 @@ fn render_history_controls(
                     let reason = if snapshot.serial_work_busy { "当前通信任务尚未结束" } else if !supported { "模块尚未确认支持此存储位置" } else { "读取前将再次确认" };
                     if ui.add_enabled(supported && !snapshot.serial_work_busy, egui::Button::new(label)).on_hover_text(reason).clicked() {
                         state.storage_confirmation = Some((context.0, context.1, dji4g_domain::SmsStorageId(token.into())));
+                        ui.close_menu();
                     }
                 }
             });
         });
     }
+}
+
+fn render_storage_confirmation(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    // This window belongs to the page, rather than the details menu that opens it. It must
+    // remain usable after clicking outside that menu, and clear if the device or SIM changes.
+    let context = (
+        snapshot.app.device.as_ref().map(|device| device.epoch),
+        snapshot.sim_epoch,
+    );
+    if state
+        .storage_confirmation
+        .as_ref()
+        .is_some_and(|(epoch, sim, _)| (*epoch, *sim) != context)
+    {
+        state.storage_confirmation = None;
+    }
     if let Some((_, _, storage)) = state.storage_confirmation.clone() {
         egui::Window::new("读取其他位置的短信").collapsible(false).resizable(false).default_width(370.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ui.ctx(), |ui| {
                 ui.label(format!("将读取{}中保存的短信，期间暂停其他模块操作。读取可能改变短信已读状态；完成后会恢复原读取位置，不改变短信写入和接收位置。", if storage.0 == "SM" { "SIM 卡" } else { "模块" }));
+                if let Some(error) = &state.refresh_error {
+                    wrapped_label(ui, RichText::new(error).color(StatusTone::Negative.color()));
+                }
                 ui.horizontal(|ui| {
                     if ui.button("取消").clicked() { state.storage_confirmation = None; }
                     if ui.add_enabled(!snapshot.serial_work_busy, egui::Button::new("确认读取")).clicked() {
@@ -506,7 +536,7 @@ fn render_inbox_notes(
     // Query evidence has its own quiet status strip; sending results remain independent.
     ui.horizontal_wrapped(|ui| {
         if snapshot.sms_refresh_pending {
-            ui.spinner();
+            crate::ui::components::loading_spinner(ui);
             ui.label(meta_text("正在同步模块短信…"));
         } else {
             ui.label(meta_text(&vm.status.text));
@@ -730,9 +760,7 @@ fn list_panel(
         if !state.outgoing && state.search.is_empty() && !snapshot.sms_refresh_pending {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
-                if ui.button("刷新短信").clicked() {
-                    refresh(sink, state);
-                }
+                refresh_button(ui, snapshot, sink, state, "刷新短信");
             });
         }
     } else {
@@ -759,7 +787,7 @@ fn render_list(
         let selected = state.selected == Some(key);
         let frame = egui::Frame::none()
             .rounding(10.0)
-            .inner_margin(12.0)
+            .inner_margin(10.0)
             .fill(if selected {
                 egui::Color32::from_rgb(211, 227, 253)
             } else {
@@ -767,11 +795,11 @@ fn render_list(
             });
         let response = frame
             .show(ui, |ui| {
-                // These are labels inside one >=72px clickable message row, not small controls.
+                // These are labels inside one >=60px clickable message row, not small controls.
                 ui.spacing_mut().interact_size.y = 20.0;
                 ui.spacing_mut().item_spacing.y = 4.0;
                 ui.set_min_width(ui.available_width());
-                ui.set_min_height(48.0);
+                ui.set_min_height(40.0);
                 ui.horizontal_wrapped(|ui| {
                     if row.unread == Some(true) && !outgoing {
                         ui.colored_label(scale::DOWNLOAD, "●");
@@ -863,7 +891,7 @@ fn render_detail(
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(0xf5, 0xf7, 0xfb))
         .rounding(12.0)
-        .inner_margin(18.0)
+        .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             wrapped_label(ui, RichText::new(&row.body).size(14.0).color(scale::INK));
@@ -1523,6 +1551,136 @@ mod tests {
     impl UiCommandSink for NoopSink {
         fn try_send(&self, _command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn both_refresh_controls_disable_during_serial_work_or_pending_reads() {
+        for label in ["刷新列表", "刷新短信"] {
+            for (serial_busy, read_pending) in [(true, false), (false, true), (false, false)] {
+                let context = egui::Context::default();
+                let mut snapshot =
+                    dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH)
+                        .snapshot();
+                snapshot.serial_work_busy = serial_busy;
+                snapshot.sms_refresh_pending = read_pending;
+                let mut state = SmsComposeState::default();
+                let mut enabled = None;
+                let _ = context.run(egui::RawInput::default(), |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        enabled = Some(
+                            refresh_button(ui, &snapshot, &NoopSink, &mut state, label).enabled(),
+                        );
+                    });
+                });
+                assert_eq!(enabled, Some(!serial_busy && !read_pending), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_confirmation_survives_closed_details_menu_and_obeys_confirmation_gate() {
+        struct Sink {
+            commands: std::sync::Mutex<Vec<UiCommand>>,
+            fail: bool,
+        }
+        impl UiCommandSink for Sink {
+            fn try_send(&self, command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+                self.commands.lock().unwrap().push(command);
+                if self.fail {
+                    Err(dji4g_application::UiSendError::QueueFull)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (action, busy, fail) in [
+            ("取消", false, false),
+            ("确认读取", false, false),
+            ("确认读取", true, false),
+            ("确认读取", false, true),
+        ] {
+            let context = egui::Context::default();
+            let mut snapshot =
+                dji4g_application::Controller::for_test(std::time::SystemTime::UNIX_EPOCH)
+                    .snapshot();
+            snapshot.serial_work_busy = busy;
+            let mut state = SmsComposeState::default();
+            state.auto_refresh_paused = true;
+            state.storage_confirmation = Some((
+                snapshot.app.device.as_ref().map(|device| device.epoch),
+                snapshot.sim_epoch,
+                dji4g_domain::SmsStorageId("SM".into()),
+            ));
+            let sink = Sink {
+                commands: Default::default(),
+                fail,
+            };
+            let mut point = None;
+            let mut displayed_error = false;
+            for tick in 0..5 {
+                let events = if matches!(tick, 2 | 3) {
+                    let pos =
+                        point.expect("page should render storage confirmation with menu closed");
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: tick == 2,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                } else {
+                    vec![]
+                };
+                let output = context.run(
+                    egui::RawInput {
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            render(ui, &snapshot, &[], Language::ZhCn, &sink, &mut state);
+                        });
+                    },
+                );
+                if tick < 2 {
+                    point = output.shapes.iter().find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape
+                            && text.galley.text() == action
+                        {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        } else {
+                            None
+                        }
+                    });
+                }
+                displayed_error = output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("操作队列已满"))
+                });
+            }
+            let commands = sink.commands.lock().unwrap();
+            if action == "确认读取" && !busy {
+                assert_eq!(commands.len(), 1);
+                assert!(
+                    matches!(&commands[0], UiCommand::SmsReadStorage { storage } if storage.0 == "SM")
+                );
+                assert_eq!(state.storage_confirmation.is_some(), fail);
+                if fail {
+                    assert!(
+                        displayed_error,
+                        "queue failure must stay visible in confirmation"
+                    );
+                }
+            } else {
+                assert!(commands.is_empty());
+                assert_eq!(state.storage_confirmation.is_some(), busy);
+            }
         }
     }
 

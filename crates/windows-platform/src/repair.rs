@@ -760,12 +760,24 @@ impl<B: RepairBackend> WindowsRepairExecutor<B> {
         if validate_observation(&after).is_err()
             || after.epoch != plan.epoch
             || after.target != plan.target
+            || (plan.action.requires_adapter() && after.adapter != current.adapter)
         {
             return unknown_result(plan.before_state_hash, ErrorCode::DeviceIdentityChanged);
         }
         let after_hash = after_hash(&after, &plan.action);
         let verified = verify_after(&after, &plan.action);
-        if verified {
+        // A surviving/up adapter or USB root cannot independently prove that a lease renewal,
+        // disable/enable, restart, or re-enumeration happened. These operations require a definite
+        // native success; only mutations with an exact requested-state readback can resolve an
+        // uncertain dispatch from fresh observations alone.
+        let requires_dispatch_success = matches!(
+            plan.action,
+            RepairAction::RefreshDhcp
+                | RepairAction::RestartAdapter
+                | RepairAction::ReenumerateDevice
+                | RepairAction::RestartModule
+        );
+        if verified && (dispatch_applied || !requires_dispatch_success) {
             return applied_result(plan.before_state_hash, after_hash);
         }
 
@@ -927,7 +939,9 @@ fn verify_after(observation: &RepairObservation, action: &RepairAction) -> bool 
         return false;
     }
     match action {
-        RepairAction::RefreshDhcp => observation.adapter.identity_hash() != [0; 32],
+        RepairAction::RefreshDhcp => {
+            observation.adapter.identity_hash() != [0; 32] && observation.adapter_up
+        }
         RepairAction::ApplyDnsProfile { profile } => {
             observation.dns_profile.as_ref() == Some(profile)
         }
@@ -935,10 +949,12 @@ fn verify_after(observation: &RepairObservation, action: &RepairAction) -> bool 
             observation.adapter.identity_hash() != [0; 32] && observation.adapter_up
         }
         RepairAction::ReenumerateDevice => observation.reenumerated,
+        // QCFG reads the saved USB configuration. Applied here does not prove that Windows
+        // is already using that interface mode; activating it may require a manual module reboot.
         RepairAction::SetUsbNetProfile { profile } => observation.usb_profile == Some(*profile),
         RepairAction::SetApn { cid, apn } => observation.contexts.iter().any(|context| {
             context.cid == *cid
-                && context.pdp_type.is_some()
+                && context.pdp_type == Some(PdpTypeForRepair::Ip)
                 && !context.active
                 && context.apn.as_ref().is_some_and(|value| value == apn)
         }),
@@ -959,11 +975,13 @@ fn before_hash(observation: &RepairObservation, action: &RepairAction) -> Before
     material.push(action_tag(action));
     material.extend_from_slice(&observation.epoch.0.to_le_bytes());
     material.extend_from_slice(&observation.target.identity_hash());
+    if action.requires_adapter() {
+        material.extend_from_slice(&observation.adapter.identity_hash());
+    }
     // Action-relevant before-state only: an unrelated observation change must never turn a
     // wanted repair into BeforeStateChanged while the elevation prompt is open.
     match action {
         RepairAction::RefreshDhcp | RepairAction::RestartAdapter => {
-            material.extend_from_slice(&observation.adapter.identity_hash());
             material.push(u8::from(observation.adapter_up));
         }
         RepairAction::ApplyDnsProfile { .. } => {
@@ -1582,21 +1600,32 @@ mod native {
         } else {
             expected_epoch
         };
-        let adapter = WindowsAdapterResolver
-            .resolve(&device, epoch)
-            .map_err(map_platform_error)?;
+        // The exact USB root and AT binding remain usable when its net interface is missing.
+        // Adapter-dependent actions reject the absent proof in validate_action; AT-only writes
+        // and physical re-enumeration must not depend on the interface they can help restore.
+        let adapter = optional_adapter_resolution(WindowsAdapterResolver.resolve(&device, epoch))?;
         let (at_binding_hash, usb_profile, contexts) = at_observation(&device, epoch);
-        let dns_profile = read_dns_profile(&adapter.identity).ok();
-        let (hotspot, hotspot_enabled) = hotspot_observation(&adapter.identity);
+        let dns_profile = adapter
+            .as_ref()
+            .and_then(|adapter| read_dns_profile(&adapter.identity).ok());
+        let (hotspot, hotspot_enabled) = adapter
+            .as_ref()
+            .map(|adapter| hotspot_observation(&adapter.identity))
+            .unwrap_or((None, false));
         let target = TargetProof::dji_gen1(target_hash);
-        let adapter_proof = AdapterProof::fixture(adapter_identity_hash(&adapter));
+        let adapter_proof = AdapterProof::fixture(
+            adapter
+                .as_ref()
+                .map(adapter_identity_hash)
+                .unwrap_or([0; 32]),
+        );
         let mut observation = RepairObservation {
             revision: 0,
             epoch,
             target,
             target_count: devices.len(),
             adapter: adapter_proof,
-            adapter_up: adapter.oper_up,
+            adapter_up: adapter.as_ref().is_some_and(|adapter| adapter.oper_up),
             reenumerated: true,
             at_binding_hash,
             usb_profile,
@@ -1622,8 +1651,8 @@ mod native {
                     Ok(adapter) => adapter,
                     Err(error) => return uncertain_or_rejected(error),
                 };
-                if !adapter.dhcp_v4 || adapter.identity.ipv4_index().is_none() {
-                    return DispatchResult::Rejected(ErrorCode::Unsupported);
+                if let Err(error) = validate_dhcp_adapter(&adapter) {
+                    return DispatchResult::Rejected(error.code());
                 }
                 match renew_dhcp(&adapter.identity) {
                     Ok(()) => DispatchResult::Applied,
@@ -1742,6 +1771,25 @@ mod native {
         WindowsAdapterResolver
             .resolve(device, epoch)
             .map_err(map_platform_error)
+    }
+
+    fn optional_adapter_resolution(
+        result: Result<AdapterObservation, crate::PlatformError>,
+    ) -> Result<Option<AdapterObservation>, RepairError> {
+        match result {
+            Ok(adapter) => Ok(Some(adapter)),
+            Err(error)
+                if matches!(
+                    error.code,
+                    "net:netcfg_id_missing" | "net:adapter_not_found"
+                ) =>
+            {
+                Ok(None)
+            }
+            // Missing network-interface facts are optional for AT/PnP repair, but failures to
+            // establish unambiguous inventory evidence must never become an absence exemption.
+            Err(error) => Err(map_platform_error(error)),
+        }
     }
 
     fn uncertain_or_rejected(error: RepairError) -> DispatchResult {
@@ -2125,6 +2173,16 @@ mod native {
             .map_err(|_| RepairError::Internal)?
     }
 
+    fn validate_dhcp_adapter(adapter: &AdapterObservation) -> Result<(), RepairError> {
+        if !adapter.oper_up {
+            return Err(RepairError::VerificationFailed);
+        }
+        if !adapter.dhcp_v4 || adapter.identity.ipv4_index().is_none() {
+            return Err(RepairError::Unsupported);
+        }
+        Ok(())
+    }
+
     fn renew_dhcp(identity: &AdapterIdentity) -> Result<(), RepairError> {
         let index = identity.ipv4_index().ok_or(RepairError::Unsupported)?;
         let mut size = 0_u32;
@@ -2179,17 +2237,30 @@ mod native {
         settings: &DNS_INTERFACE_SETTINGS,
     ) -> Result<DnsProfile, RepairError> {
         let flags = settings.Flags as u32;
-        if flags & (DNS_SETTING_NAMESERVER | DNS_SETTING_PROFILE_NAMESERVER) == 0 {
-            return Ok(DnsProfile::Automatic);
+        let read_override =
+            |flag: u32, pointer: *mut u16| -> Result<Option<Vec<IpAddr>>, RepairError> {
+                if flags & flag == 0 || pointer.is_null() {
+                    return Ok(None);
+                }
+                let text = read_wide(pointer)?;
+                if text.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    parse_dns_servers(&text).map(Some)
+                }
+            };
+        let adapter = read_override(DNS_SETTING_NAMESERVER, settings.NameServer)?;
+        let profile = read_override(DNS_SETTING_PROFILE_NAMESERVER, settings.ProfileNameServer)?;
+        match (adapter, profile) {
+            (None, None) => Ok(DnsProfile::Automatic),
+            (Some(servers), None) | (None, Some(servers)) => Ok(DnsProfile::Static { servers }),
+            (Some(adapter), Some(profile)) if adapter == profile => {
+                Ok(DnsProfile::Static { servers: adapter })
+            }
+            // The closed profile cannot represent two conflicting static overrides. Do not
+            // silently discard either value from confirmation or the before-state proof.
+            (Some(_), Some(_)) => Err(RepairError::DnsStateUnavailable),
         }
-        let pointer = if flags & DNS_SETTING_NAMESERVER != 0 {
-            settings.NameServer
-        } else {
-            settings.ProfileNameServer
-        };
-        let text = read_wide(pointer)?;
-        let servers = parse_dns_servers(&text)?;
-        Ok(DnsProfile::Static { servers })
     }
 
     fn set_dns_profile(
@@ -2198,8 +2269,28 @@ mod native {
     ) -> Result<(), RepairError> {
         let guid = windows_guid(&identity.guid_string())?;
         let mut name_server = Vec::new();
+        let settings = dns_write_settings(profile, &mut name_server)?;
+        let status = unsafe { SetInterfaceDnsSettings(guid, &settings) };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(map_win32_repair_error(status))
+        }
+    }
+
+    fn dns_write_settings(
+        profile: &DnsProfile,
+        name_server: &mut Vec<u16>,
+    ) -> Result<DNS_INTERFACE_SETTINGS, RepairError> {
+        name_server.clear();
         let flags = match profile {
-            DnsProfile::Automatic => 0,
+            DnsProfile::Automatic => {
+                // Flags select the fields Windows will change; zero flags leave the previous
+                // static DNS untouched. A real empty UTF-16 string explicitly clears adapter
+                // and profile overrides while preserving unrelated DNS settings.
+                name_server.push(0);
+                DNS_SETTING_NAMESERVER | DNS_SETTING_PROFILE_NAMESERVER
+            }
             DnsProfile::Static { servers } => {
                 if servers.is_empty() || servers.len() > 3 || !valid_dns_profile(profile) {
                     return Err(RepairError::InvalidDnsProfile);
@@ -2221,22 +2312,17 @@ mod native {
                 DNS_SETTING_NAMESERVER | if families[0] { DNS_SETTING_IPV6 } else { 0 }
             }
         };
-        let settings = DNS_INTERFACE_SETTINGS {
+        Ok(DNS_INTERFACE_SETTINGS {
             Version: DNS_INTERFACE_SETTINGS_VERSION1,
             Flags: u64::from(flags),
-            NameServer: if name_server.is_empty() {
-                ptr::null_mut()
-            } else {
+            NameServer: name_server.as_mut_ptr(),
+            ProfileNameServer: if matches!(profile, DnsProfile::Automatic) {
                 name_server.as_mut_ptr()
+            } else {
+                ptr::null_mut()
             },
             ..DNS_INTERFACE_SETTINGS::default()
-        };
-        let status = unsafe { SetInterfaceDnsSettings(guid, &settings) };
-        if status == ERROR_SUCCESS {
-            Ok(())
-        } else {
-            Err(map_win32_repair_error(status))
-        }
+        })
     }
 
     fn parse_dns_servers(text: &str) -> Result<Vec<IpAddr>, RepairError> {
@@ -2405,6 +2491,146 @@ mod native {
             status,
             ERROR_DEVICE_NOT_CONNECTED | ERROR_NO_SUCH_DEVICE | CR_NO_SUCH_DEVNODE
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn optional_adapter_scan_only_accepts_explicit_absence() {
+            for code in ["net:netcfg_id_missing", "net:adapter_not_found"] {
+                assert_eq!(
+                    optional_adapter_resolution(Err(crate::PlatformError {
+                        code,
+                        os_code: None
+                    })),
+                    Ok(None),
+                    "{code} is confirmed absence"
+                );
+            }
+            for (code, expected) in [
+                ("net:adapter_ambiguous", RepairError::TargetAmbiguous),
+                (
+                    "net:adapter_identity_mismatch",
+                    RepairError::TargetIdentityChanged,
+                ),
+                ("net:permission_denied", RepairError::PermissionDenied),
+                ("net:adapter_enumeration_failed", RepairError::Internal),
+                ("net:route_enumeration_failed", RepairError::Internal),
+                ("net:netcfg_id_invalid", RepairError::Internal),
+            ] {
+                assert_eq!(
+                    optional_adapter_resolution(Err(crate::PlatformError {
+                        code,
+                        os_code: None
+                    })),
+                    Err(expected),
+                    "{code} must not grant an absence exemption"
+                );
+            }
+        }
+
+        #[test]
+        fn automatic_dns_explicitly_clears_both_static_overrides_and_reads_back_automatic() {
+            let mut text = Vec::new();
+            let settings = dns_write_settings(&DnsProfile::Automatic, &mut text).unwrap();
+
+            assert_eq!(
+                settings.Flags,
+                u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_PROFILE_NAMESERVER)
+            );
+            assert_eq!(text, vec![0]);
+            assert_eq!(settings.NameServer, text.as_mut_ptr());
+            assert_eq!(settings.ProfileNameServer, text.as_mut_ptr());
+            assert!(settings.Domain.is_null());
+            assert!(settings.SearchList.is_null());
+            assert_eq!(read_dns_profile_inner(&settings), Ok(DnsProfile::Automatic));
+        }
+
+        #[test]
+        fn static_dns_preserves_two_servers_and_an_empty_adapter_override_keeps_profile_evidence() {
+            let requested = DnsProfile::Static {
+                servers: vec![
+                    "223.5.5.5".parse().unwrap(),
+                    "119.29.29.29".parse().unwrap(),
+                ],
+            };
+            let mut text = Vec::new();
+            let settings = dns_write_settings(&requested, &mut text).unwrap();
+            assert_eq!(settings.Flags, u64::from(DNS_SETTING_NAMESERVER));
+            assert_eq!(
+                read_wide(settings.NameServer).unwrap(),
+                "223.5.5.5,119.29.29.29"
+            );
+            assert!(settings.ProfileNameServer.is_null());
+            assert_eq!(read_dns_profile_inner(&settings), Ok(requested.clone()));
+
+            let mut empty_adapter = vec![0];
+            let profile_only = DNS_INTERFACE_SETTINGS {
+                Version: DNS_INTERFACE_SETTINGS_VERSION1,
+                Flags: u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_PROFILE_NAMESERVER),
+                NameServer: empty_adapter.as_mut_ptr(),
+                ProfileNameServer: text.as_mut_ptr(),
+                ..DNS_INTERFACE_SETTINGS::default()
+            };
+            assert_eq!(read_dns_profile_inner(&profile_only), Ok(requested));
+
+            let mut conflicting = "1.1.1.1\0".encode_utf16().collect::<Vec<_>>();
+            let conflicting = DNS_INTERFACE_SETTINGS {
+                NameServer: conflicting.as_mut_ptr(),
+                ..profile_only
+            };
+            assert_eq!(
+                read_dns_profile_inner(&conflicting),
+                Err(RepairError::DnsStateUnavailable)
+            );
+        }
+
+        #[test]
+        fn native_dhcp_guard_rejects_static_ipv4_ipv6_only_and_disconnected_adapters() {
+            let mut adapter = AdapterObservation {
+                identity: crate::adapter::tests_support::fixture_identity(
+                    DeviceEpoch(4),
+                    55,
+                    42,
+                    "192.168.225.2",
+                ),
+                oper_up: true,
+                dhcp_v4: false,
+                dhcp_v6: true,
+                gateways: vec![],
+                dns_servers: vec![],
+                routes: vec![],
+                usable_families: vec![],
+                rx_bytes: None,
+                tx_bytes: None,
+            };
+            assert_eq!(
+                validate_dhcp_adapter(&adapter),
+                Err(RepairError::Unsupported)
+            );
+
+            adapter.dhcp_v4 = true;
+            assert_eq!(validate_dhcp_adapter(&adapter), Ok(()));
+            adapter.oper_up = false;
+            assert_eq!(
+                validate_dhcp_adapter(&adapter),
+                Err(RepairError::VerificationFailed)
+            );
+
+            adapter.oper_up = true;
+            adapter.identity = crate::adapter::tests_support::fixture_identity_v6(
+                DeviceEpoch(4),
+                55,
+                43,
+                "2001:db8::2",
+            );
+            assert_eq!(
+                validate_dhcp_adapter(&adapter),
+                Err(RepairError::Unsupported)
+            );
+        }
     }
 }
 

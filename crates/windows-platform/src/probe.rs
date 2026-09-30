@@ -70,6 +70,7 @@ pub struct ProbePolicy {
     pub connect_timeout: Duration,
     pub tls_timeout: Duration,
     pub read_timeout: Duration,
+    /// DNS, route and HTTPS budget for each address family independently.
     pub total_timeout: Duration,
     pub max_response_bytes: usize,
 }
@@ -349,7 +350,7 @@ fn observe_now<B: ProbeBackend>(
     for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
         // Each family gets the full budget: a blackholed IPv4 endpoint must not starve the
         // IPv6 family, which on carrier networks is often the only globally routed one.
-        let deadline = started_mono + policy.total_timeout;
+        let deadline = Instant::now() + policy.total_timeout;
         let interface_index = match family {
             AddressFamily::Ipv4 => target.ipv4_index(),
             AddressFamily::Ipv6 => target.ipv6_index(),
@@ -2000,6 +2001,79 @@ mod tests {
     use super::*;
     use crate::adapter::tests_support::{fixture_identity, fixture_identity_v6};
     use dji4g_domain::{DefaultRouteOwner, DeviceEpoch};
+
+    struct BudgetBackend {
+        slow_v6: bool,
+    }
+    impl ProbeBackend for BudgetBackend {
+        fn best_route(&self, request: BestRouteRequest) -> Result<BestRouteReply, PlatformError> {
+            Ok(BestRouteReply {
+                luid: 55,
+                interface_index: 43,
+                source: request.source,
+                next_hop: "2001:db8::1".parse().unwrap(),
+                route_metric: 1,
+            })
+        }
+        fn dns(&self, request: BoundDnsRequest) -> Result<Vec<IpAddr>, PlatformError> {
+            if request.family == AddressFamily::Ipv4 || self.slow_v6 {
+                std::thread::sleep(request.deadline.saturating_duration_since(Instant::now()));
+                Err(PlatformError {
+                    code: "probe:dns_timeout",
+                    os_code: None,
+                })
+            } else {
+                Ok(vec!["2001:db8::1".parse().unwrap()])
+            }
+        }
+        fn https(&self, request: BoundHttpsRequest) -> Result<SocketEvidence, PlatformError> {
+            assert_eq!(request.family, AddressFamily::Ipv6);
+            assert_eq!(request.luid, 55);
+            assert_eq!(request.interface_index, 43);
+            Ok(SocketEvidence {
+                actual_source: request.source,
+                tls_validated: true,
+                http_status: Some(200),
+                response_bytes: 128,
+            })
+        }
+        fn global_route(
+            &self,
+            _: AddressFamily,
+            _: SocketAddr,
+        ) -> Result<GlobalRouteReply, PlatformError> {
+            Ok(GlobalRouteReply {
+                luid: 55,
+                interface_index: 43,
+                owner: DefaultRouteOwner::TargetAdapter,
+            })
+        }
+        fn now(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+    #[test]
+    fn ipv4_exhaustion_preserves_ipv6_budget_and_both_families_are_bounded() {
+        let target = crate::adapter::tests_support::fixture_identity_dual();
+        let mut policy = policy();
+        policy.total_timeout = Duration::from_millis(60);
+        for slow_v6 in [false, true] {
+            let start = Instant::now();
+            let result = observe_now(&BudgetBackend { slow_v6 }, &target, &policy).unwrap();
+            assert_eq!(
+                result.chosen_family,
+                if slow_v6 {
+                    None
+                } else {
+                    Some(AddressFamily::Ipv6)
+                }
+            );
+            assert!(start.elapsed() < Duration::from_secs(1));
+            if slow_v6 {
+                assert!(start.elapsed() >= policy.total_timeout * 2);
+            }
+        }
+    }
 
     fn policy() -> ProbePolicy {
         ProbePolicy {

@@ -8,7 +8,6 @@ use dji4g_application::{
 use eframe::egui::{self, RichText, Ui};
 
 use super::{meta_text, scale, wrapped_label};
-use crate::app::UiCommandSink;
 use crate::localization::{
     Language, LocalizedText, TextKey, available_languages, english_available,
 };
@@ -84,11 +83,11 @@ pub fn settings_vm_from(settings: &SettingsSnapshot, language: Language) -> Sett
             toggle_enabled: false,
             drift: false,
         },
-        AutostartStatus::Failed { code, .. } => AutostartVm {
+        AutostartStatus::Failed { code, previous } => AutostartVm {
             status: crate::localization::failure_text(code, language),
-            enabled: false,
+            enabled: matches!(previous, Some(AutostartKnownState::Enabled)),
             toggle_enabled: true,
-            drift: false,
+            drift: matches!(previous, Some(AutostartKnownState::Drift)),
         },
     };
     let persistence = match &settings.persistence {
@@ -117,15 +116,21 @@ pub fn settings_vm_from(settings: &SettingsSnapshot, language: Language) -> Sett
     }
 }
 
-/// Render the settings page. Returns the response of every interactive control, so tests can
-/// assert they actually landed inside the visible page — a layout regression would otherwise
-/// push them out of the clip rect and make the page unusable.
+/// The app dispatches collected commands after layout through its error-reporting send path.
+#[must_use]
+#[derive(Default)]
+pub(crate) struct SettingsRenderOutput {
+    #[cfg(test)]
+    pub controls: Vec<egui::Response>,
+    pub commands: Vec<UiCommand>,
+}
+
+/// Render controls and collect user intent without submitting it to the backend.
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
     language: Language,
-    sink: &dyn UiCommandSink,
-) -> Vec<egui::Response> {
+) -> SettingsRenderOutput {
     let vm = settings_vm(snapshot, language);
     super::components::page_heading(ui, &vm.title.text, "让面板按你的习惯工作");
     ui.add_space(4.0);
@@ -135,6 +140,7 @@ pub(crate) fn render(
     // the row itself used to push the parent cursor past the row edge, which placed every
     // control outside the visible page.
     let mut controls = Vec::new();
+    let mut commands = Vec::new();
     super::section_frame(ui, |ui| {
         ui.label(super::section_heading("常规"));
         controls.push(setting_row(
@@ -152,7 +158,7 @@ pub(crate) fn render(
                 let response =
                     super::components::switch(ui, &mut active_probe, "主动联网检查", true);
                 if response.changed() {
-                    let _ = sink.try_send(UiCommand::SetActiveProbe(active_probe));
+                    commands.push(UiCommand::SetActiveProbe(active_probe));
                 }
                 response
             },
@@ -173,7 +179,7 @@ pub(crate) fn render(
                     vm.autostart.toggle_enabled,
                 );
                 if response.changed() {
-                    let _ = sink.try_send(UiCommand::SetAutostart(enabled));
+                    commands.push(UiCommand::SetAutostart(enabled));
                 }
                 if !vm.autostart.status.text.is_empty() {
                     wrapped_label(ui, meta_text(vm.autostart.status.text.clone()));
@@ -197,7 +203,7 @@ pub(crate) fn render(
                 let response =
                     super::components::switch(ui, &mut start_minimized, "启动后隐藏到托盘", true);
                 if response.changed() {
-                    let _ = sink.try_send(UiCommand::SetStartMinimized(start_minimized));
+                    commands.push(UiCommand::SetStartMinimized(start_minimized));
                 }
                 response
             },
@@ -231,7 +237,7 @@ pub(crate) fn render(
                         }
                     });
                 if selected != vm.log_level {
-                    let _ = sink.try_send(UiCommand::SetLogLevel(selected));
+                    commands.push(UiCommand::SetLogLevel(selected));
                 }
                 combo.response
             },
@@ -250,7 +256,11 @@ pub(crate) fn render(
         ui.add_space(12.0);
         wrapped_label(ui, meta_text(vm.persistence.status.text));
     });
-    controls
+    SettingsRenderOutput {
+        #[cfg(test)]
+        controls,
+        commands,
+    }
 }
 
 /// One setting row: label block on the left, the control placed inside a right-to-left
@@ -357,18 +367,7 @@ impl LocalizedKeyText for TextKey {
 mod tests {
     use super::*;
     use dji4g_domain::{Availability, Freshness, HotspotStatus};
-    use std::sync::{Arc, Mutex};
-
-    struct RecordingSink {
-        commands: Mutex<Vec<UiCommand>>,
-    }
-
-    impl crate::app::UiCommandSink for RecordingSink {
-        fn try_send(&self, command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
-            self.commands.lock().expect("sink lock").push(command);
-            Ok(())
-        }
-    }
+    use std::sync::Arc;
 
     fn snapshot() -> ControllerSnapshot {
         ControllerSnapshot {
@@ -419,9 +418,6 @@ mod tests {
     #[test]
     fn every_setting_control_lands_inside_the_visible_page() {
         let context = egui::Context::default();
-        let sink = RecordingSink {
-            commands: Mutex::new(Vec::new()),
-        };
         let snapshot = snapshot();
         let mut controls = Vec::new();
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(552.0, 900.0));
@@ -432,7 +428,9 @@ mod tests {
             },
             |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    controls = render(ui, &snapshot, Language::ZhCn, &sink);
+                    let output = render(ui, &snapshot, Language::ZhCn);
+                    assert!(output.commands.is_empty());
+                    controls = output.controls;
                 });
             },
         );
@@ -452,5 +450,91 @@ mod tests {
                 "control is outside the visible page: {rect:?}"
             );
         }
+    }
+
+    fn failed_autostart(previous: Option<AutostartKnownState>) -> AutostartStatus {
+        AutostartStatus::Failed {
+            code: dji4g_application::FailureCode::new(
+                dji4g_domain::ErrorCode::PermissionDenied,
+                dji4g_application::StableCode::try_from_static("autostart:registry_write_failed")
+                    .expect("safe code"),
+            ),
+            previous,
+        }
+    }
+
+    #[test]
+    fn failed_autostart_preserves_the_last_confirmed_state_and_error() {
+        for previous in [AutostartKnownState::Enabled, AutostartKnownState::Disabled] {
+            let settings = SettingsSnapshot {
+                autostart: failed_autostart(Some(previous)),
+                ..SettingsSnapshot::default()
+            };
+            let vm = settings_vm_from(&settings, Language::ZhCn);
+            assert_eq!(
+                vm.autostart.enabled,
+                previous == AutostartKnownState::Enabled
+            );
+            assert!(vm.autostart.toggle_enabled);
+            assert!(!vm.autostart.drift);
+            let AutostartStatus::Failed { code, .. } = &settings.autostart else {
+                unreachable!();
+            };
+            assert_eq!(
+                vm.autostart.status,
+                crate::localization::failure_text(code, Language::ZhCn)
+            );
+        }
+    }
+
+    #[test]
+    fn retrying_failed_disable_collects_exactly_one_disable_command() {
+        let context = egui::Context::default();
+        super::super::style_root(&context);
+        let mut snapshot = snapshot();
+        snapshot.settings.autostart = failed_autostart(Some(AutostartKnownState::Enabled));
+        let mut control_id = None;
+        let mut commands = Vec::new();
+        for tick in 0..3 {
+            if let Some(id) = control_id {
+                context.memory_mut(|memory| memory.request_focus(id));
+            }
+            let events = if tick == 0 {
+                Vec::new()
+            } else {
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: tick == 1,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            };
+            let _ = context.run(
+                egui::RawInput {
+                    events,
+                    focused: true,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(552.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let output = render(ui, &snapshot, Language::ZhCn);
+                        control_id = Some(output.controls[2].id);
+                        if tick != 1 {
+                            assert!(output.commands.is_empty());
+                        }
+                        commands.extend(output.commands);
+                    });
+                },
+            );
+        }
+        assert!(matches!(
+            commands.as_slice(),
+            [UiCommand::SetAutostart(false)]
+        ));
     }
 }

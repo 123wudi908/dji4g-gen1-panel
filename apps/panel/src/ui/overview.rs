@@ -506,15 +506,7 @@ pub(crate) fn render_summary(
     probes: Option<&FeatureProbeView>,
 ) -> Option<crate::app::Page> {
     let mut destination = None;
-    let mut vm = overview_vm_with_probes(snapshot, language, probes);
-    if !snapshot.rates_sampled_at.is_some_and(|time| {
-        std::time::SystemTime::now()
-            .duration_since(time)
-            .is_ok_and(|age| age <= std::time::Duration::from_secs(3))
-    }) {
-        vm.down_rate = None;
-        vm.up_rate = None;
-    }
+    let vm = overview_vm_with_probes(snapshot, language, probes);
     let availability = super::availability_vm(
         &snapshot.app,
         &snapshot.diagnostics,
@@ -545,35 +537,14 @@ pub(crate) fn render_summary(
             }
         }
     });
-    section_frame(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        let values = [
-            ("运营商", vm.carrier.text.clone()),
-            ("信号", vm.signal.text.clone()),
-            (
-                "实时速率",
-                format!(
-                    "↓ {}   ↑ {}",
-                    vm.down_rate
-                        .map(super::format_rate_1dp)
-                        .unwrap_or_else(|| "--".into()),
-                    vm.up_rate
-                        .map(super::format_rate_1dp)
-                        .unwrap_or_else(|| "--".into())
-                ),
-            ),
-            ("温度", vm.temperature.text.clone()),
-        ];
-        let count = if ui.available_width() >= 680.0 { 4 } else { 2 };
-        for row in values.chunks(count) {
-            ui.columns(count, |columns| {
-                for (column, (label, value)) in columns.iter_mut().zip(row) {
-                    column.label(meta_text(*label));
-                    wrapped_label(column, RichText::new(value).strong());
-                }
-            });
-        }
-    });
+    // A quiet summary line; live throughput already has its own chart immediately below.
+    wrapped_label(
+        ui,
+        meta_text(format!(
+            "运营商 {}  ·  信号 {}  ·  温度 {}",
+            vm.carrier.text, vm.signal.text, vm.temperature.text
+        )),
+    );
     destination
 }
 
@@ -869,7 +840,7 @@ fn render_temperature_section(
             None => wrapped_label(
                 ui,
                 RichText::new(vm.temperature.text.clone())
-                    .size(scale::RATE_NUMBER)
+                    .size(scale::BODY)
                     .color(scale::FAINT),
             ),
         };

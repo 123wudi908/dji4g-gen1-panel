@@ -180,7 +180,7 @@ fn probe_finished(cycle: u64, epoch: DeviceEpoch, dns: ProbeStageDto) -> Backend
                 route_choices: Vec::new(),
                 epoch,
                 adapter_id: "{adapter}".to_owned(),
-                gateway: ProbeStageDto::Passed,
+                bound_route: ProbeStageDto::Passed,
                 public: ProbeStageDto::Passed,
                 dns,
                 protocol_coverage: Some(ProtocolCoverage::AllRequiredFamilies),
@@ -1165,7 +1165,7 @@ impl NetworkProbePort for QuietProbe {
                 route_choices: Vec::new(),
                 epoch: DeviceEpoch(1),
                 adapter_id: "{adapter}".to_owned(),
-                gateway: ProbeStageDto::Passed,
+                bound_route: ProbeStageDto::Passed,
                 public: ProbeStageDto::Passed,
                 dns: ProbeStageDto::Passed,
                 protocol_coverage: None,
@@ -1655,31 +1655,38 @@ fn runner_send_failed_and_outcome_unknown_store_their_honest_status() {
 
 #[test]
 fn runner_send_timeout_before_submission_is_failed_with_original_error() {
-    let sms = Arc::new(FakeSmsPort::with_replies([SmsReply::Err(
+    for code in [
         "sms:timeout",
-        dji4g_domain::ErrorCode::Timeout,
-    )]));
-    sms.set_pdu_mode(Some(true));
-    let (_clock, mut runner) =
-        sms_runner(Arc::clone(&sms), Arc::new(MetricsAdapter { metrics: None }));
-    runner.run_one_refresh();
+        "sms:sim_identity_required",
+        "sms:sim_identity_unverified",
+        "sms:sim_changed",
+    ] {
+        let sms = Arc::new(FakeSmsPort::with_replies([SmsReply::Err(
+            code,
+            dji4g_domain::ErrorCode::Timeout,
+        )]));
+        sms.set_pdu_mode(Some(true));
+        let (_clock, mut runner) =
+            sms_runner(Arc::clone(&sms), Arc::new(MetricsAdapter { metrics: None }));
+        runner.run_one_refresh();
 
-    queue_send(&mut runner, "+8613800138000", "超时");
+        queue_send(&mut runner, "+8613800138000", "超时");
 
-    assert_eq!(
-        sms.send_calls.load(Ordering::SeqCst),
-        1,
-        "a timed-out send is never retried automatically"
-    );
-    let state = runner.controller().state();
-    let stored = state.sms_store().messages();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].direction, SmsDirection::Outgoing);
-    assert_eq!(stored[0].status, SmsStatus::Failed);
-    assert_eq!(stored[0].body(), "超时");
-    let send = runner.controller().snapshot().sms_send.unwrap();
-    assert_eq!(send.result, Some(SmsSendResult::Failed));
-    assert_eq!(send.failure.unwrap().code, "sms:timeout");
+        assert_eq!(
+            sms.send_calls.load(Ordering::SeqCst),
+            1,
+            "a timed-out send is never retried automatically"
+        );
+        let state = runner.controller().state();
+        let stored = state.sms_store().messages();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].direction, SmsDirection::Outgoing);
+        assert_eq!(stored[0].status, SmsStatus::Failed);
+        assert_eq!(stored[0].body(), "超时");
+        let send = runner.controller().snapshot().sms_send.unwrap();
+        assert_eq!(send.result, Some(SmsSendResult::Failed));
+        assert_eq!(send.failure.unwrap().code, code);
+    }
 }
 
 #[test]

@@ -40,8 +40,15 @@ pub enum ProxyClient {
     None,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyBindingSource {
+    ConfigurationOnly,
+    RuntimeVerified,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyBinding {
+    pub source: ProxyBindingSource,
     pub client: ProxyClient,
     pub version: Option<String>,
     pub interface_alias: String,
@@ -80,6 +87,11 @@ pub fn classify_host_network(observation: &HostNetworkObservation) -> HostNetwor
             HostNetworkFinding::EvidenceIncomplete
         };
     };
+    if binding.source != ProxyBindingSource::RuntimeVerified
+        || !observation.proxy_inspection_complete
+    {
+        return HostNetworkFinding::EvidenceIncomplete;
+    }
     if binding.interface_alias.trim().is_empty() {
         return HostNetworkFinding::BindingAmbiguous;
     }

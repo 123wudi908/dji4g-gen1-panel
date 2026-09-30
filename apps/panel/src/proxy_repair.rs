@@ -121,7 +121,8 @@ fn scan() -> Result<(HostNetworkObservation, Option<RepairCandidate>), PortError
                 candidate.executable = executable;
             }
             observation.binding = inspected.binding;
-            observation.proxy_inspection_complete = true;
+            // Files cannot establish the active core configuration, even without a binding.
+            observation.proxy_inspection_complete = inspected.inspection_complete;
             Ok((observation, inspected.candidate))
         }
         Err(e) => {

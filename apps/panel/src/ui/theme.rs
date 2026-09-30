@@ -17,24 +17,24 @@ pub(crate) mod scale {
     pub(crate) const GRID: Color32 = Color32::from_rgb(0xeb, 0xeb, 0xeb);
     pub(crate) const AXIS: Color32 = Color32::from_rgb(0xd8, 0xd8, 0xd8);
 
-    pub(crate) const PAGE: f32 = 24.0;
-    pub(crate) const SECTION: f32 = 18.0;
+    pub(crate) const PAGE: f32 = 22.0;
+    pub(crate) const SECTION: f32 = 16.0;
     pub(crate) const LABEL: f32 = 14.0;
     pub(crate) const BODY: f32 = 14.0;
     pub(crate) const BUTTON: f32 = 14.0;
     pub(crate) const META: f32 = 12.0;
-    pub(crate) const RATE_NUMBER: f32 = 34.0;
+    pub(crate) const RATE_NUMBER: f32 = 28.0;
     pub(crate) const RATE_AUX: f32 = 13.0;
 
     pub(crate) const MUTED: Color32 = SECONDARY;
     pub(crate) const FAINT: Color32 = AXIS_LABEL;
     pub(crate) const DETAIL: Color32 = Color32::from_rgb(0x55, 0x5f, 0x6b);
 
-    pub(crate) const SECTION_MARGIN: [f32; 2] = [16.0, 16.0];
-    pub(crate) const SECTION_GAP: f32 = 16.0;
-    pub(crate) const COLUMN_GAP: f32 = 16.0;
-    pub(crate) const ROW_GAP: f32 = 12.0;
-    pub(crate) const CONTROL_GAP: [f32; 2] = [8.0, 8.0];
+    pub(crate) const SECTION_MARGIN: [f32; 2] = [12.0, 12.0];
+    pub(crate) const SECTION_GAP: f32 = 12.0;
+    pub(crate) const COLUMN_GAP: f32 = 12.0;
+    pub(crate) const ROW_GAP: f32 = 8.0;
+    pub(crate) const CONTROL_GAP: [f32; 2] = [8.0, 6.0];
 
     pub(crate) const LABEL_COLUMN: f32 = 96.0;
 }
@@ -42,10 +42,10 @@ pub(crate) mod scale {
 pub(crate) fn style_root(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Light);
     let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = Color32::from_rgb(0xf0, 0xf4, 0xf9);
+    visuals.panel_fill = Color32::from_rgb(0xf6, 0xf8, 0xfc);
     visuals.window_fill = Color32::WHITE;
-    visuals.faint_bg_color = Color32::from_rgb(0xf5, 0xf5, 0xf5);
-    visuals.extreme_bg_color = Color32::from_rgb(0xed, 0xed, 0xed);
+    visuals.faint_bg_color = Color32::from_rgb(0xf1, 0xf3, 0xf4);
+    visuals.extreme_bg_color = Color32::from_rgb(0xf8, 0xfa, 0xfd);
     visuals.widgets.noninteractive.bg_fill = Color32::WHITE;
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, scale::INK);
     visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xf1, 0xf3, 0xf4);
@@ -56,7 +56,7 @@ pub(crate) fn style_root(ctx: &egui::Context) {
         &mut visuals.widgets.hovered,
         &mut visuals.widgets.active,
     ] {
-        widget.rounding = egui::Rounding::same(20.0);
+        widget.rounding = egui::Rounding::same(8.0);
         widget.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(116, 119, 117));
         widget.fg_stroke = egui::Stroke::new(1.0_f32, scale::INK);
     }
@@ -64,16 +64,16 @@ pub(crate) fn style_root(ctx: &egui::Context) {
     visuals.selection.bg_fill = scale::DOWNLOAD;
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
     visuals.hyperlink_color = scale::DOWNLOAD;
-    visuals.window_rounding = egui::Rounding::same(28.0);
+    visuals.window_rounding = egui::Rounding::same(16.0);
     visuals.window_stroke = egui::Stroke::NONE;
 
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;
+    style.animation_time = 0.1;
     style.spacing.item_spacing = egui::vec2(8.0, scale::SECTION_GAP);
-    style.spacing.button_padding = egui::vec2(20.0, 10.0);
-    style.spacing.window_margin = egui::Margin::same(24.0);
-    style.visuals.extreme_bg_color = Color32::from_rgb(240, 244, 249);
-    style.spacing.interact_size = egui::vec2(80.0, 40.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.interact_size = egui::vec2(32.0, 32.0);
 
     style.text_styles = [
         (TextStyle::Heading, FontId::proportional(scale::PAGE)),
@@ -89,15 +89,55 @@ pub(crate) fn style_root(ctx: &egui::Context) {
 }
 
 /// Consistent, clearly visible primary action across page and confirmation surfaces.
-pub(crate) fn primary_button(label: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(
-        egui::RichText::new(label.into())
-            .color(Color32::WHITE)
-            .size(scale::BUTTON),
-    )
-    .fill(scale::DOWNLOAD)
-    .rounding(24.0)
-    .min_size(egui::vec2(112.0, 48.0))
+pub(crate) fn primary_button(label: impl Into<String>) -> impl egui::Widget + 'static {
+    PrimaryButton {
+        label: label.into(),
+    }
+}
+
+struct PrimaryButton {
+    label: String,
+}
+
+impl egui::Widget for PrimaryButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let enabled = ui.is_enabled();
+        ui.scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            let disabled_fill = Color32::from_rgb(232, 234, 237);
+            widgets.noninteractive.weak_bg_fill = disabled_fill;
+            widgets.inactive.weak_bg_fill = if enabled {
+                scale::DOWNLOAD
+            } else {
+                disabled_fill
+            };
+            widgets.hovered.weak_bg_fill = if enabled {
+                Color32::from_rgb(23, 100, 220)
+            } else {
+                disabled_fill
+            };
+            widgets.active.weak_bg_fill = if enabled {
+                Color32::from_rgb(9, 75, 180)
+            } else {
+                disabled_fill
+            };
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new(self.label)
+                        .color(if enabled {
+                            Color32::WHITE
+                        } else {
+                            scale::AXIS_LABEL
+                        })
+                        .size(scale::BUTTON),
+                )
+                .stroke(egui::Stroke::NONE)
+                .rounding(18.0)
+                .min_size(egui::vec2(88.0, 36.0)),
+            )
+        })
+        .inner
+    }
 }
 
 #[cfg(test)]
@@ -110,7 +150,7 @@ mod material_regressions {
         ctx.set_theme(egui::Theme::Dark);
         style_root(&ctx);
         ctx.set_theme(egui::Theme::Light);
-        assert!(ctx.style().spacing.interact_size.y >= 40.0);
+        assert!(ctx.style().spacing.interact_size.y >= 32.0);
         assert_eq!(ctx.style().visuals.selection.bg_fill, scale::DOWNLOAD);
     }
 }

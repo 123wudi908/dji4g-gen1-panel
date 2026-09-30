@@ -1127,3 +1127,466 @@ fn a_device_change_drops_capability_evidence_and_the_frozen_plan() {
     assert!(snapshot.device_tools.capabilities.is_empty());
     assert!(snapshot.device_tools.profile.is_empty());
 }
+
+fn current_tool_context(controller: &Controller) -> ToolContext {
+    let snapshot = controller.snapshot();
+    let device = snapshot
+        .app
+        .device
+        .as_ref()
+        .expect("ready fixture has a device");
+    ToolContext {
+        device_epoch: device.epoch,
+        sim_epoch: snapshot.sim_epoch,
+        identity: device.identity.clone(),
+        at_port: device.at_port.clone().unwrap_or_else(|| "[unknown]".into()),
+    }
+}
+
+fn seed_current_tool_evidence(controller: &mut Controller) -> ToolContext {
+    let context = current_tool_context(controller);
+    controller.record_tool_capability(ToolCapabilityRow::new(
+        ToolReadId::Manufacturer,
+        ToolOutcome::Ok,
+        context.clone(),
+        SystemTime::UNIX_EPOCH,
+    ));
+    controller.update_tool_profile(&context, |profile| {
+        profile.manufacturer = Some("old-device".into());
+    });
+    controller.finish_tool_task(ToolReceipt {
+        id: 99,
+        context: context.clone(),
+        operation: ToolOperationKind::Read(ToolReadId::Manufacturer),
+        outcome: ToolOutcome::Ok,
+        elapsed: Duration::ZERO,
+        transcript: Arc::new(ToolTranscript::from_lines(["old-device".into()])),
+        saw_final_code: true,
+        payload_lines: 1,
+    });
+    context
+}
+
+fn apply_inventory_context(
+    controller: &mut Controller,
+    epoch: DeviceEpoch,
+    identity: Option<StableDeviceIdentity>,
+    at_port: Option<String>,
+) {
+    controller.apply_backend_event(dji4g_application::BackendEvent::InventoryFinished {
+        cycle: dji4g_application::RefreshCycleId(1),
+        epoch,
+        result: dji4g_application::CheckResult::Passed {
+            value: dji4g_application::InventoryObservation {
+                epoch,
+                presence: if identity.is_some() {
+                    dji4g_domain::DevicePresence::Supported(dji4g_domain::DJI_GEN1)
+                } else {
+                    dji4g_domain::DevicePresence::NotDetected
+                },
+                identity,
+                at_port,
+                problem_code: None,
+                adapter_id: Some("{adapter}".into()),
+            },
+            observed_at: SystemTime::UNIX_EPOCH,
+        },
+    });
+}
+
+#[test]
+fn ordinary_inventory_context_changes_drop_cached_tools_and_frozen_commands() {
+    for change in ["epoch", "identity", "port", "removal", "unchanged"] {
+        let mut controller = controller();
+        let old_context = seed_current_tool_evidence(&mut controller);
+        controller
+            .handle_command(UiCommand::PrepareExpertTool {
+                line: ValidatedToolLine::parse("AT+VENDOR=1").unwrap(),
+            })
+            .unwrap();
+        let mut epoch = old_context.device_epoch;
+        let mut identity = Some(old_context.identity.clone());
+        let mut port = Some(old_context.at_port.clone());
+        match change {
+            "epoch" => epoch = DeviceEpoch(epoch.0 + 1),
+            "identity" => identity
+                .as_mut()
+                .unwrap()
+                .device_instance_id
+                .push_str("-new"),
+            "port" => port = Some("COM11".into()),
+            "removal" => {
+                identity = None;
+                port = None;
+            }
+            _ => {}
+        }
+        apply_inventory_context(&mut controller, epoch, identity, port);
+        let tools = controller.snapshot().device_tools;
+        if change == "unchanged" {
+            assert_eq!(tools.profile.manufacturer.as_deref(), Some("old-device"));
+            assert_eq!(tools.capabilities.len(), 1);
+            assert_eq!(tools.history.len(), 1);
+            assert!(tools.pending_expert.is_some());
+        } else {
+            assert!(tools.profile.is_empty(), "{change}");
+            assert!(tools.capabilities.is_empty(), "{change}");
+            assert!(tools.history.is_empty(), "{change}");
+            assert!(tools.pending_expert.is_none(), "{change}");
+            // A late callback cannot restore a field or capability from the old context.
+            controller.record_tool_capability(ToolCapabilityRow::new(
+                ToolReadId::Manufacturer,
+                ToolOutcome::Ok,
+                old_context.clone(),
+                SystemTime::UNIX_EPOCH,
+            ));
+            controller.update_tool_profile(&old_context, |profile| {
+                profile.manufacturer = Some("late-old-device".into());
+            });
+            assert!(controller.snapshot().device_tools.profile.is_empty());
+            assert!(controller.snapshot().device_tools.capabilities.is_empty());
+        }
+    }
+}
+
+fn apply_sim_fingerprint(controller: &mut Controller, cycle: u64, fingerprint: u8) {
+    let epoch = current_tool_context(controller).device_epoch;
+    controller.apply_backend_event(dji4g_application::BackendEvent::AtFinished {
+        cycle: dji4g_application::RefreshCycleId(cycle),
+        epoch,
+        result: dji4g_application::CheckResult::Passed {
+            value: dji4g_application::AtObservation {
+                availability: dji4g_domain::AtControlAvailability::Available,
+                cellular: Some(dji4g_domain::CellularSnapshot {
+                    sim: dji4g_domain::SimState::Ready,
+                    registration: dji4g_domain::RegistrationState::RegisteredHome,
+                    attached: dji4g_domain::AttachState::Attached,
+                    carrier: None,
+                    radio_access_technology: None,
+                    signal_rssi_dbm: None,
+                    apn: None,
+                    pdp_address: None,
+                    pdp_state: None,
+                    firmware: None,
+                    serving_cell: None,
+                    sim_identity: Some(dji4g_domain::SimIdentity {
+                        iccid_masked: "8986****0123".into(),
+                        fingerprint: [fingerprint; 8],
+                    }),
+                    numbers: None,
+                    temperature_celsius: None,
+                    temperature_status: FeatureStatus::NotProbed,
+                }),
+            },
+            observed_at: SystemTime::UNIX_EPOCH,
+        },
+    });
+}
+
+#[test]
+fn an_observed_sim_swap_withdraws_tool_evidence_and_the_frozen_command() {
+    let mut controller = controller();
+    apply_sim_fingerprint(&mut controller, 1, 1);
+    let old_context = seed_current_tool_evidence(&mut controller);
+    controller
+        .handle_command(UiCommand::PrepareExpertTool {
+            line: ValidatedToolLine::parse("AT+VENDOR=1").unwrap(),
+        })
+        .unwrap();
+    apply_sim_fingerprint(&mut controller, 2, 2);
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.sim_epoch, old_context.sim_epoch + 1);
+    assert!(snapshot.device_tools.pending_expert.is_none());
+    assert!(snapshot.device_tools.capabilities.is_empty());
+    assert!(snapshot.device_tools.profile.is_empty());
+    assert!(snapshot.device_tools.history.is_empty());
+}
+
+#[test]
+fn a_new_expert_command_replaces_an_expired_plan_but_keeps_a_live_one() {
+    let mut controller = controller();
+    controller
+        .handle_command(UiCommand::PrepareExpertTool {
+            line: ValidatedToolLine::parse("AT+VENDOR=1").unwrap(),
+        })
+        .unwrap();
+    let first = controller.snapshot().device_tools.pending_expert.unwrap();
+    assert!(
+        controller
+            .handle_command(UiCommand::PrepareExpertTool {
+                line: ValidatedToolLine::parse("AT+VENDOR=2").unwrap(),
+            })
+            .is_err()
+    );
+    assert_eq!(
+        controller
+            .snapshot()
+            .device_tools
+            .pending_expert
+            .unwrap()
+            .id,
+        first.id
+    );
+    controller.advance_time(dji4g_application::PLAN_LIFETIME + Duration::from_secs(1));
+    controller
+        .handle_command(UiCommand::PrepareExpertTool {
+            line: ValidatedToolLine::parse("AT+VENDOR=2").unwrap(),
+        })
+        .expect("the expired plan must not block a fresh preparation");
+    let second = controller.snapshot().device_tools.pending_expert.unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(second.line.expose_for_confirmation(), "AT+VENDOR=2");
+    assert!(
+        controller
+            .handle_command(UiCommand::ConfirmExpertTool { id: first.id })
+            .is_err()
+    );
+    assert!(controller.take_next_tool_request().is_none());
+    controller
+        .handle_command(UiCommand::ConfirmExpertTool { id: second.id })
+        .unwrap();
+    assert_eq!(controller.take_next_tool_request().unwrap().id, second.id);
+    assert!(controller.take_next_tool_request().is_none());
+}
+
+/// Let the first child answer, then hold the second child so the parent's intermediate state is
+/// observable. Both ID counters initially produce 1, which previously ended the whole parent.
+struct SecondToolWaits {
+    calls: std::sync::atomic::AtomicUsize,
+    control: std::sync::Mutex<Option<dji4g_application::ToolControl>>,
+}
+
+impl DeviceToolsPort for SecondToolWaits {
+    fn execute(
+        &self,
+        _: &TargetContext,
+        request: ToolRequest,
+        control: dji4g_application::ToolControl,
+    ) -> PortFuture<'_, Result<ToolReceipt, PortError>> {
+        let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if index > 0 {
+            *self.control.lock().unwrap() = Some(control.clone());
+        }
+        Box::pin(std::future::poll_fn(move |_| {
+            if index > 0 && !control.is_cancelled() {
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(Ok(ToolReceipt {
+                id: request.id,
+                context: request.context.clone(),
+                operation: request.operation.kind(),
+                outcome: if index == 0 {
+                    ToolOutcome::Ok
+                } else {
+                    ToolOutcome::CancelledBeforeWrite
+                },
+                elapsed: Duration::ZERO,
+                transcript: Arc::new(ToolTranscript::new()),
+                saw_final_code: index == 0,
+                payload_lines: 0,
+            }))
+        }))
+    }
+}
+
+#[test]
+fn a_sweep_stays_busy_and_cancellable_after_its_first_child_finishes() {
+    let tools = Arc::new(SecondToolWaits {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        control: std::sync::Mutex::new(None),
+    });
+    let (_, runner) = ControllerRunner::new(controller());
+    let mut runner = runner.with_ports(ports_with(Some(tools.clone())));
+    runner
+        .handle()
+        .try_send(UiCommand::ProbeDeviceTools)
+        .unwrap();
+    runner.poll_commands();
+    for _ in 0..100 {
+        runner.poll_tool_requests();
+        if tools.control.lock().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        tools.control.lock().unwrap().is_some(),
+        "second child must be in flight"
+    );
+    let snapshot = runner.controller().snapshot();
+    let task = snapshot.device_tools.task.unwrap();
+    assert_eq!(task.phase, ToolPhase::Running);
+    assert_eq!(task.completed_items, 1);
+    assert!(snapshot.serial_work_busy);
+    assert!(runner.controller().tool_active());
+    for command in [
+        UiCommand::SmsSend {
+            recipient: "+8613800138000".into(),
+            body: "test".into(),
+        },
+        UiCommand::RunToolRead {
+            id: ToolReadId::Model,
+        },
+        UiCommand::PrepareRepair {
+            request: dji4g_application::ControlledRepairRequest::RestartModule,
+        },
+    ] {
+        assert!(runner.controller_mut().handle_command(command).is_err());
+    }
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::CancelDeviceTool { id: task.id })
+        .unwrap();
+    settle_tools(&mut runner, 100);
+    assert_eq!(tools.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(!runner.controller().snapshot().serial_work_busy);
+    assert_eq!(
+        runner
+            .controller()
+            .snapshot()
+            .device_tools
+            .task
+            .unwrap()
+            .outcome,
+        Some(ToolOutcome::CancelledBeforeWrite)
+    );
+}
+
+/// A worker may return a response after its target changed. The transcript must stay isolated,
+/// while an unacknowledged write must still be reported as possibly applied.
+struct LateTool {
+    control: std::sync::Mutex<Option<dji4g_application::ToolControl>>,
+    release: std::sync::atomic::AtomicBool,
+    final_code: bool,
+}
+
+impl DeviceToolsPort for LateTool {
+    fn execute(
+        &self,
+        _: &TargetContext,
+        request: ToolRequest,
+        control: dji4g_application::ToolControl,
+    ) -> PortFuture<'_, Result<ToolReceipt, PortError>> {
+        control.mark_write_attempted();
+        *self.control.lock().unwrap() = Some(control);
+        Box::pin(std::future::poll_fn(move |_| {
+            if !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(Ok(ToolReceipt {
+                id: request.id,
+                context: request.context.clone(),
+                operation: request.operation.kind(),
+                outcome: if self.final_code {
+                    ToolOutcome::Ok
+                } else {
+                    ToolOutcome::OutcomeUnknown
+                },
+                elapsed: Duration::ZERO,
+                transcript: Arc::new(ToolTranscript::from_lines([
+                    "+CGMI: old-device-secret".into()
+                ])),
+                saw_final_code: self.final_code,
+                payload_lines: 1,
+            }))
+        }))
+    }
+}
+
+#[test]
+fn a_changed_target_is_busy_until_reclaimed_and_late_evidence_is_isolated() {
+    for final_code in [true, false] {
+        let tools = Arc::new(LateTool {
+            control: std::sync::Mutex::new(None),
+            release: std::sync::atomic::AtomicBool::new(false),
+            final_code,
+        });
+        let (_, runner) = ControllerRunner::new(controller());
+        let mut runner = runner.with_ports(ports_with(Some(tools.clone())));
+        let old_context = current_tool_context(runner.controller());
+        if final_code {
+            runner
+                .controller_mut()
+                .handle_command(UiCommand::RunToolRead {
+                    id: ToolReadId::Manufacturer,
+                })
+                .unwrap();
+        } else {
+            runner
+                .controller_mut()
+                .handle_command(UiCommand::PrepareExpertTool {
+                    line: ValidatedToolLine::parse("AT+VENDOR=1").unwrap(),
+                })
+                .unwrap();
+            let id = runner
+                .controller()
+                .snapshot()
+                .device_tools
+                .pending_expert
+                .unwrap()
+                .id;
+            runner
+                .controller_mut()
+                .handle_command(UiCommand::ConfirmExpertTool { id })
+                .unwrap();
+        }
+        runner.poll_tool_requests();
+        for _ in 0..100 {
+            if tools.control.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(tools.control.lock().unwrap().is_some());
+        apply_inventory_context(
+            runner.controller_mut(),
+            DeviceEpoch(old_context.device_epoch.0 + 1),
+            Some(identity()),
+            Some("COM11".into()),
+        );
+        let snapshot = runner.controller().snapshot();
+        assert!(
+            snapshot.serial_work_busy,
+            "a still-owned worker must not release the busy state"
+        );
+        assert_eq!(
+            snapshot.device_tools.task.unwrap().phase,
+            ToolPhase::Cancelling
+        );
+        runner.poll_tool_requests();
+        assert!(
+            tools
+                .control
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_cancelled()
+        );
+        tools
+            .release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        settle_tools(&mut runner, 100);
+        let tools_snapshot = runner.controller().snapshot().device_tools;
+        assert!(tools_snapshot.capabilities.is_empty());
+        assert!(tools_snapshot.profile.is_empty());
+        assert_eq!(
+            tools_snapshot.history.len(),
+            1,
+            "keep the terminal outcome boundary"
+        );
+        let entry = tools_snapshot.history.entries().front().unwrap();
+        assert!(
+            entry.transcript.is_empty(),
+            "old-device response must not appear in the new session"
+        );
+        let expected = if final_code {
+            ToolOutcome::ContextChanged
+        } else {
+            ToolOutcome::OutcomeUnknown
+        };
+        assert_eq!(entry.outcome, expected);
+        assert_eq!(tools_snapshot.task.unwrap().outcome, Some(expected));
+        assert!(!runner.controller().snapshot().serial_work_busy);
+    }
+}

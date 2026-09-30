@@ -874,6 +874,14 @@ pub(crate) mod tests_support {
             unicast_addresses: vec![source.parse().unwrap()],
         }
     }
+    pub(crate) fn fixture_identity_dual() -> AdapterIdentity {
+        let mut target = fixture_identity(DeviceEpoch(7), 55, 42, "192.168.225.2");
+        target.ipv6_index = Some(43);
+        target
+            .unicast_addresses
+            .push("2001:db8::2".parse().unwrap());
+        target
+    }
     pub(crate) fn fixture_identity_v6(
         epoch: DeviceEpoch,
         luid: u64,

@@ -42,8 +42,8 @@ pub use module_network_check::{
     ModuleNetworkCheckPhase, ModuleNetworkCheckSnapshot, NetworkRepairKind, step_state,
 };
 pub use monitor::{
-    ControllerRunner, MonitorPorts, RATE_READ_TIMEOUT, RATE_TICK_INTERVAL, REFRESH_INTERVAL,
-    STAGE_TIMEOUT, periodic_refresh_due, rate_tick_due,
+    ControllerRunner, MonitorPorts, PROBE_STAGE_TIMEOUT, RATE_READ_TIMEOUT, RATE_TICK_INTERVAL,
+    REFRESH_INTERVAL, STAGE_TIMEOUT, periodic_refresh_due, rate_tick_due,
 };
 pub use ports::{
     ActionExecutor, ActionPreconditions, AdapterContext, AdapterMetrics, AdapterNetworkDetails,

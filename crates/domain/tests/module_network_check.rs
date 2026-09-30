@@ -12,7 +12,7 @@ fn only_bound_public_and_dns_pass_prove_module_connectivity() {
     e.device = S::Passed;
     e.adapter = S::Passed;
     e.address_route = S::Passed;
-    e.gateway = S::Passed;
+    e.bound_route = S::Passed;
     e.public = S::Passed;
     e.dns = S::Passed;
     assert_eq!(classify_module_network(&e), ModuleNetworkVerdict::Usable);
@@ -79,12 +79,12 @@ fn disconnected_link_and_gateway_failure_are_specific_not_driver_claims() {
     assert_eq!(classify_module_network(&e), ModuleNetworkVerdict::LinkDown);
     e.link = S::Passed;
     e.address_route = S::Passed;
-    e.gateway = S::Failed;
+    e.bound_route = S::Failed;
     assert_eq!(
         classify_module_network(&e),
-        ModuleNetworkVerdict::GatewayIssue
+        ModuleNetworkVerdict::BoundRouteIssue
     );
-    e.gateway = S::Unavailable;
+    e.bound_route = S::Unavailable;
     assert_eq!(
         classify_module_network(&e),
         ModuleNetworkVerdict::Inconclusive

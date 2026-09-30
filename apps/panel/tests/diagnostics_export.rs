@@ -287,3 +287,12 @@ fn serialized_sms_messages_redact_sender_and_body_even_outside_the_export() {
     assert!(!json.contains("private message body"), "body leaked");
     assert!(json.contains("[REDACTED]"));
 }
+
+#[test]
+fn route_export_labels_do_not_claim_gateway_reachability() {
+    assert_eq!(check_id_name(DiagnosticCheckId::BoundRoute), "bound_route");
+    assert_eq!(
+        LocalizedText::new(Language::ZhCn, TextKey::FieldBoundRouteProbe).text,
+        "模块绑定路由查询"
+    );
+}

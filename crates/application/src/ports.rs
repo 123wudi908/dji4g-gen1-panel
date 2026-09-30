@@ -623,7 +623,7 @@ pub struct ProbeObservationDto {
     pub route_choices: Vec<NetworkRouteChoice>,
     pub epoch: DeviceEpoch,
     pub adapter_id: String,
-    pub gateway: ProbeStageDto,
+    pub bound_route: ProbeStageDto,
     pub public: ProbeStageDto,
     pub dns: ProbeStageDto,
     pub protocol_coverage: Option<ProtocolCoverage>,
@@ -692,8 +692,16 @@ pub trait ActionExecutor: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionReceiptOutcome {
     Applied,
-    Failed { code: ErrorCode },
-    OutcomeUnknown { code: ErrorCode },
+    Failed {
+        code: ErrorCode,
+    },
+    FailedWithRollback {
+        code: ErrorCode,
+        rollback: dji4g_domain::RollbackOutcome,
+    },
+    OutcomeUnknown {
+        code: ErrorCode,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -802,6 +810,9 @@ pub enum CommandState {
 pub struct CommandStateSnapshot {
     pub state: CommandState,
     pub last_error: Option<FailureCode>,
+    /// Monotonic evidence of explicitly rejected SmsSend commands. Unlike the transient
+    /// feedback notice, it survives later accepted commands and coalesced watch updates.
+    pub sms_send_rejected_seq: u64,
 }
 
 impl Default for CommandStateSnapshot {
@@ -809,6 +820,7 @@ impl Default for CommandStateSnapshot {
         Self {
             state: CommandState::Ready,
             last_error: None,
+            sms_send_rejected_seq: 0,
         }
     }
 }

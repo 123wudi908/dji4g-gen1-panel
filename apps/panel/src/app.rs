@@ -201,6 +201,23 @@ impl UiCommandSink for ControllerHandle {
     }
 }
 
+/// Keep dispatch failures visible even when a page or native-dialog worker cannot mutate
+/// the panel directly. The existing toast consumes this slot on the next UI frame.
+struct ReportingCommands {
+    inner: Arc<dyn UiCommandSink>,
+    error: Arc<Mutex<Option<ApplicationUiSendError>>>,
+}
+
+impl UiCommandSink for ReportingCommands {
+    fn try_send(&self, command: UiCommand) -> Result<(), ApplicationUiSendError> {
+        let result = self.inner.try_send(command);
+        if let Err(error) = &result {
+            *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
+        }
+        result
+    }
+}
+
 /// Sink wrapper that fulfils UI-owned commands before dispatch. `ExportDiagnostics` is built
 /// from the snapshot the UI already holds, so it must never reach the controller queue; the
 /// click is recorded here and completed by [`PanelApp::export_diagnostics`] after layout.
@@ -369,6 +386,7 @@ pub struct PanelApp {
     exit_archive_observed: bool,
     snapshot_rx: dji4g_application::sync::watch::Receiver<Arc<ControllerSnapshot>>,
     commands: Arc<dyn UiCommandSink>,
+    command_error: Arc<Mutex<Option<ApplicationUiSendError>>>,
     snapshot: Arc<ControllerSnapshot>,
     language: Language,
     page: Page,
@@ -644,6 +662,11 @@ impl PanelApp {
         let snapshot = inputs.snapshot_rx.borrow();
         let language = language_from_code(snapshot.settings.language);
         let persisted_revision = snapshot.settings.revision;
+        let command_error = Arc::new(Mutex::new(None));
+        let commands = Arc::new(ReportingCommands {
+            inner: inputs.commands,
+            error: Arc::clone(&command_error),
+        });
         Self {
             onboarding: Default::default(),
             loaded_config: ConfigV1::default(),
@@ -654,7 +677,8 @@ impl PanelApp {
             exit_archive_snapshot: None,
             exit_archive_observed: false,
             snapshot_rx: inputs.snapshot_rx,
-            commands: inputs.commands,
+            commands,
+            command_error,
             snapshot,
             language,
             page: Page::Overview,
@@ -702,6 +726,11 @@ impl PanelApp {
         let snapshot = Arc::clone(&inputs.snapshot_rx.borrow_and_update());
         let language = language_from_code(snapshot.settings.language);
         let persisted_revision = snapshot.settings.revision;
+        let command_error = Arc::new(Mutex::new(None));
+        let commands = Arc::new(ReportingCommands {
+            inner: inputs.commands,
+            error: Arc::clone(&command_error),
+        });
         Self {
             onboarding: Default::default(),
             loaded_config: ConfigV1::default(),
@@ -712,7 +741,8 @@ impl PanelApp {
             exit_archive_snapshot: None,
             exit_archive_observed: false,
             snapshot_rx: inputs.snapshot_rx,
-            commands: inputs.commands,
+            commands,
+            command_error,
             snapshot,
             language,
             page: Page::Overview,
@@ -942,6 +972,10 @@ impl PanelApp {
         self.sms_compose.review_editor();
     }
     #[cfg(debug_assertions)]
+    pub fn set_review_sms_queue_error(&mut self) {
+        self.sms_compose.review_queue_error();
+    }
+    #[cfg(debug_assertions)]
     pub fn set_review_sms_confirmation(&mut self) {
         self.sms_compose.review_confirmation();
     }
@@ -1105,6 +1139,7 @@ impl PanelApp {
             let previous_send = self.snapshot.sms_send.clone();
             let previous_snapshot = Arc::clone(&self.snapshot);
             self.snapshot = self.snapshot_rx.borrow_and_update();
+            self.sms_compose.observe_snapshot(&self.snapshot);
             self.support_report
                 .observe(&previous_snapshot, &self.snapshot);
             self.wireless_history.observe(&self.snapshot);
@@ -1328,7 +1363,17 @@ impl PanelApp {
             self.export_diagnostics(SystemTime::now());
             return;
         }
-        if let Err(error) = self.commands.try_send(command) {
+        let _ = self.commands.try_send(command);
+        self.show_command_error();
+    }
+
+    fn show_command_error(&mut self) {
+        let error = self
+            .command_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(error) = error {
             let key = match error {
                 ApplicationUiSendError::QueueFull => TextKey::StatusQueueFull,
                 ApplicationUiSendError::Closed => TextKey::StatusBackendUnavailable,
@@ -1367,6 +1412,7 @@ impl PanelApp {
 
     /// Render the same UI without requiring a native window; callers supply their own input.
     pub fn render_ui(&mut self, ctx: &egui::Context) {
+        self.sms_compose.observe_snapshot(&self.snapshot);
         self.support_report.poll();
         if let Some(archive) = &mut self.archive {
             archive.poll();
@@ -1384,7 +1430,7 @@ impl PanelApp {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.heading("正在完成本地短信历史操作");
-                    ui.spinner();
+                    crate::ui::components::loading_spinner(ui);
                     ui.label("保存、清空或导出结束后将自动退出，请稍候。");
                 });
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -1443,19 +1489,19 @@ impl PanelApp {
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(240, 244, 249))
-                    .inner_margin(egui::Margin::symmetric(20.0, 12.0)),
+                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     crate::ui::shell::brand(ui);
-                    ui.add_space(16.0);
+                    ui.add_space(12.0);
                     ui.label(
                         RichText::new(&availability.title.text)
                             .size(14.0)
                             .color(availability.tone.color()),
                     );
                     if availability.is_loading {
-                        ui.spinner();
+                        crate::ui::components::loading_spinner(ui);
                     }
                     if crate::ui::components::action_button(
                         ui,
@@ -1489,13 +1535,13 @@ impl PanelApp {
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(240, 244, 249))
-                    .inner_margin(egui::Margin::symmetric(20.0, 8.0)),
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
             )
             .show(ctx, |ui| {
                 if !self.support_report.status.is_empty() {
                     ui.horizontal_wrapped(|ui| {
                         if self.support_report.busy() {
-                            ui.spinner();
+                            crate::ui::components::loading_spinner(ui);
                         }
                         if self.support_report.path.is_some() && !self.support_report.busy() {
                             ui.label("详细日志已导出")
@@ -1534,8 +1580,8 @@ impl PanelApp {
                             OperationState::Running { phase } => {
                                 crate::ui::operation_phase_text(*phase, None, self.language)
                             }
-                            OperationState::Finished { outcome, .. } => {
-                                crate::ui::operation_outcome_text(outcome, self.language)
+                            OperationState::Finished { .. } => {
+                                crate::ui::operation_result_text(operation, self.language)
                             }
                         };
                         ui.label(crate::ui::meta_text(text.text));
@@ -1588,7 +1634,7 @@ impl PanelApp {
                 .frame(
                     egui::Frame::none()
                         .fill(Color32::from_rgb(240, 244, 249))
-                        .inner_margin(12.0),
+                        .inner_margin(8.0),
                 )
                 .show(ctx, |ui| {
                     crate::ui::shell::navigation(ui, &mut self.page, self.language)
@@ -1598,12 +1644,12 @@ impl PanelApp {
             .frame(
                 egui::Frame::none()
                     .fill(Color32::WHITE)
-                    .rounding(24.0)
+                    .rounding(16.0)
                     .outer_margin(egui::Margin::symmetric(12.0, 0.0))
                     .inner_margin(if ctx.screen_rect().width() < 1000.0 {
-                        20.0
+                        16.0
                     } else {
-                        28.0
+                        20.0
                     }),
             )
             .show(ctx, |ui| {
@@ -1729,12 +1775,10 @@ impl PanelApp {
                                 self.device_tools = tools_state;
                             }
                             Page::Settings => {
-                                let _ = settings::render(
-                                    ui,
-                                    &snapshot,
-                                    self.language,
-                                    self.commands.as_ref(),
-                                );
+                                let output = settings::render(ui, &snapshot, self.language);
+                                for command in output.commands {
+                                    self.send(command);
+                                }
                                 ui.separator();
                                 ui.horizontal_wrapped(|ui| {
                                     if ui.button("重新查看首次使用引导").clicked() {
@@ -1768,6 +1812,8 @@ impl PanelApp {
         if driver_install_requested {
             self.start_driver_install(ctx);
         }
+
+        self.show_command_error();
 
         if let Some(toast) = &self.toast {
             if now >= toast.expires_at {
@@ -2001,6 +2047,14 @@ impl PanelApp {
         }
         // Send the prepare first: the controller handles it within one poll interval (~20 ms),
         // typically while the user is still reading the box that opens below.
+        // The receiver may be ahead of the last painted frame. Capture its current plan before
+        // dispatch so an unrelated publication cannot confirm an older plan of the same type.
+        let mut snapshot_rx = self.snapshot_rx.clone();
+        let previous_plan = snapshot_rx
+            .borrow_and_update()
+            .prepared_action
+            .as_ref()
+            .map(|p| p.id);
         if self.commands.try_send(command).is_err() {
             // The prepare never reached the controller, so no plan can follow; show no box.
             self.dialog_busy.store(false, Ordering::Release);
@@ -2009,7 +2063,6 @@ impl PanelApp {
         let owner = self.panel_hwnd;
         let commands = Arc::clone(&self.commands);
         let busy = Arc::clone(&self.dialog_busy);
-        let mut snapshot_rx = self.snapshot_rx.clone();
         let spawned = std::thread::Builder::new()
             .name("dji4g-native-dialog".to_owned())
             .spawn(move || {
@@ -2019,7 +2072,7 @@ impl PanelApp {
                 // The answer turns into a command only once the plan this click prepared has
                 // been published (bounded wait): a prepare the controller rejected never gets a
                 // Confirm/Cancel, and the rejection surfaces through the ordinary feedback toast.
-                if let Some(id) = wait_for_prepared_plan(&mut snapshot_rx, tag) {
+                if let Some(id) = wait_for_prepared_plan(&mut snapshot_rx, tag, previous_plan) {
                     let command = if confirmed {
                         UiCommand::ConfirmAction { id }
                     } else {
@@ -2106,6 +2159,7 @@ fn action_metadata(action: &ActionKind) -> Option<(ActionKindTag, DisruptionLeve
 fn wait_for_prepared_plan(
     snapshot_rx: &mut dji4g_application::sync::watch::Receiver<Arc<ControllerSnapshot>>,
     tag: ActionKindTag,
+    previous_plan: Option<ActionPlanId>,
 ) -> Option<ActionPlanId> {
     let deadline = std::time::Instant::now() + PREPARED_PLAN_WAIT;
     loop {
@@ -2113,13 +2167,14 @@ fn wait_for_prepared_plan(
             let snapshot = snapshot_rx.borrow_and_update();
             if let Some(prepared) = snapshot.prepared_action.as_ref() {
                 if prepared.action == tag
+                    && Some(prepared.id) != previous_plan
                     && matches!(prepared.state, PreparedActionState::AwaitingConfirmation)
                 {
                     return Some(prepared.id);
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if snapshot_rx.is_closed() || std::time::Instant::now() >= deadline {
             return None;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -2358,6 +2413,25 @@ mod tests {
     fn panel() -> PanelApp {
         let snapshot = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
         PanelApp::from_snapshot(snapshot, Arc::new(NoopSink))
+    }
+
+    #[test]
+    fn sms_context_is_observed_while_settings_page_is_visible() {
+        let initial = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
+        let (tx, rx) = dji4g_application::sync::watch::channel(Arc::clone(&initial));
+        let mut app = PanelApp::headless(PanelInputs::new(rx, Arc::new(NoopSink), None, None));
+        app.page = Page::Settings;
+        app.sms_compose.storage_confirmation = Some((
+            None,
+            initial.sim_epoch,
+            dji4g_domain::SmsStorageId("ME".into()),
+        ));
+        let mut changed = (*initial).clone();
+        changed.sim_epoch += 1;
+        tx.send(Arc::new(changed)).unwrap();
+        app.receive_latest_nonblocking(&egui::Context::default());
+        assert!(app.sms_compose.storage_confirmation.is_none());
+        assert_eq!(app.page, Page::Settings);
     }
 
     #[test]

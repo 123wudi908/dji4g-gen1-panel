@@ -25,6 +25,29 @@ use dji4g_domain::DeviceEpoch;
 
 use crate::{ActorError, AtSessionActor, DjiDevice, PlatformError};
 
+pub(crate) fn verify_sim_response(
+    response: &AtResponse,
+    expected: [u8; 8],
+) -> Result<(), PlatformError> {
+    let error = |code| PlatformError {
+        code,
+        os_code: None,
+    };
+    if response.command != AtCommand::Iccid
+        || response.final_code != AtFinalCode::Ok
+        || response.lines.len() != 1
+    {
+        return Err(error("sms:sim_identity_unverified"));
+    }
+    let iccid = dji4g_at_protocol::parse_iccid_line(&response.lines[0])
+        .ok_or(error("sms:sim_identity_unverified"))?;
+    let digest = dji4g_domain::sha256(iccid.as_bytes());
+    if digest[..8] != expected {
+        return Err(error("sms:sim_changed"));
+    }
+    Ok(())
+}
+
 /// Bound for one queued AT transaction and for the safe handshake.
 const SMS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 

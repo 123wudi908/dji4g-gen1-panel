@@ -44,6 +44,12 @@ impl std::fmt::Debug for ArchivedSms {
 }
 
 impl ArchivedSms {
+    /// Opaque, persistent row identity for UI state. Filtering and newly captured records must
+    /// never transfer an expanded reader to a different message.
+    pub fn stable_id(&self) -> [u8; 32] {
+        self.id
+    }
+
     pub fn sender(&self) -> &str {
         &self.sender
     }

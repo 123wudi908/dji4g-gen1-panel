@@ -320,3 +320,281 @@ fn adapter_partial_failure_keeps_best_effort_rollback_evidence() {
         }
     ));
 }
+
+#[test]
+fn uncertain_lease_and_restart_calls_are_not_proved_by_a_surviving_device() {
+    for action in [
+        RepairAction::RefreshDhcp,
+        RepairAction::RestartAdapter,
+        RepairAction::ReenumerateDevice,
+        RepairAction::RestartModule,
+    ] {
+        let mut backend = ready_backend();
+        backend.set_dispatch_result(DispatchResult::Unknown(ErrorCode::Timeout));
+        // Native scanning can still find the same up adapter and USB root after a timeout.
+        // That existence proof carries no evidence that the requested operation completed.
+        let unchanged = backend.observe().unwrap();
+        backend.set_after_observation(unchanged);
+        let executor = WindowsRepairExecutor::new(backend);
+        let plan = executor.prepare(action.clone()).expect("ready target");
+
+        assert_eq!(
+            executor.execute(&plan).outcome().clone(),
+            OperationOutcome::OutcomeUnknown {
+                code: ErrorCode::Timeout
+            },
+            "{action:?} requires a definite dispatch result"
+        );
+        assert_eq!(executor.backend().mutation_count(), 1);
+        assert!(matches!(
+            executor.execute(&plan).outcome(),
+            OperationOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            executor.backend().mutation_count(),
+            1,
+            "never retry uncertainty"
+        );
+    }
+}
+
+#[test]
+fn exact_dns_readback_can_resolve_an_uncertain_write_but_old_static_dns_cannot() {
+    let old = DnsProfile::Static {
+        servers: vec![
+            "223.5.5.5".parse().unwrap(),
+            "119.29.29.29".parse().unwrap(),
+        ],
+    };
+    for (after, expected_applied) in [(DnsProfile::Automatic, true), (old.clone(), false)] {
+        let mut backend = ready_backend();
+        backend.set_dns_profile(Some(old.clone()));
+        backend.set_dispatch_result(DispatchResult::Unknown(ErrorCode::Timeout));
+        backend.set_after_dns_profile(Some(after));
+        let executor = WindowsRepairExecutor::new(backend);
+        let plan = executor
+            .prepare(RepairAction::ApplyDnsProfile {
+                profile: DnsProfile::Automatic,
+            })
+            .unwrap();
+        let outcome = executor.execute(&plan).outcome().clone();
+        if expected_applied {
+            assert!(matches!(outcome, OperationOutcome::Applied { .. }));
+        } else {
+            assert_eq!(
+                outcome,
+                OperationOutcome::OutcomeUnknown {
+                    code: ErrorCode::Timeout
+                }
+            );
+        }
+        assert_eq!(executor.backend().mutation_count(), 1);
+    }
+}
+
+#[test]
+fn at_repairs_and_physical_reenumeration_do_not_require_a_working_network_adapter() {
+    for action in [
+        RepairAction::SetUsbNetProfile {
+            profile: VerifiedUsbNetProfile::Ecm,
+        },
+        RepairAction::SetApn {
+            cid: PdpContextId::try_from(1).unwrap(),
+            apn: apn("new.example"),
+        },
+        RepairAction::RestartModule,
+        RepairAction::ReenumerateDevice,
+    ] {
+        let mut backend = ready_backend();
+        backend.set_contexts(&[(1, "IP", "old.example", false)]);
+        backend.mutate_observation(|observation| {
+            observation.adapter = AdapterProof::fixture([0; 32]);
+            observation.adapter_up = false;
+        });
+        backend.set_dns_profile(None);
+        backend.set_hotspot(None, false);
+        let executor = WindowsRepairExecutor::new(backend);
+        let plan = executor
+            .prepare(action.clone())
+            .expect("USB root and usable AT suffice");
+        assert!(
+            matches!(
+                executor.execute(&plan).outcome(),
+                OperationOutcome::Applied { .. }
+            ),
+            "{action:?} must not depend on the missing network interface"
+        );
+        assert_eq!(executor.backend().mutation_count(), 1);
+    }
+
+    for action in [
+        RepairAction::RefreshDhcp,
+        RepairAction::RestartAdapter,
+        RepairAction::ApplyDnsProfile {
+            profile: DnsProfile::Static {
+                servers: vec!["1.1.1.1".parse().unwrap()],
+            },
+        },
+        RepairAction::ToggleHotspot { enabled: true },
+    ] {
+        let mut backend = ready_backend();
+        backend
+            .mutate_observation(|observation| observation.adapter = AdapterProof::fixture([0; 32]));
+        let executor = WindowsRepairExecutor::new(backend);
+        assert!(matches!(
+            executor.prepare(action),
+            Err(RepairError::TargetNotFound)
+        ));
+        assert_eq!(executor.backend().mutation_count(), 0);
+    }
+}
+
+#[test]
+fn every_adapter_repair_binds_the_same_adapter_before_and_after_dispatch() {
+    let actions = [
+        RepairAction::RefreshDhcp,
+        RepairAction::RestartAdapter,
+        RepairAction::ApplyDnsProfile {
+            profile: DnsProfile::Static {
+                servers: vec!["1.1.1.1".parse().unwrap()],
+            },
+        },
+        RepairAction::ToggleHotspot { enabled: true },
+    ];
+    for action in actions {
+        let mut backend = ready_backend();
+        let executor = WindowsRepairExecutor::new(backend.clone());
+        let plan = executor.prepare(action.clone()).unwrap();
+        backend.mutate_observation(|observation| {
+            observation.adapter = AdapterProof::fixture([0x99; 32])
+        });
+        assert!(matches!(
+            executor.execute(&plan).outcome(),
+            OperationOutcome::Failed {
+                code: ErrorCode::EvidenceExpired,
+                ..
+            }
+        ));
+        assert_eq!(
+            executor.backend().mutation_count(),
+            0,
+            "adapter drift before {action:?}"
+        );
+
+        let mut backend = ready_backend();
+        let mut after = backend.observe().unwrap();
+        after.adapter = AdapterProof::fixture([0x99; 32]);
+        // Model a matching requested state on the replacement interface; it still must not
+        // certify a write intended for the original module adapter.
+        backend.set_after_observation(after);
+        if let RepairAction::ApplyDnsProfile { profile } = &action {
+            backend.set_after_dns_profile(Some(profile.clone()));
+        }
+        if matches!(action, RepairAction::ToggleHotspot { .. }) {
+            backend.set_after_hotspot(Some(HotspotProof::fixture([0x33; 32], [0x44; 32])), true);
+        }
+        let executor = WindowsRepairExecutor::new(backend);
+        let plan = executor.prepare(action.clone()).unwrap();
+        assert_eq!(
+            executor.execute(&plan).outcome().clone(),
+            OperationOutcome::OutcomeUnknown {
+                code: ErrorCode::DeviceIdentityChanged
+            },
+            "adapter drift after {action:?}"
+        );
+        assert_eq!(executor.backend().mutation_count(), 1);
+    }
+}
+
+#[test]
+fn apn_readback_must_preserve_the_written_ip_type_not_just_the_cid_and_apn() {
+    for pdp_type in ["IPV6", "IPV4V6"] {
+        for dispatch in [
+            DispatchResult::Applied,
+            DispatchResult::Unknown(ErrorCode::Timeout),
+        ] {
+            let mut backend = ready_backend();
+            backend.set_contexts(&[(1, "IP", "old.example", false)]);
+            backend.set_dispatch_result(dispatch);
+            let mut after = backend.observe().unwrap();
+            after.set_contexts(&[(1, pdp_type, "new.example", false)]);
+            backend.set_after_observation(after);
+            let executor = WindowsRepairExecutor::new(backend);
+            let plan = executor
+                .prepare(RepairAction::SetApn {
+                    cid: PdpContextId::try_from(1).unwrap(),
+                    apn: apn("new.example"),
+                })
+                .unwrap();
+
+            let result = executor.execute(&plan);
+            match dispatch {
+                DispatchResult::Applied => assert!(matches!(
+                    result.outcome(),
+                    OperationOutcome::Failed {
+                        code: ErrorCode::VerificationFailed,
+                        ..
+                    }
+                )),
+                DispatchResult::Unknown(_) => assert!(matches!(
+                    result.outcome(),
+                    OperationOutcome::OutcomeUnknown {
+                        code: ErrorCode::Timeout
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(executor.backend().mutation_count(), 1);
+        }
+    }
+}
+
+#[test]
+fn apn_verification_requires_an_exact_inactive_ip_readback_and_is_never_retried() {
+    for active in [false, true] {
+        for dispatch in [
+            DispatchResult::Applied,
+            DispatchResult::Unknown(ErrorCode::Timeout),
+        ] {
+            let mut backend = ready_backend();
+            backend.set_contexts(&[(1, "IP", "old.example", false)]);
+            backend.set_dispatch_result(dispatch);
+            let mut after = backend.observe().unwrap();
+            after.set_contexts(&[(1, "IP", "new.example", active)]);
+            backend.set_after_observation(after);
+            let executor = WindowsRepairExecutor::new(backend);
+            let plan = executor
+                .prepare(RepairAction::SetApn {
+                    cid: PdpContextId::try_from(1).unwrap(),
+                    apn: apn("new.example"),
+                })
+                .unwrap();
+
+            let result = executor.execute(&plan);
+            if active && matches!(dispatch, DispatchResult::Unknown(_)) {
+                assert!(matches!(
+                    result.outcome(),
+                    OperationOutcome::OutcomeUnknown {
+                        code: ErrorCode::Timeout
+                    }
+                ));
+            } else if active {
+                assert!(matches!(
+                    result.outcome(),
+                    OperationOutcome::Failed {
+                        code: ErrorCode::VerificationFailed,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(result.outcome(), OperationOutcome::Applied { .. }));
+            }
+            assert_eq!(executor.backend().mutation_count(), 1);
+            assert!(matches!(
+                executor.execute(&plan).outcome(),
+                OperationOutcome::Failed { .. }
+            ));
+            assert_eq!(executor.backend().mutation_count(), 1);
+        }
+    }
+}

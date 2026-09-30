@@ -205,7 +205,7 @@ pub(crate) fn render(
                     ui.horizontal_wrapped(|ui| {
                         ui.add_sized([160.0, 28.0], egui::Label::new(*label));
                         ui.colored_label(state.tone().color(),format!("{} {}",state.tone().marker(),state.label()));
-                        if *state == CheckState::Running { ui.spinner(); }
+                        if *state == CheckState::Running { super::components::loading_spinner(ui); }
                     });
                 }
                 ui.add_space(6.0);

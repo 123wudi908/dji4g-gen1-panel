@@ -17,7 +17,7 @@ pub struct ModuleNetworkEvidence {
     pub adapter: NetworkEvidenceState,
     pub address_route: NetworkEvidenceState,
     pub link: NetworkEvidenceState,
-    pub gateway: NetworkEvidenceState,
+    pub bound_route: NetworkEvidenceState,
     pub public: NetworkEvidenceState,
     pub dns: NetworkEvidenceState,
 }
@@ -31,7 +31,7 @@ pub enum ModuleNetworkVerdict {
     AdapterIssue,
     AddressRouteIssue,
     LinkDown,
-    GatewayIssue,
+    BoundRouteIssue,
     PublicProbeFailed,
     DnsIssue,
 }
@@ -61,10 +61,10 @@ pub fn classify_module_network(e: &ModuleNetworkEvidence) -> ModuleNetworkVerdic
     if e.address_route != S::Passed {
         return V::Inconclusive;
     }
-    if e.gateway == S::Failed {
-        return V::GatewayIssue;
+    if e.bound_route == S::Failed {
+        return V::BoundRouteIssue;
     }
-    if e.gateway != S::Passed {
+    if e.bound_route != S::Passed {
         return V::Inconclusive;
     }
     match (e.public, e.dns) {

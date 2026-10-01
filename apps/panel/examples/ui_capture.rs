@@ -197,7 +197,7 @@ mod capture {
             | "send-unknown"
             | "delete-partial"
             | "sms-detail-scrolled" => vec![Screen::SmsDetail],
-            "draft-replace" => vec![Screen::SmsCompose],
+            "draft-replace" | "sms-queue-error" => vec![Screen::SmsCompose],
             "single-query" | "single-query-detail" => vec![Screen::ToolsPreset],
             "wireless" => vec![Screen::Wireless],
             "overview" => vec![Screen::Overview],
@@ -205,6 +205,7 @@ mod capture {
             mode if mode.starts_with("module-") => vec![Screen::Overview],
             "host-normal-tun"
             | "host-missing-binding"
+            | "host-config-only"
             | "host-unsupported"
             | "host-repair-preview"
             | "host-awaiting-restart"
@@ -508,6 +509,9 @@ mod capture {
             self.screens[self.page].apply(&mut self.app);
             if self.mode == "draft-replace" {
                 self.app.set_review_reply_replace();
+            }
+            if self.mode == "sms-queue-error" {
+                self.app.set_review_sms_queue_error();
             }
             // Only initialize services once: archive fixtures must never read real user data
             // or create a fresh worker on every render frame.
@@ -867,7 +871,7 @@ mod capture {
             check.evidence = ModuleNetworkEvidence {
                 device: E::Passed,
                 link: E::Passed,
-                gateway: E::Passed,
+                bound_route: E::Passed,
                 adapter: E::Passed,
                 address_route: E::Passed,
                 public: E::Passed,
@@ -920,7 +924,7 @@ mod capture {
                 check.probe = Some(dji4g_application::ProbeObservationDto {
                     epoch: device.epoch,
                     adapter_id: device.adapter_id.clone().unwrap_or_default(),
-                    gateway: dji4g_application::ProbeStageDto::Passed,
+                    bound_route: dji4g_application::ProbeStageDto::Passed,
                     public: dji4g_application::ProbeStageDto::Passed,
                     dns: dji4g_application::ProbeStageDto::Passed,
                     protocol_coverage: None,
@@ -1016,6 +1020,11 @@ mod capture {
             };
             if mode != "host-normal-tun" {
                 observation.binding = Some(ProxyBinding {
+                    source: if matches!(mode, "host-config-only" | "host-unsupported") {
+                        dji4g_domain::ProxyBindingSource::ConfigurationOnly
+                    } else {
+                        dji4g_domain::ProxyBindingSource::RuntimeVerified
+                    },
                     client: ProxyClient::ClashVergeRev,
                     version: Some(
                         if mode == "host-unsupported" {
@@ -1108,7 +1117,7 @@ mod capture {
                             route_choices: Vec::new(),
                             epoch,
                             adapter_id: "{adapter}".into(),
-                            gateway: ProbeStageDto::Passed,
+                            bound_route: ProbeStageDto::Passed,
                             public: ProbeStageDto::Passed,
                             dns: ProbeStageDto::Failed {
                                 code: failure("probe:dns_failed"),
@@ -1246,7 +1255,10 @@ mod capture {
                     .collect(),
             });
         }
-        if matches!(mode, "draft-replace" | "sms-detail-scrolled") {
+        if matches!(
+            mode,
+            "draft-replace" | "sms-detail-scrolled" | "sms-queue-error"
+        ) {
             snapshot.sms_send = None;
         }
         if matches!(mode, "single-query" | "single-query-detail") {
@@ -1449,6 +1461,12 @@ mod capture {
             }
             if mode == "draft-replace" {
                 app.set_review_reply_replace();
+            }
+            if mode == "sms-queue-error" {
+                app.set_review_sms_queue_error();
+            }
+            if mode == "history-storage-confirm" {
+                app.set_review_sms_storage_confirmation(dji4g_domain::SmsStorageId("ME".into()));
             }
             if mode.starts_with("onboarding-") {
                 app.review_onboarding();

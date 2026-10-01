@@ -89,18 +89,21 @@ pub enum TextKey {
     ActionRenewDhcp,
     ActionApplyDnsAutomatic,
     ActionApplyDnsStatic,
+    ActionApplyDnsProfile,
     ActionRestartAdapter,
     ActionReenumerateDevice,
     ActionRestartModule,
     ActionEditApn,
     ActionSetUsbProfileDjiNdis,
     ActionSetUsbProfileEcm,
+    ActionSetUsbNetworkProfile,
     ActionEnableHotspot,
     ActionDisableHotspot,
     RiskLevelLow,
     RiskLevelMedium,
     RiskLevelHigh,
     OperationOutcomeApplied,
+    OperationUsbConfigurationSaved,
     OperationOutcomeFailed,
     OperationOutcomeUnknown,
     DnsProfileAutomatic,
@@ -233,7 +236,7 @@ pub enum TextKey {
     FieldGateway,
     FieldDnsServers,
     FieldDefaultRoute,
-    FieldBoundGatewayProbe,
+    FieldBoundRouteProbe,
     FieldBoundPublicProbe,
     FieldBoundDnsProbe,
     FieldProtocolCoverage,
@@ -351,7 +354,12 @@ pub enum TextKey {
     RepairsTitle,
     RepairsReadOnlyNotice,
     RepairsDriverNotIncluded,
+    RepairDhcpDisabled,
+    RepairApnInvalid,
     ConfirmationTitle,
+    ConfirmationDnsServers,
+    ConfirmationNewApn,
+    ConfirmationUsbConfigurationOnly,
     ConfirmationOperation,
     ConfirmationTarget,
     ConfirmationExpectedEffect,
@@ -438,6 +446,9 @@ pub enum TextKey {
     SmsErrorUnsupported,
     SmsErrorVerificationFailed,
     SmsErrorInternal,
+    SmsErrorSimRequired,
+    SmsErrorSimUnverified,
+    SmsErrorSimChanged,
     SmsErrorGeneric,
     FieldTemperature,
     TemperatureNotRead,
@@ -529,18 +540,21 @@ impl TextKey {
         Self::ActionRenewDhcp,
         Self::ActionApplyDnsAutomatic,
         Self::ActionApplyDnsStatic,
+        Self::ActionApplyDnsProfile,
         Self::ActionRestartAdapter,
         Self::ActionReenumerateDevice,
         Self::ActionRestartModule,
         Self::ActionEditApn,
         Self::ActionSetUsbProfileDjiNdis,
         Self::ActionSetUsbProfileEcm,
+        Self::ActionSetUsbNetworkProfile,
         Self::ActionEnableHotspot,
         Self::ActionDisableHotspot,
         Self::RiskLevelLow,
         Self::RiskLevelMedium,
         Self::RiskLevelHigh,
         Self::OperationOutcomeApplied,
+        Self::OperationUsbConfigurationSaved,
         Self::OperationOutcomeFailed,
         Self::OperationOutcomeUnknown,
         Self::DnsProfileAutomatic,
@@ -673,7 +687,7 @@ impl TextKey {
         Self::FieldGateway,
         Self::FieldDnsServers,
         Self::FieldDefaultRoute,
-        Self::FieldBoundGatewayProbe,
+        Self::FieldBoundRouteProbe,
         Self::FieldBoundPublicProbe,
         Self::FieldBoundDnsProbe,
         Self::FieldProtocolCoverage,
@@ -791,7 +805,12 @@ impl TextKey {
         Self::RepairsTitle,
         Self::RepairsReadOnlyNotice,
         Self::RepairsDriverNotIncluded,
+        Self::RepairDhcpDisabled,
+        Self::RepairApnInvalid,
         Self::ConfirmationTitle,
+        Self::ConfirmationDnsServers,
+        Self::ConfirmationNewApn,
+        Self::ConfirmationUsbConfigurationOnly,
         Self::ConfirmationOperation,
         Self::ConfirmationTarget,
         Self::ConfirmationExpectedEffect,
@@ -877,6 +896,9 @@ impl TextKey {
         Self::SmsErrorUnsupported,
         Self::SmsErrorVerificationFailed,
         Self::SmsErrorInternal,
+        Self::SmsErrorSimRequired,
+        Self::SmsErrorSimUnverified,
+        Self::SmsErrorSimChanged,
         Self::SmsErrorGeneric,
         Self::FieldTemperature,
         Self::TemperatureNotRead,
@@ -1054,10 +1076,13 @@ pub fn available_languages() -> &'static [Language] {
     &[Language::ZhCn]
 }
 
-/// Return the complete default catalog. `EnUs` deliberately uses the same safe catalog until a
-/// complete English review is available; the language selector does not expose it meanwhile.
+/// Return the complete default catalog. Reviewed English entries may be added individually;
+/// the language selector stays hidden until the complete English catalog is reviewed.
 #[must_use]
-pub fn template(_language: Language, key: TextKey) -> &'static str {
+pub fn template(language: Language, key: TextKey) -> &'static str {
+    if language == Language::EnUs && key == TextKey::RepairDhcpDisabled {
+        return "IPv4 DHCP is disabled on the module adapter; its lease cannot be renewed.";
+    }
     match key {
         TextKey::AvailabilityDetectingTitle => "正在检测",
         TextKey::AvailabilityDetectingReason => "正在收集并校验当前设备的连接证据。",
@@ -1125,7 +1150,7 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
         TextKey::EvidenceSourcePnp => "Windows 设备枚举",
         TextKey::EvidenceSourceAtControl => "AT 控制通道",
         TextKey::EvidenceSourceWindowsAdapter => "Windows 网卡状态",
-        TextKey::EvidenceSourceBoundGatewayProbe => "模块网关绑定探测",
+        TextKey::EvidenceSourceBoundGatewayProbe => "模块绑定路由查询（历史来源标记）",
         TextKey::EvidenceSourceBoundDnsProbe => "模块 DNS 绑定探测",
         TextKey::EvidenceSourceBoundPublicProbe => "模块公共网络绑定探测",
         TextKey::EvidenceSourceGlobalRoute => "系统默认路由",
@@ -1137,21 +1162,28 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
         TextKey::ClassificationPhasePostWriteVerification => "正在验证操作后的状态",
         TextKey::ClassificationPhaseStable => "检测完成",
         TextKey::ActionRefresh => "刷新并重新检测",
+        TextKey::RepairDhcpDisabled => "模块网卡未启用 IPv4 DHCP，无法续租。",
+        TextKey::RepairApnInvalid => "APN 含不允许的字符。",
         TextKey::ActionRenewDhcp => "更新模块网卡的 DHCP 租约",
         TextKey::ActionApplyDnsAutomatic => "恢复自动获取 DNS",
         TextKey::ActionApplyDnsStatic => "应用静态 DNS（{server_count} 个服务器）",
+        TextKey::ActionApplyDnsProfile => "修改 DNS 配置",
         TextKey::ActionRestartAdapter => "重启模块网卡",
         TextKey::ActionReenumerateDevice => "重新枚举模块设备",
         TextKey::ActionRestartModule => "重启蜂窝模块",
         TextKey::ActionEditApn => "修改 PDP 上下文 {cid} 的 APN",
         TextKey::ActionSetUsbProfileDjiNdis => "切换为电脑网卡（DJI NDIS）",
         TextKey::ActionSetUsbProfileEcm => "切换为 ECM 网卡",
+        TextKey::ActionSetUsbNetworkProfile => "切换 USB 网络配置",
         TextKey::ActionEnableHotspot => "开启移动热点",
         TextKey::ActionDisableHotspot => "关闭移动热点",
         TextKey::RiskLevelLow => "低风险",
         TextKey::RiskLevelMedium => "中等风险",
         TextKey::RiskLevelHigh => "高风险",
         TextKey::OperationOutcomeApplied => "操作已应用，并已完成状态回读。",
+        TextKey::OperationUsbConfigurationSaved => {
+            "USB 网络配置已保存；需手动重启模块后复检，当前网卡模式尚未验证。"
+        }
         TextKey::OperationOutcomeFailed => "操作失败。",
         TextKey::OperationOutcomeUnknown => {
             "无法确认操作结果；系统不会自动重试。请刷新后核对设备状态。"
@@ -1292,7 +1324,7 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
         TextKey::FieldGateway => "网关",
         TextKey::FieldDnsServers => "DNS 服务器",
         TextKey::FieldDefaultRoute => "系统默认路由",
-        TextKey::FieldBoundGatewayProbe => "模块网关探测",
+        TextKey::FieldBoundRouteProbe => "模块绑定路由查询",
         TextKey::FieldBoundPublicProbe => "模块公共网络探测",
         TextKey::FieldBoundDnsProbe => "模块 DNS 探测",
         TextKey::FieldProtocolCoverage => "IP 协议覆盖",
@@ -1418,6 +1450,11 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
         TextKey::RepairsReadOnlyNotice => "只有在目标身份和当前证据均有效时，才会启用相应操作。",
         TextKey::RepairsDriverNotIncluded => "驱动安装需单独确认；正常工作的接口无需重装。",
         TextKey::ConfirmationTitle => "确认执行",
+        TextKey::ConfirmationDnsServers => "DNS 服务器",
+        TextKey::ConfirmationNewApn => "新 APN",
+        TextKey::ConfirmationUsbConfigurationOnly => {
+            "此操作只保存 USB 网络配置；需手动重启模块后复检，当前网卡模式尚未验证。"
+        }
         TextKey::ConfirmationOperation => "操作：{operation}",
         TextKey::ConfirmationTarget => "目标：DJI 一代 4G 模块（VID 2CA3、PID 4006）",
         TextKey::ConfirmationExpectedEffect => "预期效果",
@@ -1528,6 +1565,9 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
         TextKey::SmsErrorUnsupported => "该固件不支持短信 AT 命令。",
         TextKey::SmsErrorVerificationFailed => "短信响应格式未被识别。",
         TextKey::SmsErrorInternal => "短信内部错误，请刷新后重试。",
+        TextKey::SmsErrorSimRequired => "缺少 SIM 身份信息，未执行短信操作；请先刷新。",
+        TextKey::SmsErrorSimUnverified => "无法核实当前 SIM，未执行短信操作。",
+        TextKey::SmsErrorSimChanged => "SIM 已变化，未执行短信操作；请刷新后重新确认。",
         TextKey::SmsErrorGeneric => "短信操作失败。",
         TextKey::FieldTemperature => "温度",
         TextKey::TemperatureNotRead => "未读取到",
@@ -1757,6 +1797,7 @@ pub fn stable_code_text(code: &str) -> Option<TextKey> {
         "apn:too_long" => TextKey::ProtocolApnTooLong,
         "apn:unsafe_character" => TextKey::ProtocolApnUnsafeCharacter,
         "pdp_context_id:out_of_range" => TextKey::ProtocolPdpContextIdOutOfRange,
+        "repair:dhcp_disabled" => TextKey::RepairDhcpDisabled,
         "at_protocol:wrong_port_data" => TextKey::ProtocolWrongPortData,
         "at_protocol:line_too_long" => TextKey::ProtocolLineTooLong,
         "at_protocol:response_too_large" => TextKey::ProtocolResponseTooLarge,
@@ -1872,6 +1913,9 @@ pub fn stable_code_text(code: &str) -> Option<TextKey> {
         "sms:device_removed" => TextKey::SmsErrorDeviceRemoved,
         "sms:unsupported" => TextKey::SmsErrorUnsupported,
         "sms:verification_failed" => TextKey::SmsErrorVerificationFailed,
+        "sms:sim_identity_required" => TextKey::SmsErrorSimRequired,
+        "sms:sim_identity_unverified" => TextKey::SmsErrorSimUnverified,
+        "sms:sim_changed" => TextKey::SmsErrorSimChanged,
         "sms:internal" => TextKey::SmsErrorInternal,
         code if code.starts_with("sms:") => TextKey::SmsErrorGeneric,
         code if code.starts_with("pnp:") => TextKey::PlatformPnpEnumerateFailed,
@@ -2001,14 +2045,26 @@ pub fn action_text(value: &ActionKind, language: Language) -> LocalizedText {
 pub fn action_tag_key(value: ActionKindTag) -> TextKey {
     match value {
         ActionKindTag::RenewDhcp => TextKey::ActionRenewDhcp,
-        ActionKindTag::ApplyDnsProfile => TextKey::ActionApplyDnsAutomatic,
+        ActionKindTag::ApplyDnsProfile => TextKey::ActionApplyDnsProfile,
         ActionKindTag::RestartAdapter => TextKey::ActionRestartAdapter,
         ActionKindTag::ReenumerateDevice => TextKey::ActionReenumerateDevice,
         ActionKindTag::RestartModule => TextKey::ActionRestartModule,
         ActionKindTag::EditApn { .. } => TextKey::ActionEditApn,
-        ActionKindTag::SetVerifiedUsbNetworkProfile => TextKey::ActionSetUsbProfileDjiNdis,
+        ActionKindTag::SetVerifiedUsbNetworkProfile => TextKey::ActionSetUsbNetworkProfile,
         ActionKindTag::ToggleHotspot { enabled: true } => TextKey::ActionEnableHotspot,
         ActionKindTag::ToggleHotspot { enabled: false } => TextKey::ActionDisableHotspot,
+    }
+}
+
+/// A snapshot tag identifies an operation class, but cannot recover its DNS servers or USB
+/// profile. Use neutral class labels, and format the CID that an APN tag does retain.
+#[must_use]
+pub fn action_tag_text(value: ActionKindTag, language: Language) -> LocalizedText {
+    match value {
+        ActionKindTag::EditApn { cid } => {
+            format_text_in(language, TextKey::ActionEditApn, &TextArgs::cid(cid))
+        }
+        _ => LocalizedText::new(language, action_tag_key(value)),
     }
 }
 
@@ -2058,7 +2114,7 @@ pub fn diagnostic_id(value: DiagnosticCheckId) -> TextKey {
         DiagnosticCheckId::AtControl => TextKey::FieldAtPort,
         DiagnosticCheckId::Cellular => TextKey::IssueLayerCellular,
         DiagnosticCheckId::WindowsAdapter => TextKey::FieldAdapter,
-        DiagnosticCheckId::BoundGateway => TextKey::FieldBoundGatewayProbe,
+        DiagnosticCheckId::BoundRoute => TextKey::FieldBoundRouteProbe,
         DiagnosticCheckId::BoundPublic => TextKey::FieldBoundPublicProbe,
         DiagnosticCheckId::BoundDns => TextKey::FieldBoundDnsProbe,
         DiagnosticCheckId::SystemRoute => TextKey::FieldDefaultRoute,

@@ -153,7 +153,7 @@ trait WorkerProcess {
 impl WorkerProcess for std::process::Child {
     fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
         self.try_wait()
-            .map(|status| status.map_or(Some(1), |value| Some(value.code().unwrap_or(1))))
+            .map(|status| status.map(|value| value.code().unwrap_or(1)))
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
@@ -503,6 +503,42 @@ fn option_u32_common(value: Option<u32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "only launched as an isolated child by the real-process supervisor regression"]
+    fn real_child_wait_fixture() {
+        if std::env::var_os("DJI4G_SUPERVISOR_TEST_CHILD").is_some() {
+            let mut byte = [0];
+            std::io::Read::read_exact(&mut std::io::stdin(), &mut byte).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_child_pending_status_is_waited_for_until_exit() {
+        use std::os::windows::process::CommandExt;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::real_child_wait_fixture", "--ignored"])
+            .env("DJI4G_SUPERVISOR_TEST_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .unwrap();
+        // The real std::process::Child implementation must retain its pending None.
+        assert_eq!(WorkerProcess::try_wait(&mut child).unwrap(), None);
+        let mut input = child.stdin.take().unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            std::io::Write::write_all(&mut input, b"x").unwrap();
+        });
+        let result = supervise_worker(&mut child, Instant::now() + Duration::from_secs(5));
+        release.join().unwrap();
+        child.wait().unwrap();
+        assert_eq!(result, WorkerWait::Exited(0));
+    }
 
     #[test]
     fn read_only_is_the_only_default_mode() {

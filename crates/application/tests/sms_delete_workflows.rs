@@ -198,6 +198,7 @@ fn whole_message_deletes_every_frozen_fragment_once() {
 #[test]
 fn partial_failure_or_unknown_stops_and_preserves_unconfirmed_fragments() {
     for result in [
+        SmsDeleteItemResult::NotAttempted,
         SmsDeleteItemResult::Failed,
         SmsDeleteItemResult::OutcomeUnknown,
     ] {

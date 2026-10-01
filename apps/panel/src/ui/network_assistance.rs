@@ -19,6 +19,16 @@ fn copy(language: Language, zh: &'static str, en: &'static str) -> &'static str 
     }
 }
 
+fn busy(phase: HostNetworkPhase) -> bool {
+    matches!(
+        phase,
+        HostNetworkPhase::Checking
+            | HostNetworkPhase::Preparing
+            | HostNetworkPhase::Applying
+            | HostNetworkPhase::Restoring
+    )
+}
+
 #[must_use]
 pub fn brief(
     snapshot: &ControllerSnapshot,
@@ -26,20 +36,29 @@ pub fn brief(
     language: Language,
 ) -> (StatusTone, String) {
     let host = &snapshot.host_network;
-    if matches!(
-        host.phase,
-        HostNetworkPhase::Checking
-            | HostNetworkPhase::Preparing
-            | HostNetworkPhase::Applying
-            | HostNetworkPhase::Restoring
-    ) {
+    if busy(host.phase) {
         return (
             StatusTone::Progress,
-            copy(
-                language,
-                "正在检查电脑网络与代理设置…",
-                "Checking computer network and proxy settings…",
-            )
+            match host.phase {
+                HostNetworkPhase::Preparing => {
+                    copy(language, "正在准备修复方案…", "Preparing the repair plan…")
+                }
+                HostNetworkPhase::Applying => copy(
+                    language,
+                    "正在备份并修复代理配置…",
+                    "Backing up and repairing proxy configuration…",
+                ),
+                HostNetworkPhase::Restoring => copy(
+                    language,
+                    "正在恢复原配置…",
+                    "Restoring the original configuration…",
+                ),
+                _ => copy(
+                    language,
+                    "正在检查电脑网络与代理设置…",
+                    "Checking computer network and proxy settings…",
+                ),
+            }
             .into(),
         );
     }
@@ -87,6 +106,23 @@ pub fn brief(
                 "Computer network information is stale. Check again.",
             )
             .into(),
+        );
+    }
+    if let Some(binding) = &observation.binding
+        && binding.source == dji4g_domain::ProxyBindingSource::ConfigurationOnly
+    {
+        return (
+            StatusTone::Caution,
+            match language {
+                Language::ZhCn => format!(
+                    "磁盘配置引用了网卡“{}”，尚未核实当前运行态。",
+                    binding.interface_alias
+                ),
+                Language::EnUs => format!(
+                    "Disk configuration references adapter '{}'; the current runtime is unverified.",
+                    binding.interface_alias
+                ),
+            },
         );
     }
     match host.finding {
@@ -186,6 +222,7 @@ pub(crate) fn render(
     sink: &dyn UiCommandSink,
 ) {
     let host = &snapshot.host_network;
+    let busy = busy(host.phase);
     section_frame(ui, |ui| {
         ui.heading(copy(
             language,
@@ -208,13 +245,6 @@ pub(crate) fn render(
             );
         }
         ui.horizontal_wrapped(|ui| {
-            let busy = matches!(
-                host.phase,
-                HostNetworkPhase::Checking
-                    | HostNetworkPhase::Preparing
-                    | HostNetworkPhase::Applying
-                    | HostNetworkPhase::Restoring
-            );
             if ui
                 .add_enabled(
                     !busy,
@@ -311,7 +341,15 @@ pub(crate) fn render(
                     ui,
                     format!(
                         "{}：{}",
-                        copy(language, "代理指定网卡", "Proxy-bound adapter"),
+                        if binding.source == dji4g_domain::ProxyBindingSource::ConfigurationOnly {
+                            copy(
+                                language,
+                                "磁盘配置引用网卡（运行态未核实）",
+                                "Configured adapter (runtime unverified)",
+                            )
+                        } else {
+                            copy(language, "代理指定网卡", "Proxy-bound adapter")
+                        },
                         binding.interface_alias
                     ),
                 );
@@ -381,7 +419,15 @@ pub(crate) fn render(
             }
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .button(copy(language, "保留原设置", "Keep original settings"))
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(copy(language, "保留原设置", "Keep original settings")),
+                    )
+                    .on_disabled_hover_text(copy(
+                        language,
+                        "正在处理，请等待本次操作结束",
+                        "Wait for the current operation to finish",
+                    ))
                     .clicked()
                 {
                     send(
@@ -394,7 +440,7 @@ pub(crate) fn render(
                 }
                 if ui
                     .add_enabled(
-                        !expired,
+                        !expired && !busy,
                         egui::Button::new(copy(language, "备份并修复", "Back up and repair")),
                     )
                     .clicked()
@@ -419,10 +465,18 @@ pub(crate) fn render(
                 ),
             );
             if ui
-                .button(copy(
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(copy(
+                        language,
+                        "恢复原配置",
+                        "Restore original configuration",
+                    )),
+                )
+                .on_disabled_hover_text(copy(
                     language,
-                    "恢复原配置",
-                    "Restore original configuration",
+                    "正在处理，请等待本次操作结束",
+                    "Wait for the current operation to finish",
                 ))
                 .clicked()
             {
@@ -439,4 +493,131 @@ pub(crate) fn render(
             wrapped_label(ui, copy(language, "先检查模块与 SIM；若模块公网检查通过，但代理仍报找不到网卡，请在代理软件中检查“出站接口”是否指向已移除或改名的网卡。多网卡用户可能有意固定出口，修改前确认用途。配置来源不明确时，请在代理软件中手动调整。", "Check the module and SIM. If the module path passes but the proxy reports a missing interface, review its outbound-interface setting. A fixed outlet may be intentional on computers with multiple adapters. Use the proxy client to edit ambiguous configurations."));
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_describes_the_operation_in_each_phase() {
+        let mut snapshot =
+            dji4g_application::Controller::for_test(SystemTime::UNIX_EPOCH).snapshot();
+        for (phase, message) in [
+            (HostNetworkPhase::Checking, "正在检查"),
+            (HostNetworkPhase::Preparing, "正在准备"),
+            (HostNetworkPhase::Applying, "正在备份并修复"),
+            (HostNetworkPhase::Restoring, "正在恢复"),
+        ] {
+            snapshot.host_network.phase = phase;
+            let (tone, text) = brief(&snapshot, SystemTime::UNIX_EPOCH, Language::ZhCn);
+            assert_eq!(tone, StatusTone::Progress);
+            assert!(text.starts_with(message), "{phase:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn restore_click_is_blocked_while_an_operation_is_running() {
+        struct Sink(std::sync::Mutex<Vec<UiCommand>>);
+        impl UiCommandSink for Sink {
+            fn try_send(&self, command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+                self.0.lock().unwrap().push(command);
+                Ok(())
+            }
+        }
+        for phase in [
+            HostNetworkPhase::AwaitingRestart,
+            HostNetworkPhase::Checking,
+            HostNetworkPhase::Preparing,
+            HostNetworkPhase::Applying,
+            HostNetworkPhase::Restoring,
+        ] {
+            let ctx = egui::Context::default();
+            super::super::style_root(&ctx);
+            let mut snapshot =
+                dji4g_application::Controller::for_test(SystemTime::UNIX_EPOCH).snapshot();
+            snapshot.host_network.phase = phase;
+            snapshot.host_network.result = Some(dji4g_application::ProxyRepairResult {
+                backup_id: 7,
+                changed: true,
+            });
+            let sink = Sink(std::sync::Mutex::new(vec![]));
+            let mut point = None;
+            for tick in 0..4 {
+                let events = if tick >= 2 {
+                    let pos = point.expect("restore button should be visible");
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: tick == 2,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                } else {
+                    vec![]
+                };
+                let output = ctx.run(
+                    egui::RawInput {
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render(ui, &snapshot, SystemTime::UNIX_EPOCH, Language::EnUs, &sink);
+                        });
+                    },
+                );
+                if tick < 2 {
+                    point = output.shapes.iter().find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape
+                            && text.galley.text() == "Restore original configuration"
+                        {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        } else {
+                            None
+                        }
+                    });
+                }
+            }
+            let commands = sink.0.lock().unwrap();
+            let expected = usize::from(phase == HostNetworkPhase::AwaitingRestart);
+            assert_eq!(commands.len(), expected, "{phase:?}");
+            if let Some(command) = commands.first() {
+                assert!(matches!(
+                    command,
+                    UiCommand::RestoreProxyRepair { backup_id: 7 }
+                ));
+            }
+        }
+    }
+    #[test]
+    fn disk_binding_is_presented_as_unverified_runtime() {
+        let mut snapshot =
+            dji4g_application::Controller::for_test(SystemTime::UNIX_EPOCH).snapshot();
+        snapshot.host_network.observation = Some(dji4g_domain::HostNetworkObservation {
+            adapters: vec![],
+            default_routes: vec![],
+            system_proxy: HostProxyMode::Manual,
+            binding: Some(dji4g_domain::ProxyBinding {
+                source: dji4g_domain::ProxyBindingSource::ConfigurationOnly,
+                client: dji4g_domain::ProxyClient::ClashVergeRev,
+                version: None,
+                interface_alias: "test-port".into(),
+                repairable: false,
+            }),
+            proxy_inspection_complete: false,
+            proxy_error_code: None,
+            observed_at: SystemTime::UNIX_EPOCH,
+        });
+        let (_, text) = brief(&snapshot, SystemTime::UNIX_EPOCH, Language::ZhCn);
+        assert!(text.contains("磁盘配置"));
+        assert!(text.contains("尚未核实当前运行态"));
+        assert!(!text.contains("已不存在"));
+    }
 }

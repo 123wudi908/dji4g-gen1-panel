@@ -515,9 +515,13 @@ impl SmsPort for ProductionSms {
         let fragment = fragment.clone();
         Box::pin(async move {
             match self.target_device(&target) {
-                Ok((device, epoch)) => {
-                    dji4g_windows_platform::sms_delete_checked(&device, epoch, &fragment, control)
-                }
+                Ok((device, epoch)) => dji4g_windows_platform::sms_delete_checked(
+                    &device,
+                    epoch,
+                    target.sim_fingerprint(),
+                    &fragment,
+                    control,
+                ),
                 Err(error) => dji4g_domain::SmsDeleteReceipt {
                     result: dji4g_domain::SmsDeleteItemResult::Failed,
                     code: Some(error.code.stable.as_str().to_owned()),
@@ -555,7 +559,12 @@ impl SmsPort for ProductionSms {
             let started = std::time::Instant::now();
             let request_id = control.request_id();
             let receipt = dji4g_windows_platform::sms_send_controlled(
-                &device, epoch, &recipient, &body, control,
+                &device,
+                epoch,
+                target.sim_fingerprint(),
+                &recipient,
+                &body,
+                control,
             );
             let result = match receipt.result {
                 dji4g_windows_platform::SmsSendResult::Submitted => SmsSendResult::Submitted,
@@ -789,7 +798,7 @@ impl NetworkProbePort for ProductionProbe {
                     route_choices: Vec::new(),
                     epoch: adapter.epoch(),
                     adapter_id: adapter.binding().adapter_id.clone(),
-                    gateway: ProbeStageDto::Unexecuted { code: code.clone() },
+                    bound_route: ProbeStageDto::Unexecuted { code: code.clone() },
                     public: ProbeStageDto::Unexecuted { code: code.clone() },
                     dns: ProbeStageDto::Unexecuted { code },
                     protocol_coverage: None,
@@ -1612,21 +1621,14 @@ fn execute_via_helper(
     let plan = executor
         .prepare(repair_action.clone())
         .map_err(map_repair_error)?;
-    if plan.epoch() != token.epoch() {
-        return Err(PortError::new(
-            ErrorCode::EvidenceExpired,
-            "privilege:epoch_changed",
-        ));
-    }
     // Cross-check the freshly re-enumerated target against the exact identity the user
     // confirmed, not just the epoch. `current_device` above proves the device is present; this
     // proves the plan the helper will execute is about that same device and action.
-    if dji4g_windows_platform::authoritative_identity_hash(&device) != plan.target_identity_hash() {
-        return Err(PortError::new(
-            ErrorCode::DeviceIdentityChanged,
-            "privilege:target_identity_changed",
-        ));
-    }
+    validate_native_plan_target(
+        &plan,
+        token.epoch(),
+        dji4g_windows_platform::authoritative_identity_hash(&device),
+    )?;
     if plan.action() != &repair_action {
         return Err(PortError::new(
             ErrorCode::Unsupported,
@@ -1651,6 +1653,26 @@ fn executes_in_process(action: &ActionKind) -> bool {
     matches!(action, ActionKind::ToggleHotspot { .. })
 }
 
+fn validate_native_plan_target(
+    plan: &dji4g_windows_platform::RepairPlan,
+    epoch: DeviceEpoch,
+    identity_hash: [u8; 32],
+) -> Result<(), PortError> {
+    if plan.epoch() != epoch {
+        return Err(PortError::new(
+            ErrorCode::EvidenceExpired,
+            "privilege:epoch_changed",
+        ));
+    }
+    if plan.target_identity_hash() != identity_hash {
+        return Err(PortError::new(
+            ErrorCode::DeviceIdentityChanged,
+            "privilege:target_identity_changed",
+        ));
+    }
+    Ok(())
+}
+
 /// Execute one confirmed hotspot toggle in process, without elevation.
 ///
 /// WinRT tethering control needs no administrator rights, so this action does not need the
@@ -1664,7 +1686,8 @@ fn execute_hotspot_in_process(
     token: &ValidatedActionToken,
 ) -> Result<ExecutionReceipt, PortError> {
     let target = token.target_context()?;
-    let _device = current_device(inventory, &target)?;
+    let device = current_device(inventory, &target)?;
+    let identity_hash = dji4g_windows_platform::authoritative_identity_hash(&device);
     let repair_action = repair_action(token.action())?;
     let epoch = token.epoch();
 
@@ -1674,20 +1697,18 @@ fn execute_hotspot_in_process(
             let executor =
                 WindowsRepairExecutor::new(WindowsNativeRepairBackend::with_epoch(epoch));
             let plan = executor.prepare(repair_action).map_err(map_repair_error)?;
-            if plan.epoch() != epoch {
-                return Err(PortError::new(
-                    ErrorCode::EvidenceExpired,
-                    "hotspot:epoch_changed",
-                ));
-            }
+            validate_native_plan_target(&plan, epoch, identity_hash)?;
             let result = executor.execute(&plan);
             Ok(match result.outcome() {
                 OperationOutcome::Applied { after_state_hash } => ExecutionReceipt {
                     outcome: ExecutionReceiptOutcome::Applied,
                     after_state_hash: Some(*after_state_hash),
                 },
-                OperationOutcome::Failed { code, .. } => ExecutionReceipt {
-                    outcome: ExecutionReceiptOutcome::Failed { code: *code },
+                OperationOutcome::Failed { code, rollback } => ExecutionReceipt {
+                    outcome: ExecutionReceiptOutcome::FailedWithRollback {
+                        code: *code,
+                        rollback: *rollback,
+                    },
                     after_state_hash: None,
                 },
                 OperationOutcome::OutcomeUnknown { code } => ExecutionReceipt {
@@ -1821,12 +1842,30 @@ fn map_helper_response(response: HelperResponseV1) -> Result<ExecutionReceipt, P
             outcome: ExecutionReceiptOutcome::Applied,
             after_state_hash: Some(AfterStateHash(*after_state_hash.as_bytes())),
         }),
-        HelperResultV1::Completed(OperationResultV1::Failed { code, .. }) => Ok(ExecutionReceipt {
-            outcome: ExecutionReceiptOutcome::Failed {
-                code: operation_error_code(code),
-            },
-            after_state_hash: None,
-        }),
+        HelperResultV1::Completed(OperationResultV1::Failed { code, rollback }) => {
+            Ok(ExecutionReceipt {
+                outcome: ExecutionReceiptOutcome::FailedWithRollback {
+                    code: operation_error_code(code),
+                    rollback: match rollback {
+                        dji4g_ipc::RollbackResultV1::NotRequired => {
+                            dji4g_domain::RollbackOutcome::NotRequired
+                        }
+                        dji4g_ipc::RollbackResultV1::Applied => {
+                            dji4g_domain::RollbackOutcome::Applied
+                        }
+                        dji4g_ipc::RollbackResultV1::NotAttempted => {
+                            dji4g_domain::RollbackOutcome::NotAttempted
+                        }
+                        dji4g_ipc::RollbackResultV1::Failed { code } => {
+                            dji4g_domain::RollbackOutcome::Failed {
+                                code: operation_error_code(code),
+                            }
+                        }
+                    },
+                },
+                after_state_hash: None,
+            })
+        }
         HelperResultV1::Completed(OperationResultV1::OutcomeUnknown { code }) => {
             Ok(ExecutionReceipt {
                 outcome: ExecutionReceiptOutcome::OutcomeUnknown {
@@ -2129,7 +2168,7 @@ fn probe_failure(category: ErrorCode, stable: &'static str) -> FailureCode {
 /// actually proved bound public reachability; and the global default route is carried only as
 /// explanation (`explanation_only`), never as proof of module availability.
 fn probe_dto(result: BoundProbeResult) -> ProbeObservationDto {
-    let gateway = aggregate_stage(
+    let bound_route = aggregate_stage(
         result.families.iter().flat_map(|family| {
             family
                 .endpoints
@@ -2171,7 +2210,7 @@ fn probe_dto(result: BoundProbeResult) -> ProbeObservationDto {
         route_choices,
         epoch: result.epoch,
         adapter_id: result.adapter_guid,
-        gateway,
+        bound_route,
         public,
         dns,
         protocol_coverage,
@@ -2562,9 +2601,32 @@ mod tests {
             elapsed: Duration::ZERO,
         };
 
+        let mut failed_connections = result.clone();
+        failed_connections.chosen_family = None;
+        for family in &mut failed_connections.families {
+            for endpoint in &mut family.endpoints {
+                endpoint.connect = stage(ProbeStage::Failed {
+                    code: "probe:connect_failed",
+                    os_code: None,
+                });
+                endpoint.tls = stage(ProbeStage::Unexecuted {
+                    code: "probe:dependency_unavailable",
+                });
+                endpoint.http = stage(ProbeStage::Unexecuted {
+                    code: "probe:dependency_unavailable",
+                });
+            }
+        }
+        let failed = probe_dto(failed_connections);
+        assert_eq!(failed.bound_route, ProbeStageDto::Passed);
+        assert_ne!(failed.public, ProbeStageDto::Passed);
+        assert!(
+            dji4g_application::PROBE_STAGE_TIMEOUT
+                > dji4g_windows_platform::ProbePolicy::default().total_timeout * 2
+        );
         let dto = probe_dto(result);
         assert_eq!(dto.epoch, DeviceEpoch(3));
-        assert_eq!(dto.gateway, ProbeStageDto::Passed);
+        assert_eq!(dto.bound_route, ProbeStageDto::Passed);
         assert_eq!(dto.public, ProbeStageDto::Passed);
         assert_eq!(dto.dns, ProbeStageDto::Passed);
         // Only IPv4 proved bound public reachability, so coverage is single-family (Limited),
@@ -2790,6 +2852,79 @@ mod tests {
                 profile: dji4g_domain::UsbNetworkProfile::DjiNdis
             }
         ));
+    }
+
+    #[test]
+    fn a_fresh_hotspot_plan_for_another_device_is_rejected_before_mutation() {
+        use dji4g_windows_platform::{
+            AdapterProof, FakeRepairBackend, RepairObservation, TargetProof,
+        };
+        let backend = FakeRepairBackend::ready(RepairObservation::fixture(
+            DeviceEpoch(4),
+            11,
+            TargetProof::dji_gen1([0x22; 32]),
+            AdapterProof::fixture([0x33; 32]),
+        ));
+        let executor = dji4g_windows_platform::WindowsRepairExecutor::new(backend);
+        let plan = executor
+            .prepare(RepairAction::ToggleHotspot { enabled: true })
+            .unwrap();
+        // Device B was freshly observed at the epoch supplied for confirmed device A.
+        let error =
+            super::validate_native_plan_target(&plan, DeviceEpoch(4), [0x11; 32]).unwrap_err();
+        assert_eq!(error.code.category, ErrorCode::DeviceIdentityChanged);
+        assert_eq!(executor.backend().mutation_count(), 0);
+        assert!(super::validate_native_plan_target(&plan, DeviceEpoch(5), [0x22; 32]).is_err());
+        assert_eq!(executor.backend().mutation_count(), 0);
+        super::validate_native_plan_target(&plan, DeviceEpoch(4), [0x22; 32]).unwrap();
+        assert!(matches!(
+            executor.execute(&plan).outcome(),
+            dji4g_domain::OperationOutcome::Applied { .. }
+        ));
+        assert_eq!(executor.backend().mutation_count(), 1);
+    }
+
+    #[test]
+    fn helper_failure_preserves_every_rollback_verdict_in_the_receipt() {
+        use dji4g_domain::RollbackOutcome;
+        use dji4g_ipc::{
+            HelperResponseV1, HelperResultV1, OperationResultV1, ProtocolVersion, RequestId,
+            RollbackResultV1,
+        };
+        for (wire, expected) in [
+            (
+                RollbackResultV1::NotAttempted,
+                RollbackOutcome::NotAttempted,
+            ),
+            (RollbackResultV1::NotRequired, RollbackOutcome::NotRequired),
+            (RollbackResultV1::Applied, RollbackOutcome::Applied),
+            (
+                RollbackResultV1::Failed {
+                    code: OperationCode::RollbackFailed,
+                },
+                RollbackOutcome::Failed {
+                    code: ErrorCode::RollbackFailed,
+                },
+            ),
+        ] {
+            let receipt = super::map_helper_response(HelperResponseV1 {
+                version: ProtocolVersion::V1,
+                request_id: RequestId::from_bytes([0x12; 16]),
+                result: HelperResultV1::Completed(OperationResultV1::Failed {
+                    code: OperationCode::PermissionDenied,
+                    rollback: wire,
+                }),
+            })
+            .unwrap();
+            assert_eq!(
+                receipt.outcome,
+                dji4g_application::ExecutionReceiptOutcome::FailedWithRollback {
+                    code: ErrorCode::PermissionDenied,
+                    rollback: expected,
+                }
+            );
+            assert!(receipt.after_state_hash.is_none());
+        }
     }
 
     fn probe_response(lines: &[&str]) -> dji4g_at_protocol::AtResponse {

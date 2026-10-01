@@ -10,7 +10,7 @@ pub(crate) fn navigation(ui: &mut Ui, current: &mut Page, language: Language) {
     for (page, key) in NAV_ITEMS.into_iter().filter(|(p, _)| *p != Page::Settings) {
         nav_item(ui, current, page, LocalizedText::new(language, key).text);
     }
-    ui.add_space(24.0);
+    ui.add_space(16.0);
     nav_item(ui, current, Page::Settings, "设置".into());
 }
 fn glyph(page: Page) -> &'static str {
@@ -30,17 +30,32 @@ fn nav_item(ui: &mut Ui, current: &mut Page, page: Page, label: String) {
     } else {
         scale::SECONDARY
     };
-    let response = ui.add_sized(
-        [ui.available_width(), 56.0],
-        egui::Button::new("")
-            .fill(if selected {
+    let response = ui
+        .scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.inactive.weak_bg_fill = if selected {
                 Color32::from_rgb(211, 227, 253)
             } else {
                 Color32::TRANSPARENT
-            })
-            .stroke(egui::Stroke::NONE)
-            .rounding(28.0),
-    );
+            };
+            widgets.hovered.weak_bg_fill = if selected {
+                Color32::from_rgb(203, 221, 251)
+            } else {
+                Color32::from_rgb(232, 237, 244)
+            };
+            widgets.active.weak_bg_fill = if selected {
+                Color32::from_rgb(193, 213, 248)
+            } else {
+                Color32::from_rgb(221, 230, 242)
+            };
+            ui.add_sized(
+                [ui.available_width(), 44.0],
+                egui::Button::new("")
+                    .stroke(egui::Stroke::NONE)
+                    .rounding(22.0),
+            )
+        })
+        .inner;
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
@@ -50,7 +65,7 @@ fn nav_item(ui: &mut Ui, current: &mut Page, page: Page, label: String) {
         )
     });
     let mut job = egui::text::LayoutJob::default();
-    let icon = icons::text(ui.ctx(), glyph(page), 24.0).color(ink);
+    let icon = icons::text(ui.ctx(), glyph(page), 20.0).color(ink);
     let icon_galley = egui::WidgetText::from(icon).into_galley(
         ui,
         Some(egui::TextWrapMode::Extend),
@@ -59,7 +74,7 @@ fn nav_item(ui: &mut Ui, current: &mut Page, page: Page, label: String) {
     );
     ui.painter().galley(
         egui::pos2(
-            response.rect.left() + 16.0,
+            response.rect.left() + 12.0,
             response.rect.center().y - icon_galley.size().y / 2.0,
         ),
         icon_galley,
@@ -77,7 +92,7 @@ fn nav_item(ui: &mut Ui, current: &mut Page, page: Page, label: String) {
     let text = ui.fonts(|f| f.layout_job(job));
     ui.painter().galley(
         egui::pos2(
-            response.rect.left() + 52.0,
+            response.rect.left() + 44.0,
             response.rect.center().y - text.size().y / 2.0,
         ),
         text,
@@ -86,7 +101,7 @@ fn nav_item(ui: &mut Ui, current: &mut Page, page: Page, label: String) {
     if response.has_focus() {
         ui.painter().rect_stroke(
             response.rect.shrink(2.0),
-            26.0,
+            20.0,
             egui::Stroke::new(2.0_f32, scale::DOWNLOAD),
         );
     }
@@ -95,13 +110,13 @@ fn nav_item(ui: &mut Ui, current: &mut Page, page: Page, label: String) {
     }
 }
 pub(crate) fn sidebar_width(width: f32) -> f32 {
-    if width < 1000.0 { 160.0 } else { 224.0 }
+    if width < 1000.0 { 148.0 } else { 188.0 }
 }
 
 pub(crate) fn brand(ui: &mut Ui) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(RichText::new("DJI 4G").size(22.0).color(scale::INK));
+        ui.label(RichText::new("DJI 4G").size(20.0).color(scale::INK));
         ui.label(RichText::new("模块管理").size(12.0).color(scale::SECONDARY));
     });
 }

@@ -113,6 +113,7 @@ enum Request {
         reply: OperationReply<Result<crate::SmsListing, crate::PlatformError>>,
     },
     CheckedDelete {
+        expected_sim: Option<[u8; 8]>,
         expected: SmsFragmentKey,
         control: SmsDeleteControl,
         reply: OperationReply<SmsDeleteReceipt>,
@@ -601,11 +602,13 @@ impl AtSessionActor {
 
     pub(crate) fn execute_checked_delete(
         &self,
+        expected_sim: Option<[u8; 8]>,
         expected: SmsFragmentKey,
         control: SmsDeleteControl,
     ) -> SmsDeleteReceipt {
         let (reply, response) = mpsc::channel();
         if let Err(error) = self.try_send(|state| Request::CheckedDelete {
+            expected_sim,
             expected,
             control: control.clone(),
             reply: OperationReply {
@@ -972,14 +975,20 @@ fn run_actor(
                 state.finish_closed_locked();
             }
             Request::CheckedDelete {
+                expected_sim,
                 expected,
                 control,
                 reply,
             } => {
-                let receipt =
-                    crate::sms_delete::delete_in_session(epoch, &expected, &control, |command| {
+                let receipt = crate::sms_delete::delete_in_session(
+                    epoch,
+                    expected_sim,
+                    &expected,
+                    &control,
+                    |command| {
                         execute_delete_command(epoch, serial.as_mut(), &state, command, &control)
-                    });
+                    },
+                );
                 reply.send(Ok(receipt));
                 // A checked delete owns the whole session; late bytes never enter another request.
                 let _gate = state

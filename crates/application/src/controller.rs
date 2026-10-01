@@ -313,6 +313,7 @@ pub struct Controller {
     /// SMS operations the runner's `SmsPort` implementation will execute, in request order.
     sms_requests: VecDeque<SmsRequest>,
     sms_send: Option<crate::SmsSendSnapshot>,
+    sms_send_rejected_seq: u64,
     sms_refresh_pending: bool,
     sms_delete: Option<crate::SmsDeleteSnapshot>,
     sms_read_in_flight: bool,
@@ -357,6 +358,7 @@ impl Controller {
             feedback_seq: 0,
             sms_requests: VecDeque::new(),
             sms_send: None,
+            sms_send_rejected_seq: 0,
             sms_refresh_pending: false,
             sms_delete: None,
             sms_read_in_flight: false,
@@ -400,6 +402,7 @@ impl Controller {
             feedback_seq: 0,
             sms_requests: VecDeque::new(),
             sms_send: None,
+            sms_send_rejected_seq: 0,
             sms_refresh_pending: false,
             sms_delete: None,
             sms_read_in_flight: false,
@@ -431,6 +434,7 @@ impl Controller {
         snapshot.host_network = self.host_network.clone();
         snapshot.feedback = self.feedback.clone();
         snapshot.sms_send = self.sms_send.clone();
+        snapshot.command_state.sms_send_rejected_seq = self.sms_send_rejected_seq;
         snapshot.sms_refresh_pending = self.sms_refresh_pending;
         snapshot.sms_read_phase = self
             .sms_read_control
@@ -1057,7 +1061,7 @@ impl Controller {
             }
             UiCommand::SmsSend { recipient, body } => {
                 if self.serial_work_busy() {
-                    return self.reject_sms_busy();
+                    return self.reject_sms_send_busy();
                 }
                 if self.operation_pending.is_some()
                     || self
@@ -1065,7 +1069,7 @@ impl Controller {
                         .as_ref()
                         .is_some_and(|op| matches!(op.state, OperationState::Running { .. }))
                 {
-                    return self.reject_sms_busy();
+                    return self.reject_sms_send_busy();
                 }
                 let request_id = self.next_sms_request_id;
                 self.sms_send_context = Some((self.state.epoch(), self.snapshot().sim_epoch));
@@ -1151,7 +1155,7 @@ impl Controller {
     }
 
     /// The device context a tool task must match to be allowed to run.
-    fn tool_context(&self) -> Option<crate::ToolContext> {
+    pub(crate) fn tool_context(&self) -> Option<crate::ToolContext> {
         let identity = self.state.target_identity()?;
         Some(crate::ToolContext {
             device_epoch: self.state.epoch(),
@@ -1209,6 +1213,13 @@ impl Controller {
         let Some(context) = self.tool_context() else {
             return Err(UiSendError::Closed);
         };
+        if self
+            .expert_plan
+            .as_ref()
+            .is_some_and(|plan| self.clock.system_now() > plan.expires_at)
+        {
+            self.clear_expert_plan();
+        }
         if self.expert_plan.is_some() {
             // One frozen command at a time: preparing another replaces nothing and is refused.
             return self.reject_expert(ExpertToolRefusal::AlreadyFrozen);
@@ -1342,6 +1353,9 @@ impl Controller {
     }
 
     pub fn record_tool_capability(&mut self, row: crate::ToolCapabilityRow) {
+        if self.tool_context().as_ref() != Some(&row.context) {
+            return;
+        }
         self.device_tools.record_capability(row);
         self.state.publish_only_change();
     }
@@ -1356,6 +1370,9 @@ impl Controller {
         context: &crate::ToolContext,
         update: impl FnOnce(&mut crate::ModuleProfile),
     ) {
+        if self.tool_context().as_ref() != Some(context) {
+            return;
+        }
         update(&mut self.device_tools.profile);
         self.device_tools.profile.observed_at = Some(self.clock.system_now());
         self.device_tools.profile.context = Some(context.clone());
@@ -1386,8 +1403,17 @@ impl Controller {
             })
     }
 
-    /// Finish one tool task and publish its evidence.
-    pub fn finish_tool_task(&mut self, receipt: crate::ToolReceipt) {
+    /// Record one transaction. The runner owns the parent task's terminal state, including a
+    /// single-item task: transaction IDs and parent IDs are independent and may coincide.
+    pub fn finish_tool_task(&mut self, mut receipt: crate::ToolReceipt) {
+        if self.tool_context().as_ref() != Some(&receipt.context) {
+            // Keep the outcome boundary of an already-started command, but never expose another
+            // device/SIM's response in the current session or treat it as current evidence.
+            if receipt.outcome != crate::ToolOutcome::OutcomeUnknown {
+                receipt.outcome = crate::ToolOutcome::ContextChanged;
+            }
+            receipt.transcript = Arc::new(crate::ToolTranscript::new());
+        }
         let finished_at = self.clock.system_now();
         self.device_tools.history.push(crate::ToolHistoryEntry {
             id: receipt.id,
@@ -1397,17 +1423,6 @@ impl Controller {
             finished_at,
             transcript: std::sync::Arc::clone(&receipt.transcript),
         });
-        if self
-            .device_tools
-            .task
-            .as_ref()
-            .is_some_and(|task| task.id == receipt.id)
-        {
-            if let Some(task) = self.device_tools.task.as_mut() {
-                task.phase = crate::ToolPhase::Finished;
-                task.outcome = Some(receipt.outcome);
-            }
-        }
         self.state.publish_only_change();
     }
 
@@ -1538,8 +1553,24 @@ impl Controller {
 
     /// Drop every conclusion tied to the previous device or SIM.
     fn invalidate_tool_context(&mut self) {
+        let active_task = self
+            .device_tools
+            .task
+            .take()
+            .filter(|task| task.phase.is_active());
         self.tool_requests.clear();
         self.device_tools.invalidate_context();
+        if let Some(mut task) = active_task {
+            if task.phase == crate::ToolPhase::Queued {
+                task.phase = crate::ToolPhase::Finished;
+                task.outcome = Some(crate::ToolOutcome::ContextChanged);
+            } else {
+                // The runner still owns a worker that may already have written. Hold the busy
+                // state until its terminal result is collected; invalidation cannot undo a write.
+                task.phase = crate::ToolPhase::Cancelling;
+            }
+            self.device_tools.task = Some(task);
+        }
         self.expert_plan = None;
     }
 
@@ -1562,6 +1593,7 @@ impl Controller {
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
         let before = self.state.evidence_revision();
         let sim_epoch_before = self.state.sim_epoch();
+        let tool_context_before = self.tool_context();
         let now = self.clock.system_now();
         let invalidates_for_removal = matches!(
             &event,
@@ -1572,6 +1604,9 @@ impl Controller {
         );
         let check_event = event.clone();
         self.state = crate::reduce_state(&self.state, event, now);
+        if self.tool_context() != tool_context_before {
+            self.invalidate_tool_context();
+        }
         if let Some(check) = self.module_network_check.as_mut() {
             check.observe(
                 &check_event,
@@ -1668,6 +1703,11 @@ impl Controller {
     fn reject_sms_busy(&mut self) -> Result<CommandReceipt, UiSendError> {
         self.report_feedback(failure(ErrorCode::Internal, "sms:busy"));
         Err(UiSendError::QueueFull)
+    }
+
+    fn reject_sms_send_busy(&mut self) -> Result<CommandReceipt, UiSendError> {
+        self.sms_send_rejected_seq = self.sms_send_rejected_seq.saturating_add(1);
+        self.reject_sms_busy()
     }
 
     /// The module's port is occupied by a device-tool task. The message is distinct from a busy
@@ -1918,7 +1958,7 @@ impl Controller {
                 let mut check = crate::ModuleNetworkCheckSnapshot::queued(
                     self.next_network_check_id,
                     epoch,
-                    true,
+                    false,
                 );
                 self.next_network_check_id = self.next_network_check_id.saturating_add(1);
                 check.after_operation = Some(id);
@@ -1960,6 +2000,9 @@ fn map_execution(receipt: Result<crate::ExecutionReceipt, PortError>) -> Operati
                 code,
                 rollback: RollbackOutcome::NotAttempted,
             },
+            crate::ExecutionReceiptOutcome::FailedWithRollback { code, rollback } => {
+                OperationOutcome::Failed { code, rollback }
+            }
             crate::ExecutionReceiptOutcome::OutcomeUnknown { code } => {
                 OperationOutcome::OutcomeUnknown { code }
             }
@@ -1973,6 +2016,41 @@ fn map_execution(receipt: Result<crate::ExecutionReceipt, PortError>) -> Operati
             code: error.code.category,
             rollback: RollbackOutcome::NotAttempted,
         },
+    }
+}
+
+#[cfg(test)]
+mod repair_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_receipts_preserve_recovery_in_the_operation_snapshot() {
+        for rollback in [
+            RollbackOutcome::NotAttempted,
+            RollbackOutcome::NotRequired,
+            RollbackOutcome::Applied,
+            RollbackOutcome::Failed {
+                code: ErrorCode::RollbackFailed,
+            },
+        ] {
+            let mut controller = Controller::for_test(SystemTime::UNIX_EPOCH);
+            controller.executor_returns(Ok(crate::ExecutionReceipt {
+                outcome: crate::ExecutionReceiptOutcome::FailedWithRollback {
+                    code: ErrorCode::PermissionDenied,
+                    rollback,
+                },
+                after_state_hash: None,
+            }));
+            let id = controller
+                .prepare_repair(ControlledRepairRequest::RestartAdapter)
+                .unwrap();
+            controller.confirm_action(id).unwrap();
+            assert_eq!(controller.executor_call_count(), 1);
+            assert!(matches!(controller.snapshot().operation.unwrap().state,
+                OperationState::Finished { outcome: OperationOutcome::Failed {
+                    code: ErrorCode::PermissionDenied, rollback: actual,
+                }, .. } if actual == rollback));
+        }
     }
 }
 
@@ -2020,3 +2098,55 @@ fn confirm_feedback(error: ConfirmError) -> FailureCode {
 
 // `ControllerRunner` is implemented in monitor.rs so monitor scheduling and command handling
 // share one bounded signal path without exposing the reducer internals to UI code.
+
+#[cfg(test)]
+mod sms_send_rejection_tests {
+    use super::*;
+
+    fn send() -> UiCommand {
+        UiCommand::SmsSend {
+            recipient: "+8613800138000".into(),
+            body: "测试".into(),
+        }
+    }
+
+    #[test]
+    fn send_rejection_evidence_survives_other_commands_and_preserves_active_send() {
+        let mut controller = Controller::for_test(SystemTime::UNIX_EPOCH);
+        controller.set_sms_refresh_pending(true);
+        assert!(
+            controller
+                .handle_command(UiCommand::SmsReadStorage {
+                    storage: dji4g_domain::SmsStorageId("ME".into())
+                })
+                .is_err()
+        );
+        assert_eq!(controller.snapshot().command_state.sms_send_rejected_seq, 0);
+        assert!(controller.handle_command(send()).is_err());
+        assert_eq!(controller.snapshot().command_state.sms_send_rejected_seq, 1);
+        controller
+            .handle_command(UiCommand::ClearToolHistory)
+            .unwrap();
+        assert!(controller.snapshot().feedback.is_none());
+        assert_eq!(controller.snapshot().command_state.sms_send_rejected_seq, 1);
+        controller.set_sms_refresh_pending(false);
+        controller.handle_command(send()).unwrap();
+        let active = controller.snapshot().sms_send;
+        assert_eq!(controller.snapshot().command_state.sms_send_rejected_seq, 1);
+        assert!(controller.handle_command(send()).is_err());
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.command_state.sms_send_rejected_seq, 2);
+        assert_eq!(snapshot.sms_send, active);
+    }
+
+    #[test]
+    fn pending_repair_rejects_only_the_send_that_would_use_its_channel() {
+        let mut controller = Controller::for_test(SystemTime::UNIX_EPOCH);
+        let (_sender, receiver) = mpsc::channel();
+        controller.operation_pending = Some(receiver);
+        assert!(controller.handle_command(send()).is_err());
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.command_state.sms_send_rejected_seq, 1);
+        assert!(snapshot.sms_send.is_none());
+    }
+}

@@ -2,7 +2,9 @@
 
 use std::time::SystemTime;
 
-use dji4g_application::{ActionReadinessKey, ControlledRepairRequest, ControllerSnapshot};
+use dji4g_application::{
+    ActionReadinessKey, ControlledRepairError, ControlledRepairRequest, ControllerSnapshot,
+};
 use dji4g_domain::{ActionKind, DnsProfile, HotspotStatus};
 use eframe::egui::{self, RichText, Ui};
 use std::net::{IpAddr, Ipv4Addr};
@@ -41,14 +43,7 @@ pub fn repairs_vm(snapshot: &ControllerSnapshot, now: SystemTime, language: Lang
             disabled_reason: availability.reason,
         }
     };
-    let hotspot_enabled = matches!(
-        app.hotspot,
-        HotspotStatus::Off
-            | HotspotStatus::On { .. }
-            | HotspotStatus::Starting
-            | HotspotStatus::Stopping
-    );
-    let mut actions = vec![
+    let actions = vec![
         build(
             ActionKind::RenewDhcp,
             ActionReadinessKey::RenewDhcp,
@@ -128,13 +123,8 @@ pub fn repairs_vm(snapshot: &ControllerSnapshot, now: SystemTime, language: Lang
             TextKey::ActionSetUsbProfileEcm,
         ),
     ];
-    // The hotspot toggle's own extra gate: only a resolvable hotspot state can be toggled.
-    if let Some(action) = actions
-        .iter_mut()
-        .find(|entry| matches!(entry.action, ActionKind::ToggleHotspot { .. }))
-    {
-        action.enabled = action.enabled && hotspot_enabled;
-    }
+    // Shared readiness owns the hotspot gate too: a previous failure may be retried, while
+    // unsupported states carry the same visible reason as every other repair entry point.
     RepairsVm {
         title: LocalizedText::new(language, TextKey::RepairsTitle),
         notice: LocalizedText::new(language, TextKey::RepairsReadOnlyNotice),
@@ -182,9 +172,7 @@ pub(crate) fn render(
         );
         wrapped_label(
             ui,
-            meta_text(
-                "切换会中断连接并可能重新枚举设备。仅适用于本项目已验证的设备配置；AT 端口不可用时，请先处理驱动问题。",
-            ),
+            meta_text("此操作只保存 USB 配置；需手动重启模块后验证模式。重启会中断连接。"),
         );
         for action in usb_actions {
             render_action_button(ui, action, language, sink);
@@ -211,7 +199,7 @@ pub(crate) fn render(
         ui.label(section_heading("会中断连接"));
         for action in &interrupting {
             if matches!(action.action, ActionKind::EditApn { .. }) {
-                render_apn_editor(ui, action.clone(), language, sink);
+                let _ = render_apn_editor(ui, action.clone(), language, sink);
             }
         }
         ui.vertical(|ui| {
@@ -281,7 +269,7 @@ fn render_apn_editor(
     action: RepairActionVm,
     language: Language,
     sink: &dyn PanelCommandSink,
-) {
+) -> egui::Response {
     let cid_id = egui::Id::new("repair.apn.cid");
     let apn_id = egui::Id::new("repair.apn.value");
     let mut cid = ui.data(|data| data.get_temp::<u8>(cid_id)).unwrap_or(1);
@@ -303,9 +291,32 @@ fn render_apn_editor(
         data.insert_temp(cid_id, cid);
         data.insert_temp(apn_id, value.clone());
     });
-    let request = ControlledRepairRequest::try_apn(cid, value.as_str()).ok();
+    let request = ControlledRepairRequest::try_apn(cid, value.as_str());
+    let disabled_reason = if !action.enabled {
+        Some(
+            action.disabled_reason.unwrap_or_else(|| {
+                LocalizedText::new(language, TextKey::ErrorCapabilityUnavailable)
+            }),
+        )
+    } else {
+        request.as_ref().err().map(|error| {
+            let key = match error {
+                ControlledRepairError::InvalidPdpContextId => {
+                    TextKey::ProtocolPdpContextIdOutOfRange
+                }
+                ControlledRepairError::InvalidApn if value.is_empty() => TextKey::ProtocolApnEmpty,
+                ControlledRepairError::InvalidApn
+                    if value.len() > dji4g_at_protocol::Apn::MAX_LEN =>
+                {
+                    TextKey::ProtocolApnTooLong
+                }
+                _ => TextKey::RepairApnInvalid,
+            };
+            LocalizedText::new(language, key)
+        })
+    };
     let button = ui.add_enabled(
-        action.enabled && request.is_some(),
+        action.enabled && request.is_ok(),
         egui::Button::new(
             crate::localization::format_text_in(
                 language,
@@ -315,15 +326,149 @@ fn render_apn_editor(
             .text,
         ),
     );
-    if !action.enabled {
-        if let Some(reason) = action.disabled_reason {
-            button.clone().on_hover_text(reason.text.clone());
-            wrapped_label(ui, meta_text(reason.text));
-        }
+    if let Some(reason) = disabled_reason {
+        button.clone().on_disabled_hover_text(reason.text.clone());
+        wrapped_label(ui, meta_text(reason.text));
     }
     if button.clicked() {
-        if let Some(request) = request {
+        if let Ok(request) = request {
             sink.prepare_repair_now(request);
         }
+    }
+    button
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dji4g_application::{ActionRequest, UiCommand, UiSendError};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<ControlledRepairRequest>>);
+
+    impl PanelCommandSink for RecordingSink {
+        fn try_send(&self, _command: UiCommand) -> Result<(), UiSendError> {
+            panic!("the APN editor must use the typed repair boundary")
+        }
+        fn prepare_repair_now(&self, request: ControlledRepairRequest) {
+            self.0.lock().unwrap().push(request);
+        }
+        fn prepare_action_now(&self, _request: ActionRequest) {
+            panic!("the APN editor must not emit a historical domain action")
+        }
+    }
+
+    fn apn_action() -> RepairActionVm {
+        RepairActionVm {
+            action: ActionKind::EditApn {
+                cid: 1,
+                apn: String::new(),
+            },
+            title: LocalizedText::new(Language::ZhCn, TextKey::ActionEditApn),
+            enabled: true,
+            disabled_reason: None,
+        }
+    }
+
+    fn frame(
+        context: &egui::Context,
+        sink: &RecordingSink,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> (egui::FullOutput, egui::Response) {
+        let mut button = None;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(552.0, 300.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let response = render_apn_editor(ui, apn_action(), Language::ZhCn, sink);
+                    if focus {
+                        response.request_focus();
+                    }
+                    button = Some(response);
+                });
+            },
+        );
+        (output, button.unwrap())
+    }
+
+    fn contains_text(output: &egui::FullOutput, expected: &str) -> bool {
+        fn has_text(shape: &egui::Shape, expected: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.job.text == expected,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, expected))
+    }
+
+    fn enter(pressed: bool) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    #[test]
+    fn invalid_apn_has_visible_reason_and_keyboard_cannot_prepare_it() {
+        for (value, reason) in [
+            (String::new(), "APN 不能为空。"),
+            ("bad,apn".into(), "APN 含不允许的字符。"),
+            ("中文".into(), "APN 含不允许的字符。"),
+            ("a".repeat(101), "APN 不能超过 100 个 ASCII 字节。"),
+        ] {
+            let context = egui::Context::default();
+            let sink = RecordingSink::default();
+            context.data_mut(|data| data.insert_temp(egui::Id::new("repair.apn.value"), value));
+            let (output, response) = frame(&context, &sink, Vec::new(), false);
+            assert!(!response.enabled());
+            assert!(
+                contains_text(&output, reason),
+                "missing visible input reason"
+            );
+            context.memory_mut(|memory| memory.request_focus(response.id));
+            let (_, response) = frame(&context, &sink, enter(true), false);
+            assert!(!response.clicked());
+            let _ = frame(&context, &sink, enter(false), false);
+            assert!(sink.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn valid_apn_keyboard_activation_preserves_cid_and_prepares_exactly_once() {
+        let context = egui::Context::default();
+        let sink = RecordingSink::default();
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("repair.apn.cid"), 3_u8);
+            data.insert_temp(
+                egui::Id::new("repair.apn.value"),
+                "internet.example".to_owned(),
+            );
+        });
+        let (_, response) = frame(&context, &sink, Vec::new(), true);
+        assert!(response.enabled());
+        let _ = frame(&context, &sink, enter(true), false);
+        let _ = frame(&context, &sink, enter(false), false);
+        let _ = frame(&context, &sink, Vec::new(), false);
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            &[ControlledRepairRequest::try_apn(3, "internet.example").unwrap()]
+        );
     }
 }

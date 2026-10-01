@@ -391,7 +391,7 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
         report.push_str(&format!("{}\n", text(TextKey::SmsIncompleteWarning)));
     }
 
-    report.push_str("\n【连接证据】\n");
+    report.push_str("\n【连接证据】\n模块绑定路由查询只证明找到了匹配路由，不证明网关可达。\n");
     for id in DiagnosticCheckId::ORDERED {
         let check = snapshot.diagnostics.get(id);
         report.push_str(&format!(
@@ -438,7 +438,7 @@ pub const fn check_id_name(id: DiagnosticCheckId) -> &'static str {
         DiagnosticCheckId::AtControl => "at_control",
         DiagnosticCheckId::Cellular => "cellular",
         DiagnosticCheckId::WindowsAdapter => "windows_adapter",
-        DiagnosticCheckId::BoundGateway => "bound_gateway",
+        DiagnosticCheckId::BoundRoute => "bound_route",
         DiagnosticCheckId::BoundPublic => "bound_public",
         DiagnosticCheckId::BoundDns => "bound_dns",
         DiagnosticCheckId::SystemRoute => "system_route",

@@ -137,17 +137,7 @@ fn verify_sim(
             error("sms:sim_identity_unverified")
         }
     })?;
-    if response.lines.len() != 1 {
-        return Err(error("sms:sim_identity_unverified"));
-    }
-    let iccid = dji4g_at_protocol::parse_iccid_line(&response.lines[0])
-        .ok_or(error("sms:sim_identity_unverified"))?;
-    // Identical to SimIdentity.fingerprint: SHA-256 prefix, never raw ICCID in a result.
-    let digest = dji4g_domain::sha256(iccid.as_bytes());
-    if digest[..8] != expected {
-        return Err(error("sms:sim_changed"));
-    }
-    Ok(())
+    crate::sms::verify_sim_response(&response, expected)
 }
 
 pub(crate) fn list_in_session(

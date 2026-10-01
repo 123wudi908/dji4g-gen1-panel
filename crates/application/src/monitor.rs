@@ -26,6 +26,8 @@ use crate::{
 /// `app:stage_timeout` for that check only and moves on to the next stage (and the next refresh
 /// cycle) instead of wedging the monitor thread forever.
 pub const STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Covers both default 10-second family budgets plus scheduling overhead.
+pub const PROBE_STAGE_TIMEOUT: Duration = Duration::from_secs(22);
 
 /// Platform ports used by one refresh DAG. The application owns this shape; platform crates only
 /// provide adapters implementing these traits.
@@ -142,6 +144,7 @@ pub struct ControllerRunner {
     /// Per-stage watchdog budget. Production runners keep [`STAGE_TIMEOUT`]; scenario tests
     /// shorten it so a timeout does not have to wait out a full 15 s window.
     stage_timeout: Duration,
+    probe_timeout: Duration,
     /// Locally assigned identifier for outgoing records. Used only to keep two otherwise identical
     /// send records distinct in the store's digest set; never a module storage index.
     next_sms_transaction_id: u32,
@@ -283,6 +286,7 @@ impl ControllerRunner {
             last_refresh_at: None,
             last_rate_tick_at: None,
             stage_timeout: STAGE_TIMEOUT,
+            probe_timeout: PROBE_STAGE_TIMEOUT,
             next_sms_transaction_id: 1,
             pending_sms: None,
             pending_sms_read: None,
@@ -320,6 +324,7 @@ impl ControllerRunner {
     #[must_use]
     pub fn with_stage_timeout(mut self, stage_timeout: Duration) -> Self {
         self.stage_timeout = stage_timeout;
+        self.probe_timeout = stage_timeout;
         self.sms_read_timeout = stage_timeout;
         self
     }
@@ -1269,11 +1274,7 @@ impl ControllerRunner {
     }
 
     fn start_tool_task(&mut self, request: crate::ToolRequest, port: Arc<dyn DeviceToolsPort>) {
-        let current = (
-            self.controller.state().epoch(),
-            self.controller.snapshot().sim_epoch,
-        );
-        if (request.context.device_epoch, request.context.sim_epoch) != current {
+        if self.controller.tool_context().as_ref() != Some(&request.context) {
             self.controller
                 .refuse_tool_task(request.id, crate::ToolOutcome::ContextChanged);
             return;
@@ -1393,14 +1394,10 @@ impl ControllerRunner {
     }
 
     fn poll_tool_completion(&mut self) -> bool {
-        let current = (
-            self.controller.state().epoch(),
-            self.controller.snapshot().sim_epoch,
-        );
         let Some(mut pending) = self.pending_tool.take() else {
             return false;
         };
-        let context_changed = (pending.context.device_epoch, pending.context.sim_epoch) != current;
+        let context_changed = self.controller.tool_context().as_ref() != Some(&pending.context);
         let cancelled = self
             .controller
             .device_tools()
@@ -1520,6 +1517,12 @@ impl ControllerRunner {
         pending: &PendingTool,
         receipt: crate::ToolReceipt,
     ) -> NextToolItem {
+        if receipt.outcome == crate::ToolOutcome::ContextChanged
+            || self.controller.tool_context().as_ref() != Some(&pending.context)
+        {
+            self.controller.finish_tool_task(receipt);
+            return NextToolItem::Stop;
+        }
         let operation = receipt.operation;
         if let crate::ToolOperationKind::Read(id) = operation {
             let now = self.controller.now();
@@ -1609,7 +1612,11 @@ impl ControllerRunner {
     fn finish_tool_batch(&mut self, pending: PendingTool, context_changed: bool) {
         let skipped = pending.total.saturating_sub(pending.completed);
         let outcome = if context_changed {
-            crate::ToolOutcome::ContextChanged
+            if pending.last_outcome == Some(crate::ToolOutcome::OutcomeUnknown) {
+                crate::ToolOutcome::OutcomeUnknown
+            } else {
+                crate::ToolOutcome::ContextChanged
+            }
         } else if skipped > 0 {
             // Out of budget: the items that did not run are unqueried, not failed.
             if pending.last_outcome == Some(crate::ToolOutcome::OutcomeUnknown) {
@@ -1840,10 +1847,12 @@ impl ControllerRunner {
         // started before either outcome is joined, and the events are applied in the fixed
         // order probe then hotspot.
         let adapter_context = self.controller.state().adapter_context();
+        let probe_timeout = self.probe_timeout;
+        let probe_deadline = Instant::now() + probe_timeout;
         let probe_plan = if self.controller.state().active_probe() || allow_probe_once {
             match adapter_context.clone() {
                 Some(context) => StagePlan::Running(spawn_stage(move || {
-                    poll_ready(probe_port.observe(&context, true), stage_timeout, || {
+                    poll_ready(probe_port.observe(&context, true), probe_timeout, || {
                         Err(stage_timeout_error())
                     })
                 })),
@@ -1861,6 +1870,7 @@ impl ControllerRunner {
                 reason: crate::UnexecutedReason::DisabledBySetting,
             })
         };
+        let hotspot_deadline = Instant::now() + self.stage_timeout;
         let hotspot_plan = match (adapter_context, hotspot_port) {
             (Some(context), Some(hotspot)) => StagePlan::Running(spawn_stage(move || {
                 poll_ready(hotspot.observe(Some(&context)), stage_timeout, || {
@@ -1876,18 +1886,17 @@ impl ControllerRunner {
                 observed_at: self.controller.now(),
             }),
         };
-        let deadline = Instant::now() + self.stage_timeout;
         let probe = match probe_plan {
             StagePlan::Decided(result) => result,
             StagePlan::Running(receiver) => stage_check(
-                self.join_stage_with_rates(receiver, deadline),
+                self.join_stage_with_rates(receiver, probe_deadline),
                 self.controller.now(),
             ),
         };
         let hotspot = match hotspot_plan {
             StagePlan::Decided(result) => result,
             StagePlan::Running(receiver) => stage_check(
-                self.join_stage_with_rates(receiver, deadline),
+                self.join_stage_with_rates(receiver, hotspot_deadline),
                 self.controller.now(),
             ),
         };
@@ -1993,7 +2002,11 @@ fn tool_receipt(
     match outcome {
         Ok(mut receipt) => {
             if context_changed {
-                receipt.outcome = crate::ToolOutcome::ContextChanged;
+                receipt.outcome = if written && !receipt.saw_final_code {
+                    crate::ToolOutcome::OutcomeUnknown
+                } else {
+                    crate::ToolOutcome::ContextChanged
+                };
             }
             receipt.operation = operation;
             receipt
@@ -2002,10 +2015,10 @@ fn tool_receipt(
             id: request.id,
             context: request.context.clone(),
             operation,
-            outcome: if context_changed {
-                crate::ToolOutcome::ContextChanged
-            } else if written {
+            outcome: if written {
                 crate::ToolOutcome::OutcomeUnknown
+            } else if context_changed {
+                crate::ToolOutcome::ContextChanged
             } else {
                 // A port-level failure never reached the final code, whatever its stable code.
                 crate::ToolOutcome::TransportFailure

@@ -111,7 +111,7 @@ pub(crate) fn render(
         .id_salt("archive-rows")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (index, row) in rows.iter().enumerate() {
+            for row in &rows {
                 egui::CollapsingHeader::new(format!(
                     "{}    {}{}",
                     row.sender(),
@@ -122,12 +122,7 @@ pub(crate) fn render(
                         ""
                     }
                 ))
-                .id_salt((
-                    "archive-row",
-                    index,
-                    row.captured_unix_secs(),
-                    row.context_label(),
-                ))
+                .id_salt(("archive-row", row.stable_id()))
                 .show(ui, |ui| {
                     ui.label(row.body());
                     ui.small(format!("来源分组：{} · 历史副本", row.context_label()));
@@ -155,4 +150,79 @@ pub(crate) fn render(
             });
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtering_keeps_the_same_message_open_and_does_not_open_a_different_message() {
+        let archive = ArchiveService::review_fixture(true);
+        let target = archive.rows()[1].sender().to_owned();
+        let body = archive.rows()[1].body().to_owned();
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut state = ArchiveUi::default();
+        let render_frame = |state: &mut ArchiveUi, events: Vec<egui::Event>| {
+            context.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        assert!(render(ui, Some(&archive), state).is_none());
+                    });
+                },
+            )
+        };
+        render_frame(&mut state, vec![]);
+        let output = render_frame(&mut state, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text().starts_with(&target)
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .expect("target history row should be visible");
+        for pressed in [true, false] {
+            render_frame(
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let contains_body = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == body))
+        };
+        assert!(contains_body(&render_frame(&mut state, vec![])));
+        state.search = target;
+        assert!(
+            contains_body(&render_frame(&mut state, vec![])),
+            "filtering changes the row index, not its open state"
+        );
+        state.search = archive.rows()[0].sender().to_owned();
+        assert!(
+            !contains_body(&render_frame(&mut state, vec![])),
+            "a different message must keep its own closed state"
+        );
+    }
 }

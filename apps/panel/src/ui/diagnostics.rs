@@ -96,9 +96,14 @@ fn detail_for(
             || Some(DisplayValue::new("未获取")),
             |network| Some(DisplayValue::copyable(preview_values(&network.addresses))),
         ),
-        DiagnosticCheckId::BoundGateway => network.map_or_else(
+        DiagnosticCheckId::BoundRoute => network.map_or_else(
             || Some(DisplayValue::new("未获取")),
-            |network| Some(DisplayValue::copyable(preview_values(&network.gateways))),
+            |network| {
+                Some(DisplayValue::new(format!(
+                    "仅查询匹配路由，不证明网关可达；配置网关：{}",
+                    preview_values(&network.gateways)
+                )))
+            },
         ),
         DiagnosticCheckId::BoundPublic => network.map_or_else(
             || Some(DisplayValue::new("未获取")),

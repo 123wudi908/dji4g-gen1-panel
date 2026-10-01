@@ -12,9 +12,9 @@ use dji4g_domain::{
 use eframe::egui::{self, Color32, RichText, Shape, Stroke, Ui};
 
 use crate::localization::{
-    Language, LocalizedText, TextArgs, TextKey, action_tag_key, availability_reason,
-    availability_title, diagnostic_state, error_text, failure_text, format_text_in, freshness_key,
-    hotspot_title, hotspot_unsupported_reason, rollback_outcome, unexecuted_reason,
+    Language, LocalizedText, TextArgs, TextKey, availability_reason, availability_title,
+    diagnostic_state, error_text, failure_text, format_text_in, freshness_key, hotspot_title,
+    hotspot_unsupported_reason, rollback_outcome, unexecuted_reason,
 };
 
 pub mod action_availability;
@@ -378,6 +378,24 @@ pub fn operation_outcome_text(outcome: &OperationOutcome, language: Language) ->
     }
 }
 
+/// Saving the USB configuration does not prove that the new network mode is active.
+#[must_use]
+pub fn operation_result_text(
+    operation: &dji4g_application::OperationUiSnapshot,
+    language: Language,
+) -> LocalizedText {
+    let dji4g_application::OperationState::Finished { outcome, .. } = &operation.state else {
+        return LocalizedText::new(language, TextKey::OperationVerifying);
+    };
+    if operation.action == dji4g_application::ActionKindTag::SetVerifiedUsbNetworkProfile
+        && matches!(outcome, OperationOutcome::Applied { .. })
+    {
+        LocalizedText::new(language, TextKey::OperationUsbConfigurationSaved)
+    } else {
+        operation_outcome_text(outcome, language)
+    }
+}
+
 #[must_use]
 pub fn operation_phase_text(
     phase: OperationPhase,
@@ -410,7 +428,7 @@ pub fn prepared_action_text(
     prepared: &PreparedActionSnapshot,
     language: Language,
 ) -> LocalizedText {
-    LocalizedText::new(language, action_tag_key(prepared.action))
+    crate::localization::action_tag_text(prepared.action, language)
 }
 
 pub(crate) mod icons;
@@ -745,7 +763,7 @@ pub(crate) const DOWN_COLOR: Color32 = scale::DOWNLOAD;
 pub(crate) const UP_COLOR: Color32 = scale::UPLOAD;
 
 /// Chart height of the rate section (the reference's 218px `chart-container`).
-pub(crate) const RATE_CHART_HEIGHT: f32 = 218.0;
+pub(crate) const RATE_CHART_HEIGHT: f32 = 168.0;
 /// X-axis span in seconds: the ring covers `capacity × cadence` ending at 现在.
 const RATE_CHART_X_SPAN_SECS: f32 = RATE_SAMPLE_PERIOD.as_secs_f32() * RATE_HISTORY_CAPACITY as f32;
 
@@ -883,7 +901,7 @@ pub fn render_rate_section(
                 });
             });
             ui.add_space(6.0);
-            // Hero numbers: caption row (↓下载 / ↑上传) over a 34px reading and a 13px unit.
+            // Hero numbers: caption row (↓下载 / ↑上传) over a 28pt reading and a 13pt unit.
             // Wrapped so the two readings fold onto a second line in the narrowest column.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 28.0;
@@ -975,7 +993,7 @@ fn rate_hero_block(
                 LocalizedText::new(language, TextKey::ValueNotAvailable).as_str(),
                 0.0,
                 egui::text::TextFormat::simple(
-                    egui::FontId::proportional(scale::RATE_NUMBER),
+                    egui::FontId::proportional(scale::BODY),
                     scale::FAINT,
                 ),
             );
@@ -1297,7 +1315,7 @@ mod tests {
         let context = egui::Context::default();
         style_root(&context);
         let style = context.style();
-        assert!(style.spacing.interact_size.y >= 36.0);
+        assert!(style.spacing.interact_size.y >= 32.0);
         assert!(style.text_styles[&egui::TextStyle::Body].size >= 14.0);
         assert!(style.text_styles[&egui::TextStyle::Small].size >= 12.0);
         assert!(!style.visuals.dark_mode);

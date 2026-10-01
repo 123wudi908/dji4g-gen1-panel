@@ -532,39 +532,112 @@ mod native {
 
     use windows::{
         Networking::{
-            Connectivity::{ConnectionProfile, NetworkInformation},
+            Connectivity::{ConnectionProfile, INetworkInformationStatics, NetworkInformation},
             NetworkOperators::{
-                NetworkOperatorTetheringManager, TetheringOperationStatus,
-                TetheringOperationalState,
+                INetworkOperatorTetheringManagerStatics2, NetworkOperatorTetheringManager,
+                TetheringCapability, TetheringOperationStatus, TetheringOperationalState,
             },
         },
         Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
-        core::Interface,
+        core::{Interface, Type, factory},
     };
+    use windows_collections::IVectorView;
     use windows_future::IAsyncInfo;
+
+    fn trace_stage(stage: &'static str) {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("DJI4G_HOTSPOT_TRACE").is_some() {
+            use std::io::Write;
+            eprintln!("hotspot_native:{stage}");
+            let _ = std::io::stderr().flush();
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = stage;
+    }
 
     struct ApartmentGuard;
 
     impl ApartmentGuard {
         fn new() -> Result<Self, PlatformError> {
+            trace_stage("apartment:initialize:start");
             // SAFETY: this initializes WinRT for the current worker thread.  The guard balances
             // the successful call and no WinRT object is shared with an uninitialized UI thread.
             unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
                 .map_err(|error| map_hresult(error.code().0 as u32, "ro_initialize"))?;
+            trace_stage("apartment:initialize:complete");
             Ok(Self)
         }
     }
 
     impl Drop for ApartmentGuard {
         fn drop(&mut self) {
+            trace_stage("apartment:uninitialize:start");
             // SAFETY: this is the matching call for the successful RoInitialize on this thread.
             unsafe { RoUninitialize() };
+            trace_stage("apartment:uninitialize:complete");
         }
     }
 
     struct NativeProfile {
         descriptor: ProfileDescriptor,
         profile: ConnectionProfile,
+    }
+
+    // These static interfaces must be acquired inside each initialized apartment. The generated
+    // static methods retain process-global FactoryCache pointers after RoUninitialize. A repeated
+    // profile enumeration crashed at that cached call after teardown on this host. Keep the
+    // factory reference local so it is released before the caller's ApartmentGuard is dropped.
+    fn fresh_connection_profiles() -> windows::core::Result<IVectorView<ConnectionProfile>> {
+        trace_stage("profiles:factory:start");
+        let statics = factory::<NetworkInformation, INetworkInformationStatics>()?;
+        trace_stage("profiles:factory:complete");
+        trace_stage("profiles:call:start");
+        let mut result = ptr::null_mut();
+        // SAFETY: factory returned the exact INetworkInformationStatics interface. Its vtable
+        // accepts one owned IVectorView<ConnectionProfile> out pointer; from_abi adopts that
+        // reference and reports a null success result as an error, like the generated projection.
+        let profiles = unsafe {
+            (statics.vtable().GetConnectionProfiles)(statics.as_raw(), &mut result)
+                .and_then(|| IVectorView::<ConnectionProfile>::from_abi(result))
+        };
+        trace_stage("profiles:call:complete");
+        profiles
+    }
+
+    fn fresh_tethering_capability(
+        profile: &ConnectionProfile,
+    ) -> windows::core::Result<TetheringCapability> {
+        let statics =
+            factory::<NetworkOperatorTetheringManager, INetworkOperatorTetheringManagerStatics2>()?;
+        let mut result = TetheringCapability(0);
+        // SAFETY: both COM references remain alive during this exact generated ABI call. The
+        // returned value is an i32-backed WinRT enum, and it is used only after a successful HRESULT.
+        unsafe {
+            (statics.vtable().GetTetheringCapabilityFromConnectionProfile)(
+                statics.as_raw(),
+                profile.as_raw(),
+                &mut result,
+            )
+            .map(|| result)
+        }
+    }
+
+    fn fresh_tethering_manager(
+        profile: &ConnectionProfile,
+    ) -> windows::core::Result<NetworkOperatorTetheringManager> {
+        let statics =
+            factory::<NetworkOperatorTetheringManager, INetworkOperatorTetheringManagerStatics2>()?;
+        let mut result = ptr::null_mut();
+        // SAFETY: the selected profile and exact Statics2 factory remain alive for the call.
+        // from_abi adopts the returned manager reference and rejects a null success result.
+        unsafe {
+            (statics.vtable().CreateFromConnectionProfile)(
+                statics.as_raw(),
+                profile.as_raw(),
+                &mut result,
+            )
+            .and_then(|| NetworkOperatorTetheringManager::from_abi(result))
+        }
     }
 
     fn find_profile<'a>(
@@ -591,10 +664,8 @@ mod native {
         let _apartment = ApartmentGuard::new()?;
         let profiles = enumerate_profiles_without_reinit()?;
         let selected = find_profile(adapter, &profiles)?;
-        let raw = NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(
-            &selected.profile,
-        )
-        .map_err(|error| map_hresult(error.code().0 as u32, "capability"))?;
+        let raw = fresh_tethering_capability(&selected.profile)
+            .map_err(|error| map_hresult(error.code().0 as u32, "capability"))?;
         let raw_capability = raw.0 as u32;
         Ok(HotspotCapabilityObservation {
             source_adapter_id: adapter.guid_string(),
@@ -607,13 +678,14 @@ mod native {
         adapter: &AdapterIdentity,
     ) -> Result<HotspotStatusObservation, PlatformError> {
         let _apartment = ApartmentGuard::new()?;
+        trace_stage("status:profiles:start");
         let profiles = enumerate_profiles_without_reinit()?;
         let selected = find_profile(adapter, &profiles)?;
-        let raw_capability =
-            NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(
-                &selected.profile,
-            )
+        trace_stage("status:profiles:complete");
+        trace_stage("status:capability:start");
+        let raw_capability = fresh_tethering_capability(&selected.profile)
             .map_err(|error| map_hresult(error.code().0 as u32, "capability"))?;
+        trace_stage("status:capability:complete");
         let capability = map_capability(raw_capability.0 as u32);
         let unsupported = match capability {
             HotspotCapabilityState::Unsupported(reason) => Some(HotspotStatus::Unsupported(reason)),
@@ -646,18 +718,24 @@ mod native {
                 },
             });
         }
-        let manager =
-            NetworkOperatorTetheringManager::CreateFromConnectionProfile(&selected.profile)
-                .map_err(|error| map_hresult(error.code().0 as u32, "manager_create"))?;
+        trace_stage("status:manager:start");
+        let manager = fresh_tethering_manager(&selected.profile)
+            .map_err(|error| map_hresult(error.code().0 as u32, "manager_create"))?;
+        trace_stage("status:manager:complete");
+        trace_stage("status:operational:start");
         let operational = manager
             .TetheringOperationalState()
             .map_err(|error| map_hresult(error.code().0 as u32, "operational_state"))?;
+        trace_stage("status:operational:complete");
         let raw_operational_state = operational.0 as u32;
         let clients = if raw_operational_state == TetheringOperationalState::On.0 as u32 {
-            manager.ClientCount().map_err(|error| PlatformError {
+            trace_stage("status:clients:start");
+            let clients = manager.ClientCount().map_err(|error| PlatformError {
                 code: "hotspot:client_count_failed",
                 os_code: Some(error.code().0 as u32),
-            })
+            });
+            trace_stage("status:clients:complete");
+            clients
         } else {
             Ok(0)
         };
@@ -691,10 +769,7 @@ mod native {
         let _apartment = ApartmentGuard::new()?;
         let profiles = enumerate_profiles_without_reinit()?;
         let selected = find_profile(adapter, &profiles)?;
-        let raw_capability =
-            NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(
-                &selected.profile,
-            )
+        let raw_capability = fresh_tethering_capability(&selected.profile)
             .map_err(|error| map_hresult(error.code().0 as u32, "capability"))?;
         let capability = map_capability(raw_capability.0 as u32);
         if !matches!(capability, HotspotCapabilityState::Enabled) {
@@ -716,9 +791,8 @@ mod native {
                 os_code: None,
             });
         }
-        let manager =
-            NetworkOperatorTetheringManager::CreateFromConnectionProfile(&selected.profile)
-                .map_err(|error| map_hresult(error.code().0 as u32, "manager_create"))?;
+        let manager = fresh_tethering_manager(&selected.profile)
+            .map_err(|error| map_hresult(error.code().0 as u32, "manager_create"))?;
         let before = manager
             .TetheringOperationalState()
             .map_err(|error| map_hresult(error.code().0 as u32, "operational_state"))?;
@@ -805,7 +879,7 @@ mod native {
     // state and could return RPC_E_WRONG_THREAD on a migrated executor thread.
     fn enumerate_profiles_without_reinit() -> Result<Vec<NativeProfile>, PlatformError> {
         const MAX_PROFILES: u32 = 1024;
-        let profiles = NetworkInformation::GetConnectionProfiles()
+        let profiles = fresh_connection_profiles()
             .map_err(|error| map_hresult(error.code().0 as u32, "enumerate_profiles"))?;
         let count = profiles
             .Size()
@@ -870,6 +944,28 @@ mod native {
             package_full_name_length: *mut u32,
             package_full_name: *mut u16,
         ) -> u32;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "reads native Windows network inventory; run explicitly on a WinRT host"]
+        fn profile_enumeration_survives_repeated_apartment_teardown() {
+            // Keep every cycle on the same test thread and release all profiles before its
+            // apartment. The former cached static call crashed on the second such cycle.
+            // No module is required, no profile is selected, and no network state is changed.
+            for cycle in 0..8 {
+                let _apartment = ApartmentGuard::new().unwrap_or_else(|error| {
+                    panic!("WinRT initialization failed in cycle {cycle}: {error:?}")
+                });
+                let profiles = enumerate_profiles_without_reinit().unwrap_or_else(|error| {
+                    panic!("native profile enumeration failed in cycle {cycle}: {error:?}")
+                });
+                drop(profiles);
+            }
+        }
     }
 }
 

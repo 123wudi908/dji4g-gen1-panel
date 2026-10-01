@@ -29,9 +29,9 @@ pub fn conclusion(check: &ModuleNetworkCheckSnapshot) -> (StatusTone, &'static s
                 StatusTone::Caution,
                 "模块网卡链路未连接，请检查 USB 连接与设备状态",
             ),
-            Verdict::GatewayIssue => (
+            Verdict::BoundRouteIssue => (
                 StatusTone::Caution,
-                "模块网关测试未通过，请查看地址与网关配置",
+                "模块绑定路由查询未通过，请查看地址与路由配置",
             ),
             Verdict::PublicProbeFailed => (
                 StatusTone::Caution,
@@ -112,7 +112,7 @@ fn render_impl(
         egui::Frame::none()
             .fill(egui::Color32::WHITE)
             .rounding(12.0)
-            .inner_margin(16.0)
+            .inner_margin(12.0)
     };
     frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
@@ -139,16 +139,18 @@ fn render_impl(
                 }
             }
             if active {
-                ui.spinner();
+                super::components::loading_spinner(ui);
             }
         });
         let mut details = |ui: &mut egui::Ui| {
         if let Some(check) = snapshot.module_network_check.as_ref() {
-            let (tone, text) = conclusion(check);
-            super::wrapped_label(
-                ui,
-                RichText::new(format!("{} {text}", tone.marker())).color(tone.color()),
-            );
+            if !compact {
+                let (tone, text) = conclusion(check);
+                super::wrapped_label(
+                    ui,
+                    RichText::new(format!("{} {text}", tone.marker())).color(tone.color()),
+                );
+            }
             if let Some(outcome) = &check.operation_outcome {
                 super::wrapped_label(
                     ui,
@@ -165,7 +167,7 @@ fn render_impl(
                 } else if check.adapter.is_none() {
                     "读取串口、蜂窝与模块网卡"
                 } else {
-                    "验证模块网关、公网、DNS 与电脑出口"
+                    "查询模块绑定路由，验证公网、DNS 与电脑出口"
                 };
                 super::wrapped_label(ui, format!("当前步骤：{current}"));
             }
@@ -187,7 +189,7 @@ fn render_impl(
                 if ui
                     .add_enabled(
                         enabled,
-                        egui::Button::new(repair_label(repair)).min_size(egui::vec2(0.0, 40.0)),
+                        egui::Button::new(repair_label(repair)).min_size(egui::vec2(0.0, 32.0)),
                     )
                     .clicked()
                 {
@@ -215,7 +217,7 @@ fn render_impl(
                 );
                 if ui
                     .add(
-                        egui::Button::new("查看驱动与接口检查步骤").min_size(egui::vec2(0.0, 40.0)),
+                        egui::Button::new("查看驱动与接口检查步骤").min_size(egui::vec2(0.0, 32.0)),
                     )
                     .clicked()
                 {
@@ -251,10 +253,10 @@ fn render_impl(
                     );
                 }
             }
-            egui::CollapsingHeader::new("查看本轮证据与处理说明").id_salt("module-network-evidence").show(ui, |ui| {
+            let evidence = |ui: &mut egui::Ui| {
                 for (name, state) in [("USB 模块", check.evidence.device), ("网卡读取", check.evidence.adapter), ("链路", check.evidence.link),
                     ("地址与路由", check.evidence.address_route),
-                    ("模块网关", check.evidence.gateway), ("模块公网", check.evidence.public), ("模块 DNS", check.evidence.dns)] {
+                    ("模块绑定路由查询", check.evidence.bound_route), ("模块公网", check.evidence.public), ("模块 DNS", check.evidence.dns)] {
                     ui.label(format!("{name}：{}", evidence_label(if check.phase == Phase::Stale { Evidence::Stale } else { state })));
                 }
                 if let Some(adapter) = check.adapter.as_ref() {
@@ -268,8 +270,13 @@ fn render_impl(
                     let state = &check.diagnostics.get(id).state;
                     super::wrapped_label(ui, format!("{}：{}", if id == dji4g_application::DiagnosticCheckId::AtControl { "串口通信" } else { "SIM 与蜂窝" }, crate::localization::LocalizedText::new(language, crate::localization::diagnostic_state(state)).text));
                 }
-                super::wrapped_label(ui, super::meta_text("公网探测绑定模块网卡；电脑路径只代表本次固定测试目标，不能代表所有应用。未执行、无法获取和过期均不等于故障。"));
-            });
+                super::wrapped_label(ui, super::meta_text("绑定路由查询只证明找到了匹配路由，不证明网关可达。公网探测绑定模块网卡；电脑路径只代表本次固定测试目标，不能代表所有应用。未执行、无法获取和过期均不等于故障。"));
+            };
+            if compact {
+                evidence(ui);
+            } else {
+                egui::CollapsingHeader::new("查看本轮证据与处理说明").id_salt("module-network-evidence").show(ui, evidence);
+            }
         } else {
             super::wrapped_label(
                 ui,
@@ -291,13 +298,13 @@ fn render_impl(
             );
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add(egui::Button::new("取消").min_size(egui::vec2(0.0, 40.0)))
+                    .add(egui::Button::new("取消").min_size(egui::vec2(0.0, 32.0)))
                     .clicked()
                 {
                     consent = false;
                 }
                 if ui
-                    .add(egui::Button::new("仅检查本地信息").min_size(egui::vec2(0.0, 40.0)))
+                    .add(egui::Button::new("仅检查本地信息").min_size(egui::vec2(0.0, 32.0)))
                     .clicked()
                 {
                     error = sink
@@ -310,7 +317,7 @@ fn render_impl(
                     }
                 }
                 if ui
-                    .add(egui::Button::new("允许本次联网检查").min_size(egui::vec2(0.0, 40.0)))
+                    .add(egui::Button::new("允许本次联网检查").min_size(egui::vec2(0.0, 32.0)))
                     .clicked()
                 {
                     error = sink

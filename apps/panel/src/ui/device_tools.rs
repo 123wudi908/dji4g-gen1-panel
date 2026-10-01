@@ -377,17 +377,17 @@ pub(crate) fn render(
     let can_act = device_present && !busy;
 
     render_header(ui, snapshot, tools);
-    ui.add_space(14.0);
+    ui.add_space(8.0);
     let previous_tab = state.tab;
     render_tabs(ui, state);
     if state.tab != previous_tab {
         state.error = None;
         state.point_to_expert = false;
     }
-    ui.add_space(10.0);
+    ui.add_space(6.0);
     if tools.task.is_some() {
-        render_task_strip(ui, tools, sink);
-        ui.add_space(14.0);
+        render_task_strip(ui, tools, sink, state);
+        ui.add_space(8.0);
     }
     match state.tab {
         ToolTab::Preset => render_preset(ui, snapshot, sink, state, now, language, can_act),
@@ -395,11 +395,11 @@ pub(crate) fn render(
         ToolTab::Expert => render_expert(ui, snapshot, sink, state, can_act, language),
     }
     render_feedback(ui, state);
-    ui.add_space(14.0);
+    ui.add_space(8.0);
     render_history(ui, tools, state, sink);
 }
 
-/// Current target: identity, AT port and device/SIM epoch. Nothing here is rendered from a
+/// Current target: identity and AT port, with device/SIM epoch available on hover. Nothing here is rendered from a
 /// fabricated value — an absent device says so and every action stays disabled.
 fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceToolsSnapshot) {
     super::components::page_heading(ui, "设备工具", "读取模块信息，按需执行经过确认的操作");
@@ -415,7 +415,8 @@ fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceTools
         Some(device) => {
             badge(ui, "设备已连接", scale::DOWNLOAD);
             if let Some(identity) = identity {
-                ui.label(
+                super::wrapped_label(
+                    ui,
                     RichText::new(format!(
                         "VID {:04X} · PID {:04X} · 设备标识 {}",
                         identity.vid,
@@ -428,16 +429,16 @@ fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceTools
                 );
             }
             let port = device.at_port.as_deref().unwrap_or("未获取");
-            ui.label(meta_text(format!("AT 端口 {port}")));
-            ui.label(meta_text(format!(
-                "设备代次 {} · SIM 会话 {}",
-                device.epoch.0, snapshot.sim_epoch
-            )));
+            ui.label(meta_text(format!("AT 端口 {port}")))
+                .on_hover_text(format!(
+                    "设备代次 {} · SIM 会话 {}",
+                    device.epoch.0, snapshot.sim_epoch
+                ));
         }
         None => {
             badge(ui, "未检测到设备", StatusTone::Negative.color());
-            ui.label(meta_text("连接模块后才能执行查询与受控操作"));
-            ui.label(meta_text(format!("SIM 会话 {}", snapshot.sim_epoch)));
+            ui.label(meta_text("连接模块后才能执行查询与受控操作"))
+                .on_hover_text(format!("SIM 会话 {}", snapshot.sim_epoch));
         }
     });
 }
@@ -460,6 +461,7 @@ fn render_task_strip(
     ui: &mut Ui,
     tools: &DeviceToolsSnapshot,
     sink: &dyn crate::app::PanelCommandSink,
+    state: &mut DeviceToolsState,
 ) {
     egui::Frame::none()
         .fill(Color32::from_rgb(0xf5, 0xf7, 0xfb))
@@ -504,8 +506,19 @@ fn render_task_strip(
                                 }
                             }
                         }
-                        if task.phase.is_active() && ui.button("取消").clicked() {
-                            let _ = sink.try_send(UiCommand::CancelDeviceTool { id: task.id });
+                        if task.phase.is_active()
+                            && ui
+                                .add_enabled(
+                                    task.phase != ToolPhase::Cancelling,
+                                    egui::Button::new("取消"),
+                                )
+                                .clicked()
+                        {
+                            send_tool_command(
+                                sink,
+                                state,
+                                UiCommand::CancelDeviceTool { id: task.id },
+                            );
                         }
                     }
                     None => {
@@ -678,7 +691,7 @@ fn render_capability_section(
                         send_tool_command(sink, state, UiCommand::RunToolRead { id });
                     }
                     if querying {
-                        ui.spinner();
+                        super::components::loading_spinner(ui);
                         ui.label(meta_text("本项查询中；下方保留上次结果与采集时间"));
                     }
                 });
@@ -1106,7 +1119,7 @@ fn render_expert(
         // never substitutes for approving one exact command.
         if let Some(pending) = &tools.pending_expert {
             ui.add_space(8.0);
-            render_pending_expert(ui, pending, sink);
+            render_pending_expert(ui, pending, sink, state, can_act);
         }
     });
 }
@@ -1151,6 +1164,8 @@ fn render_pending_expert(
     ui: &mut Ui,
     pending: &PendingExpertTool,
     sink: &dyn crate::app::PanelCommandSink,
+    state: &mut DeviceToolsState,
+    can_act: bool,
 ) {
     let remaining = pending
         .expires_at
@@ -1191,11 +1206,21 @@ fn render_pending_expert(
                         remaining.as_secs()
                     )));
                 }
-                if ui.button("确认执行").clicked() {
-                    let _ = sink.try_send(UiCommand::ConfirmExpertTool { id: pending.id });
+                if ui
+                    .add_enabled(
+                        can_act && !remaining.is_zero(),
+                        egui::Button::new("确认执行"),
+                    )
+                    .clicked()
+                {
+                    send_tool_command(sink, state, UiCommand::ConfirmExpertTool { id: pending.id });
                 }
                 if ui.button("取消").clicked() {
-                    let _ = sink.try_send(UiCommand::CancelExpertToolPlan { id: pending.id });
+                    send_tool_command(
+                        sink,
+                        state,
+                        UiCommand::CancelExpertToolPlan { id: pending.id },
+                    );
                 }
             });
         });
@@ -1618,6 +1643,150 @@ mod tests {
         send_tool_command(&Full, &mut state, UiCommand::ClearToolHistory);
         assert!(state.notice.is_none());
         assert!(state.error.as_deref().unwrap().contains("队列"));
+    }
+
+    /// Click the actual rendered button so tests cover the dispatch wiring, including disabled
+    /// confirmation controls, rather than only calling the shared submission helper.
+    fn click_button(label: &str, mut render: impl FnMut(&mut Ui)) {
+        let ctx = egui::Context::default();
+        super::super::style_root(&ctx);
+        let mut point = None;
+        for tick in 0..4 {
+            let events = if tick >= 2 {
+                let pos = point.expect("the requested button must be visible");
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: tick == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let output = ctx.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render(ui);
+                    });
+                },
+            );
+            if tick < 2 {
+                point = output.shapes.iter().find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    } else {
+                        None
+                    }
+                });
+            }
+        }
+    }
+
+    struct RejectingSink {
+        error: UiSendError,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::app::PanelCommandSink for RejectingSink {
+        fn try_send(&self, _: UiCommand) -> Result<(), UiSendError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.error.clone())
+        }
+        fn prepare_repair_now(&self, _: ControlledRepairRequest) {}
+        fn prepare_action_now(&self, _: dji4g_application::ActionRequest) {}
+    }
+
+    fn pending_fixture(expires_at: SystemTime) -> PendingExpertTool {
+        PendingExpertTool {
+            id: 7,
+            line: ValidatedToolLine::parse("AT+VENDOR=1").unwrap(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn tool_cancel_and_expert_buttons_show_actual_submission_failures() {
+        for error in [UiSendError::QueueFull, UiSendError::Closed] {
+            for action in ["task-cancel", "expert-confirm", "expert-cancel"] {
+                let sink = RejectingSink {
+                    error: error.clone(),
+                    attempts: std::sync::atomic::AtomicUsize::new(0),
+                };
+                let mut state = DeviceToolsState {
+                    notice: Some("old notice".into()),
+                    ..Default::default()
+                };
+                if action == "task-cancel" {
+                    let mut controller =
+                        dji4g_application::Controller::for_test(SystemTime::UNIX_EPOCH);
+                    controller
+                        .handle_command(UiCommand::RunToolRead {
+                            id: ToolReadId::Model,
+                        })
+                        .unwrap();
+                    let tools = controller.snapshot().device_tools;
+                    click_button("取消", |ui| {
+                        render_task_strip(ui, &tools, &sink, &mut state);
+                    });
+                } else {
+                    let pending = pending_fixture(SystemTime::now() + Duration::from_secs(60));
+                    let label = if action == "expert-confirm" {
+                        "确认执行"
+                    } else {
+                        "取消"
+                    };
+                    click_button(label, |ui| {
+                        render_pending_expert(ui, &pending, &sink, &mut state, true);
+                    });
+                }
+                assert_eq!(
+                    sink.attempts.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "{action}"
+                );
+                assert!(state.notice.is_none(), "{action}");
+                assert_eq!(
+                    state.error.as_deref(),
+                    Some(send_error_text(error.clone()).as_str()),
+                    "{action}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_expired_or_busy_expert_confirmation_cannot_dispatch() {
+        for (expired, can_act) in [(true, true), (false, false)] {
+            let sink = RejectingSink {
+                error: UiSendError::QueueFull,
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let mut state = DeviceToolsState::default();
+            let pending = pending_fixture(if expired {
+                SystemTime::UNIX_EPOCH
+            } else {
+                SystemTime::now() + Duration::from_secs(60)
+            });
+            click_button("确认执行", |ui| {
+                render_pending_expert(ui, &pending, &sink, &mut state, can_act);
+            });
+            assert_eq!(sink.attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(state.error.is_none());
+        }
     }
 
     impl crate::app::PanelCommandSink for RecordingSink {

@@ -47,6 +47,7 @@ impl HostNetworkPort for FakeHost {
                 default_routes: vec![],
                 system_proxy: HostProxyMode::Manual,
                 binding: Some(ProxyBinding {
+                    source: dji4g_domain::ProxyBindingSource::RuntimeVerified,
                     client: ProxyClient::ClashVergeRev,
                     version: Some("2.5.5".into()),
                     interface_alias: "removed adapter".into(),

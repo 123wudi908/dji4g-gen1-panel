@@ -16,7 +16,7 @@ use dji4g_application::{ActionKindTag, ControllerSnapshot, OperationState};
 use dji4g_domain::{ActionKind, DisruptionLevel, RiskLevel};
 
 use crate::localization::{
-    Language, LocalizedText, TextKey, action_tag_key, disruption_level, risk_level,
+    Language, LocalizedText, TextKey, action_text, disruption_level, risk_level,
 };
 
 /// A blockable native dialog; implementations run on a dedicated worker thread, never on the
@@ -70,13 +70,39 @@ pub fn confirm_message_for_action(
     dev_mode: bool,
     language: Language,
 ) -> Option<(String, String)> {
-    let tag = ActionKindTag::from_action(action)?;
+    ActionKindTag::from_action(action)?;
     let disruption = disruption?;
     let risk = risk?;
-    let mut message = format!(
-        "操作：{}\n",
-        LocalizedText::new(language, action_tag_key(tag)).text
-    );
+    let mut message = format!("操作：{}\n", action_text(action, language).text);
+    match action {
+        ActionKind::ApplyDnsProfile {
+            profile: dji4g_domain::DnsProfile::Static { servers },
+        } => message.push_str(&format!(
+            "{}：{}\n",
+            LocalizedText::new(language, TextKey::ConfirmationDnsServers).text,
+            servers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("、")
+        )),
+        ActionKind::EditApn { apn, .. } => {
+            // This value is disclosed only in the user's confirmation box, so they can verify
+            // their editor input. General UI/audit formatting keeps APNs masked.
+            message.push_str(&format!(
+                "{}：{}\n",
+                LocalizedText::new(language, TextKey::ConfirmationNewApn).text,
+                apn.replace(['\r', '\n'], " ")
+            ));
+        }
+        ActionKind::SetVerifiedUsbNetworkProfile { .. } => {
+            message.push_str(
+                &LocalizedText::new(language, TextKey::ConfirmationUsbConfigurationOnly).text,
+            );
+            message.push('\n');
+        }
+        _ => {}
+    }
     message.push_str(&format!(
         "中断：{}\n",
         LocalizedText::new(language, disruption_level(disruption)).text
@@ -119,10 +145,10 @@ pub fn result_request(
     if operation.operation_id != operation_id {
         return None;
     }
-    let OperationState::Finished { outcome, .. } = &operation.state else {
+    let OperationState::Finished { .. } = &operation.state else {
         return None;
     };
-    let message = crate::ui::operation_outcome_text(outcome, language).text;
+    let message = crate::ui::operation_result_text(operation, language).text;
     Some(DialogRequest::Result {
         operation_id,
         title: LocalizedText::new(language, TextKey::OperationResultTitle).text,

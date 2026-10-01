@@ -59,7 +59,7 @@ pub enum DiagnosticCheckId {
     AtControl,
     Cellular,
     WindowsAdapter,
-    BoundGateway,
+    BoundRoute,
     BoundPublic,
     BoundDns,
     SystemRoute,
@@ -72,7 +72,7 @@ impl DiagnosticCheckId {
         Self::AtControl,
         Self::Cellular,
         Self::WindowsAdapter,
-        Self::BoundGateway,
+        Self::BoundRoute,
         Self::BoundPublic,
         Self::BoundDns,
         Self::SystemRoute,
@@ -85,7 +85,7 @@ impl DiagnosticCheckId {
             Self::AtControl => 1,
             Self::Cellular => 2,
             Self::WindowsAdapter => 3,
-            Self::BoundGateway => 4,
+            Self::BoundRoute => 4,
             Self::BoundPublic => 5,
             Self::BoundDns => 6,
             Self::SystemRoute => 7,
@@ -432,6 +432,7 @@ pub struct ReducerState {
     inventory_adapter_id: Option<String>,
     inventory_problem_code: Option<u32>,
     adapter: Option<Evidence<AdapterState>>,
+    adapter_details: Option<Evidence<crate::AdapterNetworkDetails>>,
     network: Option<NetworkSnapshot>,
     bound_public: Option<Evidence<BoundEvidence<BoundPublicStatus>>>,
     bound_dns: Option<Evidence<BoundEvidence<BoundDnsStatus>>>,
@@ -493,6 +494,7 @@ impl ReducerState {
             inventory_adapter_id: None,
             inventory_problem_code: None,
             adapter: None,
+            adapter_details: None,
             network: None,
             bound_public: None,
             bound_dns: None,
@@ -598,7 +600,7 @@ impl ReducerState {
             UnexecutedReason::DisabledBySetting
         };
         for id in [
-            DiagnosticCheckId::BoundGateway,
+            DiagnosticCheckId::BoundRoute,
             DiagnosticCheckId::BoundPublic,
             DiagnosticCheckId::BoundDns,
         ] {
@@ -793,8 +795,7 @@ impl ReducerState {
             }
             dji4g_domain::ActionKind::RenewDhcp
             | dji4g_domain::ActionKind::ApplyDnsProfile { .. }
-            | dji4g_domain::ActionKind::RestartAdapter
-            | dji4g_domain::ActionKind::SetVerifiedUsbNetworkProfile { .. } => {
+            | dji4g_domain::ActionKind::RestartAdapter => {
                 if !check_ready(DiagnosticCheckId::WindowsAdapter)
                     || self
                         .adapter_binding
@@ -807,8 +808,20 @@ impl ReducerState {
                 {
                     return Err(failure(ErrorCodeForStage::Missing, "app:adapter_not_ready"));
                 }
+                if matches!(action, dji4g_domain::ActionKind::RenewDhcp)
+                    && self.adapter_details.as_ref().is_some_and(|value| {
+                        value.is_fresh_for(self.epoch, now) && !value.value.dhcp_v4
+                    })
+                {
+                    return Err(failure(
+                        ErrorCodeForStage::Unsupported,
+                        "repair:dhcp_disabled",
+                    ));
+                }
             }
-            dji4g_domain::ActionKind::RestartModule | dji4g_domain::ActionKind::EditApn { .. } => {
+            dji4g_domain::ActionKind::RestartModule
+            | dji4g_domain::ActionKind::EditApn { .. }
+            | dji4g_domain::ActionKind::SetVerifiedUsbNetworkProfile { .. } => {
                 if !check_ready(DiagnosticCheckId::AtControl)
                     || !matches!(
                         self.at_control.as_ref().map(|value| value.value),
@@ -1029,7 +1042,7 @@ impl ReducerState {
             DiagnosticCheckId::AtControl,
             DiagnosticCheckId::Cellular,
             DiagnosticCheckId::WindowsAdapter,
-            DiagnosticCheckId::BoundGateway,
+            DiagnosticCheckId::BoundRoute,
             DiagnosticCheckId::BoundPublic,
             DiagnosticCheckId::BoundDns,
             DiagnosticCheckId::SystemRoute,
@@ -1225,6 +1238,7 @@ impl ReducerState {
         self.inventory_adapter_id = None;
         self.inventory_problem_code = None;
         self.adapter = None;
+        self.adapter_details = None;
         self.network = None;
         self.bound_public = None;
         self.bound_dns = None;
@@ -1626,6 +1640,7 @@ impl ReducerState {
                     } else {
                         self.adapter_binding = None;
                         self.adapter = None;
+                        self.adapter_details = None;
                         self.network = None;
                         self.bound_public = None;
                         self.bound_dns = None;
@@ -1635,6 +1650,7 @@ impl ReducerState {
                     self.target_identity = None;
                     self.adapter_binding = None;
                     self.adapter = None;
+                    self.adapter_details = None;
                     self.network = None;
                     self.bound_public = None;
                     self.bound_dns = None;
@@ -1663,6 +1679,7 @@ impl ReducerState {
                 self.inventory_at_port = None;
                 self.inventory_adapter_id = None;
                 self.adapter = None;
+                self.adapter_details = None;
                 self.network = None;
                 self.bound_public = None;
                 self.bound_dns = None;
@@ -1683,7 +1700,7 @@ impl ReducerState {
                     DiagnosticCheckId::AtControl,
                     DiagnosticCheckId::Cellular,
                     DiagnosticCheckId::WindowsAdapter,
-                    DiagnosticCheckId::BoundGateway,
+                    DiagnosticCheckId::BoundRoute,
                     DiagnosticCheckId::BoundPublic,
                     DiagnosticCheckId::BoundDns,
                     DiagnosticCheckId::SystemRoute,
@@ -1703,6 +1720,7 @@ impl ReducerState {
                 self.inventory_at_port = None;
                 self.inventory_adapter_id = None;
                 self.adapter = None;
+                self.adapter_details = None;
                 self.network = None;
                 self.bound_public = None;
                 self.bound_dns = None;
@@ -1722,7 +1740,7 @@ impl ReducerState {
                     DiagnosticCheckId::AtControl,
                     DiagnosticCheckId::Cellular,
                     DiagnosticCheckId::WindowsAdapter,
-                    DiagnosticCheckId::BoundGateway,
+                    DiagnosticCheckId::BoundRoute,
                     DiagnosticCheckId::BoundPublic,
                     DiagnosticCheckId::BoundDns,
                     DiagnosticCheckId::SystemRoute,
@@ -2103,6 +2121,10 @@ impl ReducerState {
                     },
                     observed_at,
                 ));
+                // Missing details remain unknown; native preparation still validates DHCP.
+                self.adapter_details = value.details.clone().map(|details| {
+                    evidence(epoch, EvidenceSource::WindowsAdapter, details, observed_at)
+                });
                 // An adapter observation may finish before AT. Preserve a newer rates-only
                 // read instead of rewinding its baseline when the full cycle is applied.
                 let keep_rates = self
@@ -2217,7 +2239,7 @@ impl ReducerState {
                 self.system_default_route = None;
                 for id in [
                     DiagnosticCheckId::SystemRoute,
-                    DiagnosticCheckId::BoundGateway,
+                    DiagnosticCheckId::BoundRoute,
                     DiagnosticCheckId::BoundPublic,
                     DiagnosticCheckId::BoundDns,
                 ] {
@@ -2241,13 +2263,13 @@ impl ReducerState {
                 if value.epoch != epoch || value.adapter_id != binding.adapter_id {
                     return;
                 }
-                let gateway = apply_probe_stage(
-                    &value.gateway,
-                    DiagnosticCheckId::BoundGateway,
+                let bound_route = apply_probe_stage(
+                    &value.bound_route,
+                    DiagnosticCheckId::BoundRoute,
                     self,
                     observed_at,
                 );
-                let (public_status, dns_status) = if gateway {
+                let (public_status, dns_status) = if bound_route {
                     let _ = apply_probe_public(&value.public, self, observed_at);
                     let _ = apply_probe_dns(&value.dns, self, observed_at);
                     let public_status =
@@ -2287,7 +2309,7 @@ impl ReducerState {
                     }
                     (public_status, dns_status)
                 } else {
-                    let code = failure(ErrorCodeForStage::Missing, "probe:gateway_not_proven");
+                    let code = failure(ErrorCodeForStage::Missing, "probe:bound_route_not_proven");
                     for id in [DiagnosticCheckId::BoundPublic, DiagnosticCheckId::BoundDns] {
                         self.set_check_terminal(
                             id,
@@ -2348,7 +2370,7 @@ impl ReducerState {
             }
             CheckResult::Failed { code, observed_at } if self.accept_observed(observed_at, now) => {
                 self.set_check_terminal(
-                    DiagnosticCheckId::BoundGateway,
+                    DiagnosticCheckId::BoundRoute,
                     DiagnosticCheckState::Unavailable { code: code.clone() },
                     observed_at,
                 );
@@ -2368,7 +2390,7 @@ impl ReducerState {
                 if self.accept_observed(observed_at, now) =>
             {
                 self.set_check_terminal(
-                    DiagnosticCheckId::BoundGateway,
+                    DiagnosticCheckId::BoundRoute,
                     DiagnosticCheckState::Unavailable { code: code.clone() },
                     observed_at,
                 );
@@ -2386,7 +2408,7 @@ impl ReducerState {
             }
             CheckResult::Unexecuted { reason } => {
                 for id in [
-                    DiagnosticCheckId::BoundGateway,
+                    DiagnosticCheckId::BoundRoute,
                     DiagnosticCheckId::BoundPublic,
                     DiagnosticCheckId::BoundDns,
                 ] {
@@ -2874,5 +2896,185 @@ impl DiagnosticSetExt for DiagnosticSet {
         check.finished_at = Some(observed_at);
         check.observed_at = Some(observed_at);
         check.expires_at = Some(observed_at + EVIDENCE_TTL);
+    }
+}
+
+#[cfg(test)]
+mod repair_readiness_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(3600)
+    }
+
+    fn controller(state: ReducerState) -> (crate::Controller, Arc<crate::FakeActionExecutor>) {
+        let executor = Arc::new(crate::FakeActionExecutor::new());
+        (
+            crate::Controller::new(
+                state,
+                executor.clone(),
+                Arc::new(crate::FakeClock::new(now())),
+            ),
+            executor,
+        )
+    }
+
+    fn usb_actions() -> [dji4g_domain::ActionKind; 2] {
+        [
+            dji4g_domain::UsbNetworkProfile::DjiNdis,
+            dji4g_domain::UsbNetworkProfile::Ecm,
+        ]
+        .map(|profile| dji4g_domain::ActionKind::SetVerifiedUsbNetworkProfile { profile })
+    }
+
+    #[test]
+    fn usb_configuration_requires_fresh_at_even_when_the_adapter_is_ready() {
+        for (availability, at) in [
+            (AtControlAvailability::Unavailable, now()),
+            (
+                AtControlAvailability::Available,
+                now() - Duration::from_secs(60),
+            ),
+        ] {
+            let mut state = ReducerState::test_ready(now());
+            state.at_control = Some(evidence(
+                state.epoch,
+                EvidenceSource::AtControl,
+                availability,
+                at,
+            ));
+            for action in usb_actions() {
+                let failure = state.action_prerequisite(&action, now()).unwrap_err();
+                assert_eq!(failure.stable.as_str(), "app:at_not_ready");
+                let (mut controller, executor) = controller(state.clone());
+                assert!(controller.prepare_action(action).is_err());
+                assert_eq!(executor.calls(), 0);
+            }
+            assert!(
+                state
+                    .action_prerequisite(&dji4g_domain::ActionKind::RestartAdapter, now())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn usb_configuration_can_be_prepared_with_at_and_no_windows_adapter() {
+        let mut state = ReducerState::test_ready(now());
+        state.adapter = None;
+        state.adapter_binding = None;
+        state.adapter_details = None;
+        state.network = None;
+        state.set_check_terminal(
+            DiagnosticCheckId::WindowsAdapter,
+            DiagnosticCheckState::Unavailable {
+                code: failure(ErrorCodeForStage::Missing, "app:adapter_not_ready"),
+            },
+            now(),
+        );
+        assert!(
+            state
+                .action_prerequisite(&dji4g_domain::ActionKind::RestartAdapter, now())
+                .is_err()
+        );
+        for action in usb_actions() {
+            let (mut controller, executor) = controller(state.clone());
+            let id = controller.prepare_action(action).unwrap();
+            assert_eq!(controller.snapshot().prepared_action.unwrap().id, id);
+            assert_eq!(executor.calls(), 0);
+        }
+    }
+
+    fn observe_details(state: &mut ReducerState, dhcp: Option<bool>) {
+        let binding = state.adapter_binding.as_ref().unwrap().value.clone();
+        state.apply_adapter(
+            CheckResult::Passed {
+                observed_at: now(),
+                value: AdapterObservationDto {
+                    details: dhcp.map(|dhcp_v4| crate::AdapterNetworkDetails {
+                        link_up: true,
+                        dhcp_v4,
+                        dns_automatic: None,
+                    }),
+                    epoch: state.epoch,
+                    binding,
+                    state: AdapterStateDto::UsableAddressAndRoute,
+                    addresses: vec!["192.168.225.2".into()],
+                    gateways: vec!["192.168.225.1".into()],
+                    dns_servers: vec![],
+                    ipv4: true,
+                    ipv6: false,
+                    rx_bytes: None,
+                    tx_bytes: None,
+                },
+            },
+            state.epoch,
+            now(),
+        );
+    }
+
+    #[test]
+    fn dhcp_readiness_and_prepare_reject_explicit_static_configuration() {
+        for dhcp in [Some(false), Some(true), None] {
+            let mut state = ReducerState::test_ready(now());
+            observe_details(&mut state, dhcp);
+            let ready = state
+                .action_readiness(now())
+                .into_iter()
+                .find(|entry| entry.key == ActionReadinessKey::RenewDhcp)
+                .unwrap();
+            let (mut controller, executor) = controller(state);
+            let prepare = controller.prepare_repair(crate::ControlledRepairRequest::RefreshDhcp);
+            if dhcp == Some(false) {
+                assert_eq!(
+                    ready.ready.unwrap_err().stable.as_str(),
+                    "repair:dhcp_disabled"
+                );
+                assert!(
+                    matches!(prepare, Err(crate::PrepareError::Prerequisite(code))
+                    if code.stable.as_str() == "repair:dhcp_disabled")
+                );
+                assert!(controller.snapshot().prepared_action.is_none());
+            } else {
+                assert!(ready.ready.is_ok());
+                assert!(prepare.is_ok());
+            }
+            assert_eq!(executor.calls(), 0);
+        }
+    }
+
+    #[test]
+    fn dhcp_details_do_not_survive_unknown_readback_expiry_or_device_change() {
+        let mut state = ReducerState::test_ready(now());
+        observe_details(&mut state, Some(false));
+        observe_details(&mut state, None);
+        assert!(state.adapter_details.is_none());
+        assert!(
+            state
+                .action_prerequisite(&dji4g_domain::ActionKind::RenewDhcp, now())
+                .is_ok()
+        );
+        observe_details(&mut state, Some(false));
+        state.adapter_details.as_mut().unwrap().observed_at = now() - Duration::from_secs(60);
+        assert!(
+            state
+                .action_prerequisite(&dji4g_domain::ActionKind::RenewDhcp, now())
+                .is_ok()
+        );
+        state = reduce_state(
+            &state,
+            BackendEvent::EpochInvalidated {
+                next_epoch: DeviceEpoch(2),
+                reason: EpochInvalidationReason::PhysicalRemoval,
+            },
+            now(),
+        );
+        assert!(state.adapter_details.is_none());
+        assert!(
+            state
+                .action_prerequisite(&dji4g_domain::ActionKind::RenewDhcp, now())
+                .is_err()
+        );
     }
 }

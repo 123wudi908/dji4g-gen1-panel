@@ -19,10 +19,14 @@ pub struct SmsSubmitReceipt {
 pub fn sms_send_controlled(
     device: &DjiDevice,
     epoch: DeviceEpoch,
+    expected_sim: Option<[u8; 8]>,
     recipient: &str,
     text: &str,
     control: SmsTransactionControl,
 ) -> SmsSubmitReceipt {
+    if expected_sim.is_none() {
+        return failed("sms:sim_identity_required", &control);
+    }
     let submit = match build_ucs2_submit(recipient, text) {
         Ok(value) => value,
         Err(_) => return failed("sms:invalid_message", &control),
@@ -36,7 +40,7 @@ pub fn sms_send_controlled(
             Ok(value) => value,
             Err(error) => return actor_failure(error, &control),
         };
-        let outcome = send_in_session(&actor, submit, &control);
+        let outcome = send_in_session(&actor, expected_sim, submit, &control);
         let receipt = classify(outcome, &control);
         // The actor retains its lease until its worker has really released the OS handle.
         // Waiting here keeps the application busy until cleanup is complete.
@@ -140,11 +144,33 @@ fn execute(
     wait(actor, actor.try_execute(command), control)
 }
 
+enum SendError {
+    Actor(ActorError),
+    Sim(&'static str),
+}
+impl From<ActorError> for SendError {
+    fn from(error: ActorError) -> Self {
+        Self::Actor(error)
+    }
+}
+fn verify_live_sim(
+    actor: &AtSessionActor,
+    expected: [u8; 8],
+    control: &SmsTransactionControl,
+) -> Result<(), SendError> {
+    let response = execute(actor, AtCommand::Iccid, control)
+        .map_err(|_| SendError::Sim("sms:sim_identity_unverified"))?;
+    crate::sms::verify_sim_response(&response, expected).map_err(|error| SendError::Sim(error.code))
+}
+
 fn send_in_session(
     actor: &AtSessionActor,
+    expected_sim: Option<[u8; 8]>,
     submit: EncodedSubmit,
     control: &SmsTransactionControl,
-) -> Result<AtResponse, ActorError> {
+) -> Result<AtResponse, SendError> {
+    let expected_sim = expected_sim.ok_or(SendError::Sim("sms:sim_identity_required"))?;
+    verify_live_sim(actor, expected_sim, control)?;
     let mode = execute(actor, AtCommand::SmsMessageFormat, control)?;
     if crate::sms::parse_cmgf_mode(&mode.lines) != Some(true) {
         execute(actor, AtCommand::SmsSetPduMode, control)?;
@@ -153,17 +179,21 @@ fn send_in_session(
             return Err(ActorError::Protocol(ProtocolError {
                 code: ErrorCode::VerificationFailed,
                 kind: ProtocolErrorKind::UnexpectedData,
-            }));
+            })
+            .into());
         }
     }
+    verify_live_sim(actor, expected_sim, control)?;
     control.set_phase(SmsSendPhase::Submitting);
-    actor.execute_prompt_controlled(
-        AtCommand::SmsSend {
-            tpdu_octets: submit.tpdu_octets,
-        },
-        submit.expose_for_confirmed_send().as_bytes().to_vec(),
-        control.clone(),
-    )
+    actor
+        .execute_prompt_controlled(
+            AtCommand::SmsSend {
+                tpdu_octets: submit.tpdu_octets,
+            },
+            submit.expose_for_confirmed_send().as_bytes().to_vec(),
+            control.clone(),
+        )
+        .map_err(SendError::Actor)
 }
 
 fn failed(code: &str, control: &SmsTransactionControl) -> SmsSubmitReceipt {
@@ -182,7 +212,7 @@ fn failed(code: &str, control: &SmsTransactionControl) -> SmsSubmitReceipt {
 }
 
 fn classify(
-    outcome: Result<AtResponse, ActorError>,
+    outcome: Result<AtResponse, SendError>,
     control: &SmsTransactionControl,
 ) -> SmsSubmitReceipt {
     match outcome {
@@ -199,7 +229,8 @@ fn classify(
             }
         }
         Ok(_) => failed("sms:missing_reference", control),
-        Err(error) => actor_failure(error, control),
+        Err(SendError::Actor(error)) => actor_failure(error, control),
+        Err(SendError::Sim(code)) => failed(code, control),
     }
 }
 
@@ -292,9 +323,11 @@ mod tests {
             Box::new(Fixture {
                 writes: writes.clone(),
                 reads: [
+                    "+QCCID: 89860123456789012345\r\nOK\r\n",
                     "+CMGF: 1\r\nOK\r\n",
                     "OK\r\n",
                     "+CMGF: 0\r\nOK\r\n",
+                    "+QCCID: 89860123456789012345\r\nOK\r\n",
                     ">",
                     "+CMGS: 7\r\nOK\r\n",
                 ]
@@ -306,6 +339,7 @@ mod tests {
         let control = SmsTransactionControl::new(Duration::from_secs(1));
         let response = send_in_session(
             &actor,
+            Some(test_sim()),
             build_ucs2_submit("+8613800138000", "测试").unwrap(),
             &control,
         );
@@ -314,10 +348,10 @@ mod tests {
             SmsSendResult::Submitted
         );
         let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 5);
-        assert_eq!(writes[0], b"AT+CMGF?\r");
-        assert_eq!(writes[1], b"AT+CMGF=0\r");
-        assert_eq!(writes[2], b"AT+CMGF?\r");
+        assert_eq!(writes.len(), 7);
+        assert_eq!(writes[1], b"AT+CMGF?\r");
+        assert_eq!(writes[2], b"AT+CMGF=0\r");
+        assert_eq!(writes[3], b"AT+CMGF?\r");
         assert_eq!(
             writes
                 .last()
@@ -335,15 +369,21 @@ mod tests {
             DeviceEpoch(1),
             Box::new(Fixture {
                 writes: writes.clone(),
-                reads: ["+CMGF: 1\r\nOK\r\n", "OK\r\n", "+CMGF: 1\r\nOK\r\n"]
-                    .into_iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect(),
+                reads: [
+                    "+QCCID: 89860123456789012345\r\nOK\r\n",
+                    "+CMGF: 1\r\nOK\r\n",
+                    "OK\r\n",
+                    "+CMGF: 1\r\nOK\r\n",
+                ]
+                .into_iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
             }),
         );
         let control = SmsTransactionControl::new(Duration::from_secs(1));
         let response = send_in_session(
             &actor,
+            Some(test_sim()),
             build_ucs2_submit("+8613800138000", "测试").unwrap(),
             &control,
         );
@@ -351,7 +391,7 @@ mod tests {
         assert_eq!(receipt.result, SmsSendResult::Failed);
         assert_eq!(receipt.failure.unwrap().code, "sms:pdu_confirm_failed");
         assert!(!control.submission_possible());
-        assert_eq!(writes.lock().unwrap().len(), 3);
+        assert_eq!(writes.lock().unwrap().len(), 4);
     }
     #[test]
     fn cms_code_survives_without_message_content() {
@@ -392,5 +432,58 @@ mod tests {
         let detail = receipt.failure.unwrap();
         assert_eq!(detail.code, "sms:port_open_failed");
         assert_eq!(detail.os_code, Some(5));
+    }
+    fn test_sim() -> [u8; 8] {
+        dji4g_domain::sha256(b"89860123456789012345")[..8]
+            .try_into()
+            .unwrap()
+    }
+    #[test]
+    fn live_sim_failures_never_submit_body() {
+        for case in 0..4 {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let identity = "+QCCID: 89860123456789012345\r\nOK\r\n";
+            let changed = "+QCCID: 89860123456789012346\r\nOK\r\n";
+            let reads = match case {
+                0 => vec![],
+                1 => vec!["ERROR\r\n"],
+                2 => vec![changed],
+                _ => vec![identity, "+CMGF: 0\r\nOK\r\n", changed],
+            };
+            let actor = AtSessionActor::spawn(
+                DeviceEpoch(1),
+                Box::new(Fixture {
+                    writes: writes.clone(),
+                    reads: reads.into_iter().map(|s| s.as_bytes().to_vec()).collect(),
+                }),
+            );
+            let control = SmsTransactionControl::new(Duration::from_secs(1));
+            let receipt = classify(
+                send_in_session(
+                    &actor,
+                    if case == 0 { None } else { Some(test_sim()) },
+                    build_ucs2_submit("+8613800138000", "测试").unwrap(),
+                    &control,
+                ),
+                &control,
+            );
+            assert_eq!(receipt.result, SmsSendResult::Failed);
+            assert_eq!(
+                receipt.failure.unwrap().code,
+                match case {
+                    0 => "sms:sim_identity_required",
+                    1 => "sms:sim_identity_unverified",
+                    _ => "sms:sim_changed",
+                }
+            );
+            assert!(!control.submission_possible());
+            assert!(
+                writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|w| !w.starts_with(b"AT+CMGS") && !w.contains(&0x1a))
+            );
+        }
     }
 }

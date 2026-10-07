@@ -8,6 +8,11 @@ use dji4g_application::{
 use dji4g_domain::Freshness;
 use eframe::egui;
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 pub const OFFICIAL_DRIVER_GUIDANCE_URL: &str = "https://repair.dji.com/help/content?customId=01700008285&lang=en&paperDocType=ARTICLE&re=US&spaceId=17";
 pub const OFFICIAL_SUPPORT_URL: &str = "https://www.dji.com/cn/support";
 
@@ -29,14 +34,23 @@ pub(crate) enum CheckState {
 }
 
 impl CheckState {
-    fn label(self) -> &'static str {
+    fn label(self, language: crate::localization::Language) -> String {
         match self {
-            Self::Waiting => "等待检查 / 设备就绪",
-            Self::Running => "正在检查…",
-            Self::Passed => "已通过",
-            Self::Attention => "需要查看原因",
-            Self::Disabled => "已关闭，尚未验证",
-            Self::Expired => "结果已过期，请刷新",
+            Self::Waiting => t(language, crate::localization::TextKey::OnboardingWaiting),
+            Self::Running => t(language, crate::localization::TextKey::OnboardingChecking),
+            Self::Passed => t(language, crate::localization::TextKey::CheckPassed),
+            Self::Attention => t(
+                language,
+                crate::localization::TextKey::OnboardingNeedsReview,
+            ),
+            Self::Disabled => t(
+                language,
+                crate::localization::TextKey::OnboardingDisabledUnverified,
+            ),
+            Self::Expired => t(
+                language,
+                crate::localization::TextKey::OnboardingStaleRefresh,
+            ),
         }
     }
     fn tone(self) -> super::StatusTone {
@@ -79,16 +93,47 @@ fn check_state(
 
 pub(crate) fn checks(
     snapshot: &ControllerSnapshot,
+    language: crate::localization::Language,
     now: SystemTime,
-) -> Vec<(&'static str, CheckState)> {
+) -> Vec<(String, CheckState)> {
     use DiagnosticCheckId as Id;
     [
-        (Id::UsbDevice, "USB 设备识别"),
-        (Id::WindowsAdapter, "Windows 网卡"),
-        (Id::AtControl, "AT 串口通信"),
-        (Id::Cellular, "SIM 与蜂窝网络"),
-        (Id::BoundPublic, "模块公网连接"),
-        (Id::BoundDns, "模块 DNS 解析"),
+        (
+            Id::UsbDevice,
+            t(language, crate::localization::TextKey::OnboardingCheckUsb),
+        ),
+        (
+            Id::WindowsAdapter,
+            t(
+                language,
+                crate::localization::TextKey::OnboardingCheckAdapter,
+            ),
+        ),
+        (
+            Id::AtControl,
+            t(language, crate::localization::TextKey::OnboardingCheckAt),
+        ),
+        (
+            Id::Cellular,
+            t(
+                language,
+                crate::localization::TextKey::OnboardingCheckCellular,
+            ),
+        ),
+        (
+            Id::BoundPublic,
+            t(
+                language,
+                crate::localization::TextKey::OnboardingCheckBoundPublic,
+            ),
+        ),
+        (
+            Id::BoundDns,
+            t(
+                language,
+                crate::localization::TextKey::OnboardingCheckBoundDns,
+            ),
+        ),
     ]
     .into_iter()
     .map(|(id, label)| {
@@ -134,24 +179,41 @@ pub(crate) fn bundled_driver_available() -> bool {
 }
 
 fn completion_copy(
+    language: crate::localization::Language,
     ready: bool,
     result: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
-) -> (&'static str, &'static str, &'static str) {
+) -> (String, String, String) {
     use dji4g_windows_platform::driver_setup::DriverSetupOutcome as O;
     if let Some(outcome @ (O::RestartRequired | O::RestartRequiredAfterFailure)) = result {
-        return ("2. 请先重启电脑", "进入面板（需重启）", outcome.message());
+        return (
+            t(
+                language,
+                crate::localization::TextKey::OnboardingRestartStep,
+            ),
+            t(
+                language,
+                crate::localization::TextKey::OnboardingEnterAfterRestart,
+            ),
+            crate::localization::stable_code_display(language, outcome.code()),
+        );
     }
     (
-        "2. 自动检查模块",
+        t(
+            language,
+            crate::localization::TextKey::OnboardingAutoCheckStep,
+        ),
         if ready {
-            "开始使用"
+            t(language, crate::localization::TextKey::OnboardingStartUsing)
         } else {
-            "进入面板"
+            t(language, crate::localization::TextKey::OnboardingEnterPanel)
         },
         if ready {
-            "模块绑定的公网与 DNS 检查通过；电脑实际出口仍可能由 Wi-Fi 或 VPN 决定。"
+            t(language, crate::localization::TextKey::OnboardingPassedNote)
         } else {
-            "等待检查、未连接、证据过期或关闭主动联网检查，不等于驱动损坏。具体原因可进入面板查看。"
+            t(
+                language,
+                crate::localization::TextKey::OnboardingNotPassedNote,
+            )
         },
     )
 }
@@ -159,84 +221,218 @@ fn completion_copy(
 pub(crate) fn render(
     ctx: &egui::Context,
     snapshot: &ControllerSnapshot,
+    language: crate::localization::Language,
     now: SystemTime,
     driver_fixture: Option<bool>,
     setup_result: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
     sink: &dyn crate::app::PanelCommandSink,
 ) -> OnboardingAction {
-    let rows = checks(snapshot, now);
+    let rows = checks(snapshot, language, now);
     let ready = rows.iter().all(|(_, state)| *state == CheckState::Passed);
-    let (check_heading, enter_label, completion_detail) = completion_copy(ready, setup_result);
+    let (check_heading, enter_label, completion_detail) =
+        completion_copy(language, ready, setup_result);
     let mut action = OnboardingAction::None;
     egui::TopBottomPanel::bottom("onboarding-actions")
         .show_separator_line(false)
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(240, 244, 249))
+                .fill(super::scale::surface_alt())
                 .inner_margin(16.0),
         )
         .show(ctx, |ui| {
-            if super::components::entry_footer(ui, enter_label).clicked() {
+            if super::components::entry_footer(ui, &enter_label, language).clicked() {
                 action = OnboardingAction::Enter;
             }
         });
-    egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0)).show(ctx, |ui| {
-        egui::ScrollArea::vertical().id_salt("onboarding-scroll").auto_shrink([false,false]).show(ui, |ui| {
-            ui.set_max_width(ui.available_width().min(960.0));
-            super::shell::brand(ui);
-            ui.add_space(16.0);
-            super::components::page_heading(ui, "连接你的 4G 模块", "连接、检查，然后开始使用。也可以随时进入面板。");
-            if let Some(result) = setup_result {
-                ui.add_space(12.0);
-                super::section_frame(ui, |ui| {
-                    ui.label(super::section_heading("本次驱动安装结果"));
-                    super::wrapped_label(ui, result.message());
-                });
-            }
-            ui.add_space(16.0);
-            super::components::status_banner(ui, "1 · 连接模块", "插好 SIM 卡，使用支持数据传输的 USB 线连接电脑。已有驱动可直接使用。", super::StatusTone::Neutral);
-            ui.add_space(12.0);
-            super::section_frame(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(super::section_heading(check_heading));
-                    if ui.add_enabled(!snapshot.serial_work_busy,egui::Button::new("重新检查")).clicked() { action = OnboardingAction::Refresh; }
-                });
-                for (label,state) in &rows {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add_sized([160.0, 28.0], egui::Label::new(*label));
-                        ui.colored_label(state.tone().color(),format!("{} {}",state.tone().marker(),state.label()));
-                        if *state == CheckState::Running { super::components::loading_spinner(ui); }
+    egui::CentralPanel::default()
+        .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("onboarding-scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width().min(960.0));
+                    super::shell::brand(ui, language);
+                    ui.add_space(16.0);
+                    super::components::page_heading(
+                        ui,
+                        &t(language, crate::localization::TextKey::OnboardingTitle),
+                        &t(language, crate::localization::TextKey::OnboardingIntro),
+                    );
+                    if let Some(result) = setup_result {
+                        ui.add_space(12.0);
+                        super::section_frame(ui, |ui| {
+                            ui.label(super::section_heading(t(
+                                language,
+                                crate::localization::TextKey::OnboardingSetupResultHeading,
+                            )));
+                            super::wrapped_label(
+                                ui,
+                                crate::localization::stable_code_display(language, result.code()),
+                            );
+                        });
+                    }
+                    ui.add_space(16.0);
+                    super::components::status_banner(
+                        ui,
+                        &t(language, crate::localization::TextKey::OnboardingStep1Title),
+                        &t(language, crate::localization::TextKey::OnboardingStep1Body),
+                        super::StatusTone::Neutral,
+                    );
+                    ui.add_space(12.0);
+                    super::section_frame(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(super::section_heading(check_heading));
+                            if ui
+                                .add_enabled(
+                                    !snapshot.serial_work_busy,
+                                    egui::Button::new(t(
+                                        language,
+                                        crate::localization::TextKey::HostCheckAgain,
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                action = OnboardingAction::Refresh;
+                            }
+                        });
+                        for (label, state) in &rows {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_sized(
+                                    [160.0, super::scale::CONTROL_H],
+                                    egui::Label::new(label.clone()),
+                                );
+                                ui.colored_label(
+                                    state.tone().color(),
+                                    format!("{} {}", state.tone().marker(), state.label(language)),
+                                );
+                                if *state == CheckState::Running {
+                                    super::components::loading_spinner(ui);
+                                }
+                            });
+                        }
+                        ui.add_space(6.0);
+                        super::wrapped_label(ui, super::meta_text(completion_detail));
                     });
-                }
-                ui.add_space(6.0);
-                super::wrapped_label(ui,super::meta_text(completion_detail));
-            });
-            if super::module_network_check::render(ui, snapshot, now, crate::localization::Language::ZhCn, sink) { action = OnboardingAction::OpenRepairs; }
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new("电脑网络与代理（可选检查）").default_open(false).show(ui, |ui| {
-                let (tone, summary) = super::network_assistance::brief(snapshot, now, crate::localization::Language::ZhCn);
-                super::wrapped_label(ui, egui::RichText::new(format!("{} {summary}", tone.marker())).color(tone.color()));
-                if ui.button("检查电脑网络").clicked() { action = OnboardingAction::InspectHostNetwork; }
-                super::wrapped_label(ui, super::meta_text("即使没插模块也能检查；代理配置问题不会当作驱动损坏。"));
-            });
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new("3. 需要驱动时再安装").default_open(false).show(ui, |ui| {
-                if driver_fixture.unwrap_or_else(bundled_driver_available) {
-                    super::wrapped_label(ui,"已找到本地驱动资源，安装前还会校验签名和文件。此包不能覆盖所有接口（包括未匹配的 MI_04）；如有缺驱动接口无法匹配，将在安装前停止。已有接口正常时无需重复安装。");
-                    if ui.add_enabled(!super::driver_setup::installation_busy(snapshot),egui::Button::new("使用内置驱动")).clicked() { action = OnboardingAction::InstallBundledDriver; }
-                    super::wrapped_label(ui,super::meta_text("点击后先确认，再退出面板并显示 Windows 授权；安装结束或取消授权后会自动返回面板。需要重启时，请先重启电脑。"));
-                } else {
-                    super::wrapped_label(ui,"此版本未附带完整驱动资源，不能在这里离线安装。请先打开 Windows 设置 → Windows 更新 → 可选更新，查看驱动更新；也可联系 DJI 官方支持取得适配此模块的驱动，按厂商说明安装后点击“重新检查”。");
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("打开 Windows 更新").clicked() { action = OnboardingAction::OpenWindowsUpdate; }
-                    ui.hyperlink_to("DJI 官方兼容与驱动说明",OFFICIAL_DRIVER_GUIDANCE_URL);
-                    ui.hyperlink_to("联系 DJI 官方支持",OFFICIAL_SUPPORT_URL);
+                    if super::module_network_check::render(
+                        ui,
+                        snapshot,
+                        now,
+                        crate::localization::Language::ZhCn,
+                        sink,
+                    ) {
+                        action = OnboardingAction::OpenRepairs;
+                    }
+                    ui.add_space(12.0);
+                    // Always open: sections are cards, not accordions.
+                    ui.label(super::section_heading(t(
+                        language,
+                        crate::localization::TextKey::OnboardingHostHeading,
+                    )));
+                    {
+                        let (tone, summary) = super::network_assistance::brief(
+                            snapshot,
+                            now,
+                            crate::localization::Language::ZhCn,
+                        );
+                        super::wrapped_label(
+                            ui,
+                            egui::RichText::new(format!("{} {summary}", tone.marker()))
+                                .color(tone.color()),
+                        );
+                        if ui
+                            .button(t(
+                                language,
+                                crate::localization::TextKey::OnboardingCheckHost,
+                            ))
+                            .clicked()
+                        {
+                            action = OnboardingAction::InspectHostNetwork;
+                        }
+                        super::wrapped_label(
+                            ui,
+                            super::meta_text(t(
+                                language,
+                                crate::localization::TextKey::OnboardingHostNote,
+                            )),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.label(super::section_heading(t(
+                        language,
+                        crate::localization::TextKey::OnboardingStep3Title,
+                    )));
+                    {
+                        if driver_fixture.unwrap_or_else(bundled_driver_available) {
+                            super::wrapped_label(
+                                ui,
+                                t(
+                                    language,
+                                    crate::localization::TextKey::OnboardingBundledDriverNote,
+                                ),
+                            );
+                            if ui
+                                .add_enabled(
+                                    !super::driver_setup::installation_busy(snapshot),
+                                    egui::Button::new(t(
+                                        language,
+                                        crate::localization::TextKey::OnboardingUseBundledDriver,
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                action = OnboardingAction::InstallBundledDriver;
+                            }
+                            super::wrapped_label(
+                                ui,
+                                super::meta_text(t(
+                                    language,
+                                    crate::localization::TextKey::OnboardingBundledDriverHint,
+                                )),
+                            );
+                        } else {
+                            super::wrapped_label(
+                                ui,
+                                t(
+                                    language,
+                                    crate::localization::TextKey::OnboardingNoBundledDriverNote,
+                                ),
+                            );
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .button(t(
+                                    language,
+                                    crate::localization::TextKey::OnboardingOpenWindowsUpdate,
+                                ))
+                                .clicked()
+                            {
+                                action = OnboardingAction::OpenWindowsUpdate;
+                            }
+                            super::components::link(
+                                ui,
+                                &t(
+                                    language,
+                                    crate::localization::TextKey::OnboardingDjiCompatibilityLink,
+                                ),
+                                OFFICIAL_DRIVER_GUIDANCE_URL,
+                            );
+                            super::components::link(
+                                ui,
+                                &t(language, crate::localization::TextKey::DriverDjiSupportLink),
+                                OFFICIAL_SUPPORT_URL,
+                            );
+                        });
+                        super::wrapped_label(
+                            ui,
+                            super::meta_text(t(
+                                language,
+                                crate::localization::TextKey::OnboardingOfficialLinkNote,
+                            )),
+                        );
+                    }
                 });
-                super::wrapped_label(ui,super::meta_text("官方网页提供兼容说明与支持入口，不是驱动直达下载。网页不会自动安装；Windows 更新也不保证提供该模块的全部驱动。"));
-            });
         });
-    });
     action
 }
 
@@ -248,12 +444,12 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH;
         let mut snapshot = dji4g_application::ReducerState::new(now).snapshot();
         assert!(
-            checks(&snapshot, now)
+            checks(&snapshot, crate::localization::Language::ZhCn, now)
                 .iter()
                 .all(|(_, state)| *state == CheckState::Waiting)
         );
         snapshot.settings.active_probe = false;
-        let rows = checks(&snapshot, now);
+        let rows = checks(&snapshot, crate::localization::Language::ZhCn, now);
         assert_eq!(rows[4].1, CheckState::Disabled);
         assert_eq!(rows[5].1, CheckState::Disabled);
         assert_eq!(check_state(None, true, now), CheckState::Waiting);
@@ -263,14 +459,18 @@ mod tests {
         let now = SystemTime::now();
         let snapshot = dji4g_application::ReducerState::test_ready(now).snapshot();
         assert!(
-            checks(&snapshot, now)
+            checks(&snapshot, crate::localization::Language::ZhCn, now)
                 .iter()
                 .all(|(_, state)| *state == CheckState::Passed)
         );
         assert!(
-            checks(&snapshot, now + std::time::Duration::from_secs(3600))
-                .iter()
-                .all(|(_, state)| *state == CheckState::Expired)
+            checks(
+                &snapshot,
+                crate::localization::Language::ZhCn,
+                now + std::time::Duration::from_secs(3600)
+            )
+            .iter()
+            .all(|(_, state)| *state == CheckState::Expired)
         );
     }
 }
@@ -279,12 +479,23 @@ mod tests {
 fn restart_result_overrides_healthy_checks_and_start_using_copy() {
     use dji4g_windows_platform::driver_setup::DriverSetupOutcome as O;
     for outcome in [O::RestartRequired, O::RestartRequiredAfterFailure] {
-        let (heading, button, detail) = completion_copy(true, Some(outcome));
+        let (heading, button, detail) =
+            completion_copy(crate::localization::Language::ZhCn, true, Some(outcome));
         assert!(heading.contains("重启"));
         assert!(button.contains("重启"));
         assert!(detail.contains("重启"));
-        assert!(!button.contains("开始使用"));
+        assert!(!button.contains(&t(
+            crate::localization::Language::ZhCn,
+            crate::localization::TextKey::OnboardingStartUsing,
+        )));
         assert!(!detail.contains("检查通过"));
     }
-    assert!(completion_copy(true, Some(O::Ready)).1.contains("开始使用"));
+    assert!(
+        completion_copy(crate::localization::Language::ZhCn, true, Some(O::Ready))
+            .1
+            .contains(&t(
+                crate::localization::Language::ZhCn,
+                crate::localization::TextKey::OnboardingStartUsing,
+            ))
+    );
 }

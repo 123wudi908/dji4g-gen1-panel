@@ -16,6 +16,7 @@ pub fn sms_list_controlled(
     storage: Option<SmsStorageId>,
     control: SmsReadControl,
 ) -> Result<SmsListing, PlatformError> {
+    crate::sms::require_sms_device(device)?;
     if expected_sim.is_none() {
         return Err(error("sms:sim_identity_required"));
     }

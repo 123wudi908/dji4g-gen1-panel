@@ -132,6 +132,7 @@ pub struct ControllerRunner {
     last_host_trigger: Option<Instant>,
     controller: Controller,
     commands: mpsc::Receiver<UiCommand>,
+    presentation_commands: mpsc::Receiver<UiCommand>,
     refresh: Arc<RefreshSignal>,
     handle: ControllerHandle,
     ports: Option<MonitorPorts>,
@@ -272,7 +273,8 @@ impl ControllerRunner {
     #[must_use]
     pub fn new(controller: Controller) -> (ControllerHandle, Self) {
         let initial = Arc::new(controller.snapshot());
-        let (handle, commands, refresh) = ControllerHandle::channels(initial);
+        let (handle, commands, presentation_commands, refresh) =
+            ControllerHandle::channels(initial);
         let runner = Self {
             host_port: None,
             pending_host: None,
@@ -280,6 +282,7 @@ impl ControllerRunner {
             last_host_trigger: None,
             controller,
             commands,
+            presentation_commands,
             refresh,
             handle: handle.clone(),
             ports: None,
@@ -375,7 +378,7 @@ impl ControllerRunner {
     /// without spawning the async loop, and it is behaviourally identical to the loop's own
     /// receive branch.
     pub fn poll_commands(&mut self) -> bool {
-        let mut handled = false;
+        let mut handled = self.poll_presentation_commands();
         loop {
             match self.commands.try_recv() {
                 Ok(command) => {
@@ -388,8 +391,23 @@ impl ControllerRunner {
         }
     }
 
+    /// Only preferences and persistence receipts can bypass a read-only diagnostic wait.
+    /// Device commands remain in their original bounded FIFO until the scan releases its ports.
+    fn poll_presentation_commands(&mut self) -> bool {
+        let mut handled = false;
+        while let Ok(command) = self.presentation_commands.try_recv() {
+            let _ = self.controller.handle_command(command);
+            handled = true;
+        }
+        if handled {
+            self.publish();
+        }
+        handled
+    }
+
     pub async fn run(mut self) {
         loop {
+            self.poll_presentation_commands();
             if !self.host_auto_requested && self.host_port.is_some() {
                 self.host_auto_requested = true;
                 let _ = self
@@ -1211,10 +1229,11 @@ impl ControllerRunner {
         // An unreadable counter, a port error, or a watchdog timeout all collapse to `None` values,
         // which the reducer turns into honest `None` rates/metrics — never stale or fabricated
         // numbers.
-        let (counters, metrics, sampled_at) = match join_stage(receiver, deadline) {
-            Some(Ok(sampled)) => sampled,
-            _ => (None, None, self.controller.now()),
-        };
+        let (counters, metrics, sampled_at) =
+            match self.join_stage_with_settings(receiver, deadline) {
+                Some(Ok(sampled)) => sampled,
+                _ => (None, None, self.controller.now()),
+            };
         let (rx, tx) = counters.map_or((None, None), |(rx, tx)| (Some(rx), Some(tx)));
         self.controller
             .apply_backend_event(BackendEvent::RatesSampled {
@@ -1649,6 +1668,25 @@ impl ControllerRunner {
         }
     }
 
+    fn join_stage_with_settings<T>(
+        &mut self,
+        receiver: mpsc::Receiver<Result<T, crate::PortError>>,
+        deadline: Instant,
+    ) -> Option<Result<T, crate::PortError>> {
+        loop {
+            self.poll_presentation_commands();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining.min(IDLE_POLL_INTERVAL)) {
+                Ok(result) => return Some(result),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+
     /// Keep bound-interface telemetry alive while waiting for slow diagnostic stages.
     /// Counter reads are read-only and never use the serial port; events remain runner-ordered.
     fn join_stage_with_rates<T>(
@@ -1657,6 +1695,7 @@ impl ControllerRunner {
         deadline: Instant,
     ) -> Option<Result<T, crate::PortError>> {
         loop {
+            self.poll_presentation_commands();
             let remaining = deadline.saturating_duration_since(Instant::now());
             match receiver.recv_timeout(remaining.min(IDLE_POLL_INTERVAL)) {
                 Ok(result) => return Some(result),
@@ -2039,7 +2078,7 @@ fn tool_response_of(receipt: &crate::ToolReceipt) -> dji4g_at_protocol::ToolResp
             .transcript
             .lines()
             .iter()
-            .filter(|line| !line.starts_with("[模块主动上报]"))
+            .filter(|line| crate::urc_transcript_payload(line).is_none())
             .cloned()
             .collect(),
         urc_lines: Vec::new(),
@@ -2149,26 +2188,8 @@ where
     receiver
 }
 
-/// Wait for one stage's outcome until `deadline`. `None` means the budget expired (or the
-/// worker died without reporting), and the runner moves on without the stage's real result.
-fn join_stage<T>(
-    receiver: mpsc::Receiver<Result<T, crate::PortError>>,
-    deadline: Instant,
-) -> Option<Result<T, crate::PortError>> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(outcome) => Some(outcome),
-        // Timeout: the stage exceeded its watchdog budget. Disconnected: the worker panicked or
-        // vanished without reporting. Both are reported as `app:stage_timeout` so the cycle
-        // always completes and the next refresh can proceed normally.
-        Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => None,
-    }
-}
-
-/// Map a stage's raw outcome onto the reducer vocabulary, substituting the watchdog failure
-/// `app:stage_timeout` when the stage produced nothing within its budget. The timestamp is taken
-/// on the runner thread from the controller clock so `observed_at` stays on one deterministic
-/// clock (workers have no controller access and must not stamp wall-clock time themselves).
+/// Map a stage's raw outcome onto the reducer vocabulary, reporting a watchdog timeout when
+/// the worker produced nothing in its budget. Only the controller clock stamps observations.
 fn stage_check<T>(
     outcome: Option<Result<T, crate::PortError>>,
     observed_at: SystemTime,

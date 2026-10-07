@@ -99,6 +99,9 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
         return;
     }
     let y = |value: f32| plot.bottom() - value / axis.max_bytes * plot.height();
+    // The plot area gets a hairline box so the series read as a chart rather than as floating
+    // lines on the card, matching the bordered blocks elsewhere on the page.
+    painter.rect_stroke(plot, 0.0, Stroke::new(1.0_f32, scale::border()));
     for i in 0..=axis.step_count {
         let ordinate = y(axis.step_bytes() * i as f32);
         painter.line_segment(
@@ -106,14 +109,14 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
                 egui::pos2(plot.left(), ordinate),
                 egui::pos2(plot.right(), ordinate),
             ],
-            Stroke::new(1.0_f32, scale::GRID),
+            Stroke::new(1.0_f32, scale::line()),
         );
         painter.text(
             egui::pos2(plot.left() - 10.0, ordinate),
             egui::Align2::RIGHT_CENTER,
             axis.tick_label(i),
             egui::FontId::proportional(scale::META),
-            scale::AXIS_LABEL,
+            scale::faint(),
         );
     }
     painter.text(
@@ -121,16 +124,21 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
         egui::Align2::LEFT_TOP,
         axis.unit,
         egui::FontId::proportional(scale::META),
-        scale::AXIS_LABEL,
+        scale::faint(),
     );
     for seconds in [60, 45, 30, 15, 0] {
         if width < 420.0 && matches!(seconds, 45 | 15) {
             continue;
         }
         let text = if seconds == 0 {
-            "现在".into()
+            LocalizedText::new(language, TextKey::RateNow).text
         } else {
-            format!("{seconds} 秒前")
+            format_text_in(
+                language,
+                TextKey::RateSecondsAgo,
+                &TextArgs::count(seconds as usize),
+            )
+            .text
         };
         let align = match seconds {
             60 => egui::Align2::LEFT_CENTER,
@@ -145,7 +153,7 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
             align,
             text,
             egui::FontId::proportional(scale::META),
-            scale::AXIS_LABEL,
+            scale::faint(),
         );
     }
     let Some(&(latest, _, _)) = samples.last() else {
@@ -154,7 +162,7 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
             egui::Align2::CENTER_CENTER,
             LocalizedText::new(language, TextKey::RateSampling).text,
             egui::FontId::proportional(scale::RATE_AUX),
-            scale::SECONDARY,
+            scale::secondary(),
         );
         return;
     };
@@ -165,9 +173,9 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
         painter.text(
             plot.center(),
             egui::Align2::CENTER_CENTER,
-            "速率采样暂停，等待新读数",
+            LocalizedText::new(language, TextKey::RateSamplePaused).text,
             egui::FontId::proportional(scale::RATE_AUX),
-            scale::SECONDARY,
+            scale::secondary(),
         );
         return;
     }
@@ -175,9 +183,9 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
         painter.text(
             plot.center(),
             egui::Align2::CENTER_CENTER,
-            "暂未获取速率",
+            LocalizedText::new(language, TextKey::RateNotSampled).text,
             egui::FontId::proportional(scale::RATE_AUX),
-            scale::SECONDARY,
+            scale::secondary(),
         );
         return;
     }
@@ -280,7 +288,7 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
             if (hx - pointer.x).abs() <= plot.width() * 1.5 / RATE_CHART_X_SPAN_SECS {
                 series.line_segment(
                     [egui::pos2(hx, plot.top()), egui::pos2(hx, plot.bottom())],
-                    Stroke::new(1.0_f32, scale::AXIS),
+                    Stroke::new(1.0_f32, scale::line()),
                 );
                 for (value, color) in [(down, DOWN_COLOR), (up, UP_COLOR)] {
                     if let Some(value) = value {
@@ -288,15 +296,31 @@ pub(super) fn paint(ui: &mut Ui, history: &RateHistory, language: Language) {
                     }
                 }
                 response.on_hover_ui_at_pointer(|ui| {
-                    ui.label(format!("{:.1} 秒前 · 实际采样", age(time, latest)));
-                    ui.label(format!(
-                        "↓ 下载  {}",
-                        down.map(format_rate_1dp).unwrap_or_else(|| "未获取".into())
-                    ));
-                    ui.label(format!(
-                        "↑ 上传  {}",
-                        up.map(format_rate_1dp).unwrap_or_else(|| "未获取".into())
-                    ));
+                    ui.label(
+                        format_text_in(
+                            language,
+                            TextKey::RateHoverAgo,
+                            &TextArgs::age(format!("{:.1}", age(time, latest))),
+                        )
+                        .text,
+                    );
+                    let missing = || LocalizedText::new(language, TextKey::ValueNotAvailable).text;
+                    ui.label(
+                        format_text_in(
+                            language,
+                            TextKey::RateHoverDown,
+                            &TextArgs::detail(down.map(format_rate_1dp).unwrap_or_else(missing)),
+                        )
+                        .text,
+                    );
+                    ui.label(
+                        format_text_in(
+                            language,
+                            TextKey::RateHoverUp,
+                            &TextArgs::detail(up.map(format_rate_1dp).unwrap_or_else(missing)),
+                        )
+                        .text,
+                    );
                 });
             }
         }

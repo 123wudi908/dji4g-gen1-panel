@@ -23,6 +23,7 @@ use crate::{
     ConfirmResult, ConfirmationInvalidationReason, ControllerSnapshot, EpochInvalidationReason,
     FailureCode, FakeActionExecutor, FakeClock, FeatureKey, LanguageCode, LogLevel, OperationPhase,
     OperationState, OperationUiSnapshot, PortError, PreparedActionState, ReducerState, StableCode,
+    ThemeCode,
 };
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -126,6 +127,7 @@ pub enum UiCommand {
     SetStartMinimized(bool),
     SetActiveProbe(bool),
     SetLanguage(LanguageCode),
+    SetTheme(ThemeCode),
     SetLogLevel(LogLevel),
     ExportDiagnostics,
     /// Re-list the module's stored messages. Queued for the runner's `SmsPort`; the controller
@@ -243,6 +245,7 @@ impl RefreshSignal {
 #[derive(Clone)]
 pub struct ControllerHandle {
     sender: SyncSender<UiCommand>,
+    presentation_sender: SyncSender<UiCommand>,
     refresh: Arc<RefreshSignal>,
     pub(crate) snapshot_tx: crate::sync::watch::Sender<Arc<ControllerSnapshot>>,
 }
@@ -257,7 +260,16 @@ impl ControllerHandle {
         if matches!(command, UiCommand::Refresh) {
             return Ok(self.refresh.request());
         }
-        self.sender
+        // Presentation preferences never take a device lease or alter diagnostic evidence.
+        let sender = if matches!(
+            command,
+            UiCommand::SetTheme(_) | UiCommand::SetLanguage(_) | UiCommand::SettingsPersisted(_)
+        ) {
+            &self.presentation_sender
+        } else {
+            &self.sender
+        };
+        sender
             .try_send(command)
             .map(|()| CommandReceipt::Accepted)
             .map_err(|error| match error {
@@ -268,17 +280,26 @@ impl ControllerHandle {
 
     pub(crate) fn channels(
         initial: Arc<ControllerSnapshot>,
-    ) -> (Self, mpsc::Receiver<UiCommand>, Arc<RefreshSignal>) {
+    ) -> (
+        Self,
+        mpsc::Receiver<UiCommand>,
+        mpsc::Receiver<UiCommand>,
+        Arc<RefreshSignal>,
+    ) {
         let (sender, receiver) = crate::sync::bounded(COMMAND_QUEUE_CAPACITY);
+        let (presentation_sender, presentation_receiver) =
+            crate::sync::bounded(COMMAND_QUEUE_CAPACITY);
         let (snapshot_tx, _snapshot_rx) = crate::sync::watch::channel(initial);
         let refresh = Arc::new(RefreshSignal::new());
         (
             Self {
                 sender,
+                presentation_sender,
                 refresh: Arc::clone(&refresh),
                 snapshot_tx,
             },
             receiver,
+            presentation_receiver,
             refresh,
         )
     }
@@ -751,6 +772,10 @@ impl Controller {
         }
     }
 
+    pub fn set_theme(&mut self, theme: ThemeCode) {
+        self.state.set_theme(theme);
+    }
+
     pub fn set_language(&mut self, language: LanguageCode) {
         self.state.set_language(language);
     }
@@ -969,6 +994,14 @@ impl Controller {
                 }
                 Ok(CommandReceipt::Accepted)
             }
+            UiCommand::SetTheme(value) => {
+                let revision_before = self.state.settings_revision();
+                self.set_theme(value);
+                if self.state.settings_revision() != revision_before {
+                    self.state.begin_settings_persistence();
+                }
+                Ok(CommandReceipt::Accepted)
+            }
             UiCommand::SetLanguage(value) => {
                 let revision_before = self.state.settings_revision();
                 self.set_language(value);
@@ -990,6 +1023,9 @@ impl Controller {
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsRefresh => {
+                if self.state.read_only_module() {
+                    return self.reject_read_only_module();
+                }
                 if self.sms_active()
                     || self.sms_delete_active()
                     || self.sms_read_in_flight
@@ -1010,6 +1046,11 @@ impl Controller {
             UiCommand::SmsReadStorage { storage } => {
                 if self.serial_work_busy() || self.operation_pending.is_some() {
                     return self.reject_sms_busy();
+                }
+                // Choosing another holder issues `AT+CPMS` on the module: a write the generic
+                // read-only module is never offered.
+                if self.state.read_only_module() {
+                    return self.reject_read_only_module();
                 }
                 if !matches!(storage.0.as_str(), "SM" | "ME") {
                     self.report_feedback(failure(
@@ -1039,6 +1080,9 @@ impl Controller {
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsRead { index } => {
+                if self.state.read_only_module() {
+                    return self.reject_read_only_module();
+                }
                 if self.sms_active()
                     || self.sms_delete_active()
                     || self.sms_read_in_flight
@@ -1070,6 +1114,12 @@ impl Controller {
                         .is_some_and(|op| matches!(op.state, OperationState::Running { .. }))
                 {
                     return self.reject_sms_send_busy();
+                }
+                // Submitting a message writes to the module and costs the user money: a recognized
+                // read-only module (the generic `2C7C:0125`) never receives one.
+                if self.state.read_only_module() {
+                    self.sms_send_rejected_seq = self.sms_send_rejected_seq.saturating_add(1);
+                    return self.reject_read_only_module();
                 }
                 let request_id = self.next_sms_request_id;
                 self.sms_send_context = Some((self.state.epoch(), self.snapshot().sim_epoch));
@@ -1209,6 +1259,12 @@ impl Controller {
     ) -> Result<CommandReceipt, UiSendError> {
         if self.serial_work_busy() {
             return self.reject_tool_busy();
+        }
+        // The expert console writes arbitrary AT text to the module: it stays closed for a
+        // recognized read-only module, with the refusal recorded in the tool transcript too.
+        if self.state.read_only_module() {
+            self.device_tools.last_refusal = Some(crate::ToolOutcome::Rejected);
+            return self.reject_read_only_module();
         }
         let Some(context) = self.tool_context() else {
             return Err(UiSendError::Closed);
@@ -1466,6 +1522,11 @@ impl Controller {
         if self.serial_work_busy() {
             return self.reject_sms_busy();
         }
+        // Deleting from the module's own storage is a write; the generic read-only module keeps
+        // every stored message untouched.
+        if self.state.read_only_module() {
+            return self.reject_read_only_module();
+        }
         let context = (self.state.epoch().0, self.state.sim_epoch());
         let unique: HashSet<_> = fragments.iter().collect();
         let group_matches = self.state.sms_store().display_messages().iter().any(|row| {
@@ -1708,6 +1769,16 @@ impl Controller {
     fn reject_sms_send_busy(&mut self) -> Result<CommandReceipt, UiSendError> {
         self.sms_send_rejected_seq = self.sms_send_rejected_seq.saturating_add(1);
         self.reject_sms_busy()
+    }
+
+    /// Refuse a module-writing command because the identified module is read-only.
+    ///
+    /// The user sees the localized reason through the ordinary feedback notice, and the SMS send
+    /// path additionally records the rejection sequence so a pending compose draft is released
+    /// exactly like a busy rejection.
+    fn reject_read_only_module(&mut self) -> Result<CommandReceipt, UiSendError> {
+        self.report_feedback(failure(ErrorCode::Unsupported, "app:read_only_module"));
+        Err(UiSendError::Closed)
     }
 
     /// The module's port is occupied by a device-tool task. The message is distinct from a busy

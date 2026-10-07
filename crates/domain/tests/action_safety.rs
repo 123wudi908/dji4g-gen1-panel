@@ -5,7 +5,8 @@ use std::{
 
 use dji4g_domain::{
     ActionKind, ActionPlan, ActionPlanDraft, ActionSafetyError, BeforeStateHash, DeviceEpoch,
-    DisruptionLevel, DnsProfile, RiskLevel, StableDeviceIdentity, UsbNetworkProfile,
+    DisruptionLevel, DnsProfile, QUECTEL_GENERIC, RiskLevel, StableDeviceIdentity,
+    UsbNetworkProfile,
 };
 
 fn identity(pid: u16) -> StableDeviceIdentity {
@@ -67,6 +68,42 @@ fn arbitrary_instance_identity_cannot_create_an_action_plan() {
 
     assert_eq!(
         ActionPlan::try_new(plan),
+        Err(ActionSafetyError::UnsupportedDevice)
+    );
+}
+
+/// The recognized-but-read-only generic module is accepted as a device and refused as a target:
+/// no controlled repair may be planned or validated against it.
+#[test]
+fn recognized_read_only_module_cannot_create_or_validate_an_action_plan() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let generic = || StableDeviceIdentity {
+        container_id: "{f5af1065-56f4-42f4-a3bd-09caa15a31aa}".to_owned(),
+        device_instance_id: "USB\\VID_2C7C&PID_0125\\REDACTED".to_owned(),
+        vid: QUECTEL_GENERIC.vid,
+        pid: QUECTEL_GENERIC.pid,
+    };
+
+    assert!(generic().is_supported(), "it must still be recognized");
+    assert_eq!(generic().profile(), Some(QUECTEL_GENERIC));
+
+    let mut plan = draft(now, 0x4006, DeviceEpoch(2), DeviceEpoch(2));
+    plan.target = generic();
+    assert_eq!(
+        ActionPlan::try_new(plan),
+        Err(ActionSafetyError::UnsupportedDevice)
+    );
+
+    // Even a plan built for the write-capable profile refuses to run against the generic one.
+    let plan = ActionPlan::try_new(draft(now, 0x4006, DeviceEpoch(2), DeviceEpoch(2))).unwrap();
+    assert_eq!(
+        plan.validate_for_execution(
+            41,
+            DeviceEpoch(2),
+            &generic(),
+            BeforeStateHash([0xA5; 32]),
+            now
+        ),
         Err(ActionSafetyError::UnsupportedDevice)
     );
 }

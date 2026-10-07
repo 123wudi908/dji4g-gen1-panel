@@ -11,20 +11,25 @@ use std::time::{Duration, SystemTime};
 use dji4g_application::{
     ControlledRepairError, ControlledRepairRequest, ControllerSnapshot, DeviceToolsSnapshot,
     PendingExpertTool, ToolHistoryEntry, ToolOperationKind, ToolOutcome, ToolPhase, UiCommand,
-    UiSendError, UsbNetReading,
+    UiSendError, UsbNetReading, urc_transcript_payload,
 };
 use dji4g_at_protocol::{
     PdpContextState, PdpType, ToolInputError, ToolReadId, ToolWriteId, ValidatedToolLine,
     VerifiedUsbNetProfile, classify_known_write,
 };
 use dji4g_domain::{DeviceEpoch, FeatureStatus, StableDeviceIdentity};
-use eframe::egui::{self, Color32, RichText, Ui};
+use eframe::egui::{self, RichText, Ui};
 
 use super::{
     StatusTone, detail_text, field_label, info_grid, meta_text, scale, section_frame,
     section_heading, wrapped_label,
 };
 use crate::localization::Language;
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 /// Which tier of the terminal is on screen.
 ///
@@ -95,31 +100,74 @@ impl DeviceToolsState {
 
 /// Status of one capability row. `NotProbed` reads 未查询; it is never presented as a failure.
 #[must_use]
-pub fn feature_status_text(status: FeatureStatus) -> (&'static str, StatusTone) {
+pub fn feature_status_text(status: FeatureStatus, language: Language) -> (String, StatusTone) {
     match status {
-        FeatureStatus::NotProbed => ("未查询", StatusTone::Neutral),
-        FeatureStatus::Supported => ("可用", StatusTone::Positive),
-        FeatureStatus::Empty => ("无数据", StatusTone::Neutral),
-        FeatureStatus::UnsupportedConfirmed => ("固件不支持", StatusTone::Negative),
-        FeatureStatus::TemporarilyUnavailable => ("暂时不可用", StatusTone::Caution),
-        FeatureStatus::FormatMismatch => ("格式不匹配", StatusTone::Caution),
-        FeatureStatus::TransportFailure => ("查询超时", StatusTone::Negative),
+        FeatureStatus::NotProbed => (
+            t(language, crate::localization::TextKey::ToolStateNotQueried),
+            StatusTone::Neutral,
+        ),
+        FeatureStatus::Supported => (
+            t(language, crate::localization::TextKey::ToolStateAvailable),
+            StatusTone::Positive,
+        ),
+        FeatureStatus::Empty => (
+            t(language, crate::localization::TextKey::ToolStateNoData),
+            StatusTone::Neutral,
+        ),
+        FeatureStatus::UnsupportedConfirmed => (
+            t(language, crate::localization::TextKey::ToolStateUnsupported),
+            StatusTone::Negative,
+        ),
+        FeatureStatus::TemporarilyUnavailable => (
+            t(
+                language,
+                crate::localization::TextKey::ToolStateTemporarilyUnavailable,
+            ),
+            StatusTone::Caution,
+        ),
+        FeatureStatus::FormatMismatch => (
+            t(
+                language,
+                crate::localization::TextKey::ToolStateFormatMismatch,
+            ),
+            StatusTone::Caution,
+        ),
+        FeatureStatus::TransportFailure => (
+            t(language, crate::localization::TextKey::ToolStateTimeout),
+            StatusTone::Negative,
+        ),
     }
 }
 
 /// Localized description of one tool outcome. The stable code is shown next to it, so a report can
 /// name the exact result without ever quoting the response text.
 #[must_use]
-pub fn tool_outcome_text(outcome: ToolOutcome) -> &'static str {
+pub fn tool_outcome_text(outcome: ToolOutcome, language: Language) -> String {
     match outcome {
-        ToolOutcome::Ok => "模块返回 OK；配置是否生效需另行确认",
-        ToolOutcome::Rejected => "模块明确拒绝了本次命令",
-        ToolOutcome::Unsupported => "模块表示不支持此命令",
-        ToolOutcome::TransportFailure => "没有收到可用应答（超时、串口错误或已断开）",
-        ToolOutcome::FormatMismatch => "模块有应答，但响应格式未被识别",
-        ToolOutcome::CancelledBeforeWrite => "未执行的命令已取消；已执行项见终端记录",
-        ToolOutcome::OutcomeUnknown => "可能已写入但未收到最终应答；不会自动重试",
-        ToolOutcome::ContextChanged => "设备或 SIM 已变化，本次结果已作废",
+        ToolOutcome::Ok => t(language, crate::localization::TextKey::ToolResultOk),
+        ToolOutcome::Rejected => t(language, crate::localization::TextKey::ToolResultRejected),
+        ToolOutcome::Unsupported => t(
+            language,
+            crate::localization::TextKey::ToolResultUnsupported,
+        ),
+        ToolOutcome::TransportFailure => {
+            t(language, crate::localization::TextKey::ToolResultNoAnswer)
+        }
+        ToolOutcome::FormatMismatch => t(
+            language,
+            crate::localization::TextKey::ToolResultUnrecognized,
+        ),
+        ToolOutcome::CancelledBeforeWrite => {
+            t(language, crate::localization::TextKey::ToolResultCancelled)
+        }
+        ToolOutcome::OutcomeUnknown => t(
+            language,
+            crate::localization::TextKey::ToolResultMaybeWritten,
+        ),
+        ToolOutcome::ContextChanged => t(
+            language,
+            crate::localization::TextKey::ToolResultInvalidated,
+        ),
     }
 }
 
@@ -140,85 +188,139 @@ pub fn tool_outcome_tone(outcome: ToolOutcome) -> StatusTone {
 /// Localized description of an input refusal; the parser's stable code stays the machine-readable
 /// form and is rendered beside this text.
 #[must_use]
-pub fn tool_input_error_text(error: ToolInputError) -> &'static str {
+pub fn tool_input_error_text(error: ToolInputError, language: Language) -> String {
     match error {
-        ToolInputError::Empty => "请输入一条 AT 命令",
-        ToolInputError::TooLong => "命令超过 256 个字符",
-        ToolInputError::NonAscii => "命令只能包含 ASCII 字符",
-        ToolInputError::ControlCharacter => "命令不能包含控制字符或换行",
-        ToolInputError::ChainedCommand => "命令不能包含分号链式调用",
-        ToolInputError::InvalidPrefix => "命令必须以 AT 开头",
-        ToolInputError::NotWhitelisted => "该命令不在只读白名单内",
-        ToolInputError::InteractiveCommand => "此命令族需要交互式会话，文本终端无法安全驱动",
+        ToolInputError::Empty => t(language, crate::localization::TextKey::ToolInputEmpty),
+        ToolInputError::TooLong => t(language, crate::localization::TextKey::ToolInputTooLong),
+        ToolInputError::NonAscii => t(language, crate::localization::TextKey::ToolInputNotAscii),
+        ToolInputError::ControlCharacter => t(
+            language,
+            crate::localization::TextKey::ToolInputControlChars,
+        ),
+        ToolInputError::ChainedCommand => {
+            t(language, crate::localization::TextKey::ToolInputSemicolon)
+        }
+        ToolInputError::InvalidPrefix => {
+            t(language, crate::localization::TextKey::ToolInputMustStartAt)
+        }
+        ToolInputError::NotWhitelisted => t(
+            language,
+            crate::localization::TextKey::ToolInputNotWhitelisted,
+        ),
+        ToolInputError::InteractiveCommand => t(
+            language,
+            crate::localization::TextKey::ToolInputNeedsInteractive,
+        ),
     }
 }
 
 /// Display label of one whitelisted read, including the AT request it maps to.
 #[must_use]
-pub fn tool_read_text(id: ToolReadId) -> &'static str {
+pub fn tool_read_text(id: ToolReadId, language: Language) -> String {
     match id {
-        ToolReadId::Attention => "模块响应（AT）",
-        ToolReadId::Manufacturer => "制造商（AT+CGMI）",
-        ToolReadId::Model => "型号（AT+CGMM）",
-        ToolReadId::Revision => "固件版本（AT+CGMR）",
-        ToolReadId::SimState => "SIM 状态（AT+CPIN?）",
-        ToolReadId::SignalQuality => "信号质量（AT+CSQ）",
-        ToolReadId::Operator => "运营商（AT+COPS?）",
-        ToolReadId::EpsRegistration => "网络注册（AT+CEREG?）",
-        ToolReadId::PacketAttach => "分组附着（AT+CGATT?）",
-        ToolReadId::PdpContexts => "PDP 上下文（AT+CGDCONT?）",
-        ToolReadId::PdpActivation => "PDP 激活状态（AT+CGACT?）",
-        ToolReadId::PdpAddresses => "PDP 地址（AT+CGPADDR）",
-        ToolReadId::UsbNet => "USB 网络模式（AT+QCFG=\"usbnet\"）",
-        ToolReadId::Temperature => "温度（AT+QTEMP）",
-        ToolReadId::ServingCell => "服务小区（AT+QENG=\"servingcell\"）",
-        ToolReadId::SmsFormat => "短信格式（AT+CMGF?）",
-        ToolReadId::SmsStorage => "短信存储（AT+CPMS?）",
+        ToolReadId::Attention => t(language, crate::localization::TextKey::ToolPresetAttention),
+        ToolReadId::Manufacturer => t(
+            language,
+            crate::localization::TextKey::ToolPresetManufacturer,
+        ),
+        ToolReadId::Model => t(language, crate::localization::TextKey::ToolPresetModel),
+        ToolReadId::Revision => t(language, crate::localization::TextKey::ToolPresetFirmware),
+        ToolReadId::SimState => t(language, crate::localization::TextKey::ToolPresetSim),
+        ToolReadId::SignalQuality => t(language, crate::localization::TextKey::ToolPresetSignal),
+        ToolReadId::Operator => t(language, crate::localization::TextKey::ToolPresetCarrier),
+        ToolReadId::EpsRegistration => t(
+            language,
+            crate::localization::TextKey::ToolPresetRegistration,
+        ),
+        ToolReadId::PacketAttach => t(language, crate::localization::TextKey::ToolPresetAttach),
+        ToolReadId::PdpContexts => t(
+            language,
+            crate::localization::TextKey::ToolPresetPdpContexts,
+        ),
+        ToolReadId::PdpActivation => t(language, crate::localization::TextKey::ToolPresetPdpActive),
+        ToolReadId::PdpAddresses => t(language, crate::localization::TextKey::ToolPresetPdpAddress),
+        ToolReadId::UsbNet => t(language, crate::localization::TextKey::ToolPresetUsbMode),
+        ToolReadId::Temperature => t(
+            language,
+            crate::localization::TextKey::ToolPresetTemperature,
+        ),
+        ToolReadId::ServingCell => t(
+            language,
+            crate::localization::TextKey::ToolPresetServingCell,
+        ),
+        ToolReadId::SmsFormat => t(language, crate::localization::TextKey::ToolPresetSmsFormat),
+        ToolReadId::SmsStorage => t(language, crate::localization::TextKey::ToolPresetSmsStorage),
     }
 }
 
 /// Label of one operation kind, shared by the task strip and the history list.
 #[must_use]
-pub fn tool_operation_text(kind: ToolOperationKind) -> String {
+pub fn tool_operation_text(kind: ToolOperationKind, language: Language) -> String {
     match kind {
-        ToolOperationKind::Read(id) => tool_read_text(id).to_owned(),
-        ToolOperationKind::ProbeAll => "全部预设查询（批量）".to_owned(),
-        ToolOperationKind::Expert => "AT 命令（高级）".to_owned(),
+        ToolOperationKind::Read(id) => tool_read_text(id, language),
+        ToolOperationKind::ProbeAll => t(language, crate::localization::TextKey::ToolBatchPresets),
+        ToolOperationKind::Expert => t(language, crate::localization::TextKey::ToolAdvancedAt),
     }
 }
 
 /// Phase label and tone of the task strip.
 #[must_use]
-pub fn tool_phase_text(phase: ToolPhase) -> (&'static str, StatusTone) {
+pub fn tool_phase_text(phase: ToolPhase, language: Language) -> (String, StatusTone) {
     match phase {
-        ToolPhase::Idle => ("空闲", StatusTone::Neutral),
-        ToolPhase::Queued => ("排队中", StatusTone::Progress),
-        ToolPhase::Running => ("执行中", StatusTone::Progress),
-        ToolPhase::Cancelling => ("正在取消", StatusTone::Caution),
-        ToolPhase::Finished => ("已结束", StatusTone::Neutral),
+        ToolPhase::Idle => (
+            t(language, crate::localization::TextKey::ToolTaskIdle),
+            StatusTone::Neutral,
+        ),
+        ToolPhase::Queued => (
+            t(language, crate::localization::TextKey::ToolTaskQueued),
+            StatusTone::Progress,
+        ),
+        ToolPhase::Running => (
+            t(language, crate::localization::TextKey::ToolTaskRunning),
+            StatusTone::Progress,
+        ),
+        ToolPhase::Cancelling => (
+            t(language, crate::localization::TextKey::ToolTaskCancelling),
+            StatusTone::Caution,
+        ),
+        ToolPhase::Finished => (
+            t(language, crate::localization::TextKey::ToolTaskFinished),
+            StatusTone::Neutral,
+        ),
     }
 }
 
 /// Human elapsed time of one task or history entry, in the band that reads honestly.
 #[must_use]
-pub fn format_elapsed(elapsed: Duration) -> String {
+pub fn format_elapsed(elapsed: Duration, language: Language) -> String {
     if elapsed.as_secs() >= 60 {
-        format!(
-            "{} 分 {} 秒",
-            elapsed.as_secs() / 60,
-            elapsed.as_secs() % 60
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ToolElapsedMinutes,
+            &[
+                &(elapsed.as_secs() / 60).to_string(),
+                &(elapsed.as_secs() % 60).to_string(),
+            ],
         )
     } else if elapsed.as_millis() >= 1_000 {
-        format!("{:.1} 秒", elapsed.as_secs_f64())
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ToolElapsedSeconds,
+            &[&format!("{:.1}", elapsed.as_secs_f64())],
+        )
     } else {
-        format!("{} 毫秒", elapsed.as_millis())
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ToolElapsedMillis,
+            &[&elapsed.as_millis().to_string()],
+        )
     }
 }
 
 /// Last four characters of the device's container id (or instance path when the container id is
 /// absent). The full value never reaches the screen.
 #[must_use]
-pub fn masked_device_id(identity: &StableDeviceIdentity) -> String {
+pub fn masked_device_id(identity: &StableDeviceIdentity, language: Language) -> String {
     let source = if identity.container_id.trim().is_empty() {
         identity.device_instance_id.as_str()
     } else {
@@ -229,7 +331,7 @@ pub fn masked_device_id(identity: &StableDeviceIdentity) -> String {
         chars[chars.len().saturating_sub(4)..].iter().collect()
     };
     if tail.trim().is_empty() {
-        "未获取".to_owned()
+        t(language, crate::localization::TextKey::ValueNotAvailable)
     } else {
         format!("…{}", tail.trim())
     }
@@ -237,10 +339,12 @@ pub fn masked_device_id(identity: &StableDeviceIdentity) -> String {
 
 /// The verified USB network mode's display name.
 #[must_use]
-pub fn usb_profile_text(profile: VerifiedUsbNetProfile) -> &'static str {
+pub fn usb_profile_text(profile: VerifiedUsbNetProfile, language: Language) -> String {
     match profile {
-        VerifiedUsbNetProfile::DjiNdis => "DJI NDIS（电脑网卡）",
-        VerifiedUsbNetProfile::Ecm => "ECM",
+        VerifiedUsbNetProfile::DjiNdis => {
+            t(language, crate::localization::TextKey::ToolUsbModeDjiNdis)
+        }
+        VerifiedUsbNetProfile::Ecm => "ECM".to_owned(),
     }
 }
 
@@ -282,69 +386,82 @@ fn known_write_request(write: &ToolWriteId) -> ControlledRepairRequest {
 
 /// Localized text of one PDP type; these are protocol names and stay verbatim.
 #[must_use]
-pub fn pdp_type_text(pdp_type: PdpType) -> &'static str {
+pub fn pdp_type_text(pdp_type: PdpType) -> String {
     match pdp_type {
-        PdpType::Ip => "IP",
-        PdpType::Ipv6 => "IPv6",
-        PdpType::Ipv4v6 => "IPv4v6",
+        PdpType::Ip => "IP".to_owned(),
+        PdpType::Ipv6 => "IPv6".to_owned(),
+        PdpType::Ipv4v6 => "IPv4v6".to_owned(),
     }
 }
 
-fn pdp_state_text(state: PdpContextState) -> &'static str {
+fn pdp_state_text(state: PdpContextState, language: Language) -> String {
     match state {
-        PdpContextState::Active => "已激活",
-        PdpContextState::Inactive => "未激活",
+        PdpContextState::Active => t(language, crate::localization::TextKey::PdpActive),
+        PdpContextState::Inactive => t(language, crate::localization::TextKey::PdpInactive),
     }
 }
 
-fn send_error_text(error: UiSendError) -> String {
+fn send_error_text(error: UiSendError, language: Language) -> String {
     match error {
-        UiSendError::QueueFull => "命令队列已满，请稍后重试".to_owned(),
-        UiSendError::Closed => "后台连接已关闭，请稍后重试".to_owned(),
+        UiSendError::QueueFull => {
+            t(language, crate::localization::TextKey::ToolQueueFull).to_owned()
+        }
+        UiSendError::Closed => {
+            t(language, crate::localization::TextKey::ToolChannelClosed).to_owned()
+        }
     }
 }
 
-fn controlled_repair_error_text(error: ControlledRepairError) -> String {
+fn controlled_repair_error_text(error: ControlledRepairError, language: Language) -> String {
     match error {
         ControlledRepairError::InvalidPdpContextId => {
-            "PDP 上下文编号必须在 1 到 16 之间。".to_owned()
+            t(language, crate::localization::TextKey::ToolApnContextRange).to_owned()
         }
         ControlledRepairError::InvalidApn => {
-            "APN 不合法：不能为空、不能超过 100 字节，且不能包含引号、逗号、分号或控制字符。"
-                .to_owned()
+            t(language, crate::localization::TextKey::ToolApnInvalid).to_owned()
         }
-        ControlledRepairError::InvalidDnsProfile | ControlledRepairError::UnsupportedAction => {
-            "该受控操作当前不可用。".to_owned()
-        }
+        ControlledRepairError::InvalidDnsProfile | ControlledRepairError::UnsupportedAction => t(
+            language,
+            crate::localization::TextKey::ToolControlledUnavailable,
+        )
+        .to_owned(),
     }
 }
 
-fn badge(ui: &mut Ui, text: impl Into<String>, color: egui::Color32) {
+fn badge(ui: &mut Ui, text: impl Into<String>, tone: StatusTone) {
     egui::Frame::none()
-        .fill(color.gamma_multiply(0.09))
+        .fill(scale::surface_sunken())
         .rounding(6.0)
         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
-            ui.label(RichText::new(text.into()).size(12.0).color(color));
+            ui.label(RichText::new(text.into()).size(12.0).color(tone.color()));
         });
 }
 
-fn value_text(value: Option<&str>) -> RichText {
+fn value_text(value: Option<&str>, language: Language) -> RichText {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => RichText::new(value).size(scale::BODY).color(scale::INK),
-        None => RichText::new("未查询")
-            .size(scale::META)
-            .color(scale::FAINT),
+        Some(value) => RichText::new(value).size(scale::BODY).color(scale::ink()),
+        None => RichText::new(t(
+            language,
+            crate::localization::TextKey::ToolStateNotQueried,
+        ))
+        .size(scale::META)
+        .color(scale::faint()),
     }
 }
 
 fn observed_time_text(at: Option<SystemTime>, now: SystemTime, language: Language) -> String {
     let Some(at) = at else {
-        return "未查询".to_owned();
+        return t(language, crate::localization::TextKey::ToolStateNotQueried);
     };
-    let clock = super::clock_hms(at).unwrap_or_else(|| "时间未知".to_owned());
+    let clock = super::clock_hms(at)
+        .unwrap_or_else(|| t(language, crate::localization::TextKey::ToolTimeUnknown).to_owned());
     match now.duration_since(at) {
-        Ok(age) => format!("{clock}（{}前）", super::format_age(age, language).text),
+        Ok(age) => crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ToolClockAgo,
+            &[clock.as_str(), &super::format_age(age, language).text],
+        ),
         Err(_) => clock,
     }
 }
@@ -376,33 +493,42 @@ pub(crate) fn render(
         });
     let can_act = device_present && !busy;
 
-    render_header(ui, snapshot, tools);
+    render_header(ui, language, snapshot, tools);
     ui.add_space(8.0);
     let previous_tab = state.tab;
-    render_tabs(ui, state);
+    render_tabs(ui, language, state);
     if state.tab != previous_tab {
         state.error = None;
         state.point_to_expert = false;
     }
     ui.add_space(6.0);
     if tools.task.is_some() {
-        render_task_strip(ui, tools, sink, state);
+        render_task_strip(ui, language, tools, sink, state);
         ui.add_space(8.0);
     }
     match state.tab {
         ToolTab::Preset => render_preset(ui, snapshot, sink, state, now, language, can_act),
-        ToolTab::Query => render_query(ui, tools, sink, state, can_act),
+        ToolTab::Query => render_query(ui, language, tools, sink, state, can_act),
         ToolTab::Expert => render_expert(ui, snapshot, sink, state, can_act, language),
     }
     render_feedback(ui, state);
     ui.add_space(8.0);
-    render_history(ui, tools, state, sink);
+    render_history(ui, language, tools, state, sink);
 }
 
 /// Current target: identity and AT port, with device/SIM epoch available on hover. Nothing here is rendered from a
 /// fabricated value — an absent device says so and every action stays disabled.
-fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceToolsSnapshot) {
-    super::components::page_heading(ui, "设备工具", "读取模块信息，按需执行经过确认的操作");
+fn render_header(
+    ui: &mut Ui,
+    language: Language,
+    snapshot: &ControllerSnapshot,
+    tools: &DeviceToolsSnapshot,
+) {
+    super::components::page_heading(
+        ui,
+        &t(language, crate::localization::TextKey::ToolsTitle),
+        &t(language, crate::localization::TextKey::ToolsIntro),
+    );
     let device = snapshot.app.device.as_ref();
     let identity = device.map(|device| &device.identity).or_else(|| {
         tools
@@ -413,70 +539,110 @@ fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceTools
     });
     ui.horizontal_wrapped(|ui| match device {
         Some(device) => {
-            badge(ui, "设备已连接", scale::DOWNLOAD);
+            badge(
+                ui,
+                t(language, crate::localization::TextKey::ToolsDeviceConnected),
+                StatusTone::Positive,
+            );
             if let Some(identity) = identity {
                 super::wrapped_label(
                     ui,
-                    RichText::new(format!(
-                        "VID {:04X} · PID {:04X} · 设备标识 {}",
-                        identity.vid,
-                        identity.pid,
-                        masked_device_id(identity)
+                    RichText::new(crate::localization::format_positional(
+                        language,
+                        crate::localization::TextKey::ToolsDeviceIdentity,
+                        &[
+                            &format!("{:04X}", identity.vid),
+                            &format!("{:04X}", identity.pid),
+                            &masked_device_id(identity, language),
+                        ],
                     ))
                     .size(scale::BODY)
                     .strong()
-                    .color(scale::INK),
+                    .color(scale::ink()),
                 );
             }
-            let port = device.at_port.as_deref().unwrap_or("未获取");
-            ui.label(meta_text(format!("AT 端口 {port}")))
-                .on_hover_text(format!(
-                    "设备代次 {} · SIM 会话 {}",
-                    device.epoch.0, snapshot.sim_epoch
-                ));
+            let port = device
+                .at_port
+                .as_deref()
+                .map(str::to_owned)
+                .unwrap_or_else(|| t(language, crate::localization::TextKey::ValueNotAvailable));
+            ui.label(meta_text(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ToolsAtPort,
+                &[&port],
+            )))
+            .on_hover_text(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ToolsDeviceEpoch,
+                &[&device.epoch.0.to_string(), &snapshot.sim_epoch.to_string()],
+            ));
         }
         None => {
-            badge(ui, "未检测到设备", StatusTone::Negative.color());
-            ui.label(meta_text("连接模块后才能执行查询与受控操作"))
-                .on_hover_text(format!("SIM 会话 {}", snapshot.sim_epoch));
+            badge(
+                ui,
+                t(language, crate::localization::TextKey::ToolsNoDevice),
+                StatusTone::Negative,
+            );
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsNoDeviceHint,
+            )))
+            .on_hover_text(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ToolsSimSession,
+                &[&snapshot.sim_epoch.to_string()],
+            ));
         }
     });
 }
 
-fn render_tabs(ui: &mut Ui, state: &mut DeviceToolsState) {
+fn render_tabs(ui: &mut Ui, language: Language, state: &mut DeviceToolsState) {
     super::components::page_tabs(
         ui,
         egui::Id::new("device-tools-tabs"),
         &mut state.tab,
         &[
-            super::components::TabItem::new(ToolTab::Preset, "预设"),
-            super::components::TabItem::new(ToolTab::Query, "只读查询"),
-            super::components::TabItem::new(ToolTab::Expert, "AT 命令（高级）"),
+            super::components::TabItem::new(
+                ToolTab::Preset,
+                t(language, crate::localization::TextKey::ToolsTabPresets),
+            ),
+            super::components::TabItem::new(
+                ToolTab::Query,
+                t(language, crate::localization::TextKey::ToolsTabReadOnly),
+            ),
+            super::components::TabItem::new(
+                ToolTab::Expert,
+                t(language, crate::localization::TextKey::ToolAdvancedAt),
+            ),
         ],
     );
-    ui.label(meta_text("任务执行期间仍可切换标签页，但写入按钮会被禁用"));
+    ui.label(meta_text(t(
+        language,
+        crate::localization::TextKey::ToolsTabSwitchHint,
+    )));
 }
 
 fn render_task_strip(
     ui: &mut Ui,
+    language: Language,
     tools: &DeviceToolsSnapshot,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
 ) {
     egui::Frame::none()
-        .fill(Color32::from_rgb(0xf5, 0xf7, 0xfb))
+        .fill(scale::surface_sunken())
         .rounding(10.0)
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                ui.label(section_heading("任务进度"));
+                ui.label(section_heading(t(language, crate::localization::TextKey::ToolsTaskProgress)));
                 match &tools.task {
                     Some(task) => {
-                        let (phase, tone) = tool_phase_text(task.phase);
-                        badge(ui, phase, tone.color());
+                        let (phase, tone) = tool_phase_text(task.phase, language);
+                        badge(ui, phase, tone);
                         ui.label(
-                            RichText::new(tool_operation_text(task.operation)).color(scale::INK),
+                            RichText::new(tool_operation_text(task.operation, language)).color(scale::ink()),
                         );
                         if task.total_items > 0 {
                             ui.label(meta_text(format!(
@@ -492,9 +658,9 @@ fn render_task_strip(
                                             if task.operation == ToolOperationKind::ProbeAll
                                                 && outcome == ToolOutcome::Ok
                                             {
-                                                "批量查询已结束，请查看逐项结果"
+                                                t(language, crate::localization::TextKey::ToolsBatchFinished)
                                             } else {
-                                                tool_outcome_text(outcome)
+                                                tool_outcome_text(outcome, language)
                                             },
                                         )
                                         .color(tool_outcome_tone(outcome).color()),
@@ -502,7 +668,7 @@ fn render_task_strip(
                                     ui.label(meta_text(outcome.code()));
                                 }
                                 None => {
-                                    ui.label(meta_text("已结束，结果未知"));
+                                    ui.label(meta_text(t(language, crate::localization::TextKey::ToolsFinishedUnknown)));
                                 }
                             }
                         }
@@ -510,11 +676,12 @@ fn render_task_strip(
                             && ui
                                 .add_enabled(
                                     task.phase != ToolPhase::Cancelling,
-                                    egui::Button::new("取消"),
+                                    egui::Button::new(t(language, crate::localization::TextKey::ButtonCancel)),
                                 )
                                 .clicked()
                         {
                             send_tool_command(
+                                language,
                                 sink,
                                 state,
                                 UiCommand::CancelDeviceTool { id: task.id },
@@ -522,7 +689,7 @@ fn render_task_strip(
                         }
                     }
                     None => {
-                        ui.label(meta_text("当前没有设备工具任务"));
+                        ui.label(meta_text(t(language, crate::localization::TextKey::ToolsNoTask)));
                     }
                 }
             });
@@ -534,17 +701,17 @@ fn render_task_strip(
                 wrapped_label(
                     ui,
                     meta_text(
-                        "取消只会停止等待，不能撤销已经写入模块的改动；写入超时后不会自动重试。",
+                        t(language, crate::localization::TextKey::ToolsCancelNote),
                     ),
                 );
             }
             if let Some(refusal) = tools.last_refusal {
                 wrapped_label(
                     ui,
-                    RichText::new(format!(
-                        "最近一次请求被拒绝：{}（{}）",
-                        tool_outcome_text(refusal),
-                        refusal.code()
+                    RichText::new(crate::localization::format_positional(
+                        language,
+                        crate::localization::TextKey::ToolsLastRejected,
+                        &[&tool_outcome_text(refusal, language), refusal.code()],
                     ))
                     .color(tool_outcome_tone(refusal).color()),
                 );
@@ -564,8 +731,8 @@ fn render_preset(
     let tools = &snapshot.device_tools;
     let profile = &tools.profile;
     render_profile_section(ui, tools, sink, state, now, language, can_act);
-    render_capability_section(ui, tools, now, language, sink, state, can_act);
-    render_connection_section(ui, profile);
+    render_capability_section(ui, language, tools, now, sink, state, can_act);
+    render_connection_section(ui, language, profile);
     render_controlled_actions(ui, snapshot, profile, sink, state, now, language);
 }
 
@@ -581,59 +748,98 @@ fn render_profile_section(
     let profile = &tools.profile;
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("模块资料"));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::ToolsProfileHeading,
+            )));
             if ui
-                .add_enabled(can_act, egui::Button::new("刷新模块资料"))
-                .on_hover_text("按顺序运行全部只读预设查询；不会写入模块")
+                .add_enabled(
+                    can_act,
+                    egui::Button::new(t(
+                        language,
+                        crate::localization::TextKey::ToolsRefreshProfile,
+                    )),
+                )
+                .on_hover_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsRefreshProfileHint,
+                ))
                 .clicked()
             {
                 state.notice = None;
                 state.error = sink
                     .try_send(UiCommand::ProbeDeviceTools)
                     .err()
-                    .map(send_error_text);
+                    .map(|error| send_error_text(error, language));
             }
         });
         info_grid(ui, "device-tools-profile-grid", |ui| {
-            ui.label(field_label("制造商"));
-            ui.label(value_text(profile.manufacturer.as_deref()));
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldManufacturer,
+            )));
+            ui.label(value_text(profile.manufacturer.as_deref(), language));
             ui.end_row();
-            ui.label(field_label("型号"));
-            ui.label(value_text(profile.model.as_deref()));
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldModel,
+            )));
+            ui.label(value_text(profile.model.as_deref(), language));
             ui.end_row();
-            ui.label(field_label("固件版本"));
-            ui.label(value_text(profile.revision.as_deref()));
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldFirmwareVersion,
+            )));
+            ui.label(value_text(profile.revision.as_deref(), language));
             ui.end_row();
-            ui.label(field_label("USB 网络模式"));
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldUsbNetworkMode,
+            )));
             match profile.usb_net {
                 Some(UsbNetReading::Verified(profile)) => {
-                    ui.label(RichText::new(usb_profile_text(profile)).color(scale::INK));
+                    ui.label(
+                        RichText::new(usb_profile_text(profile, language)).color(scale::ink()),
+                    );
                 }
                 Some(UsbNetReading::Unrecognised) => {
-                    ui.label(RichText::new("未识别").color(StatusTone::Caution.color()));
+                    ui.label(
+                        RichText::new(t(language, crate::localization::TextKey::ToolNotRecognized))
+                            .color(StatusTone::Caution.color()),
+                    );
                 }
                 None => {
-                    ui.label(meta_text("未查询"));
+                    ui.label(meta_text(t(
+                        language,
+                        crate::localization::TextKey::ToolStateNotQueried,
+                    )));
                 }
             }
             ui.end_row();
-            ui.label(field_label("采集时间"));
-            ui.label(value_text(Some(
-                observed_time_text(profile.observed_at, now, language).as_str(),
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldCapturedAt,
             )));
+            ui.label(value_text(
+                Some(observed_time_text(profile.observed_at, now, language).as_str()),
+                language,
+            ));
             ui.end_row();
         });
         if matches!(profile.usb_net, Some(UsbNetReading::Unrecognised)) {
             wrapped_label(
                 ui,
-                RichText::new("模块报告的 USB 网络模式不是本版本已验证的值；不会自动切换。")
-                    .color(StatusTone::Caution.color()),
+                RichText::new(t(
+                    language,
+                    crate::localization::TextKey::ToolsUsbModeUnverified,
+                ))
+                .color(StatusTone::Caution.color()),
             );
         }
         if profile.is_empty() {
             wrapped_label(
                 ui,
-                meta_text("尚未读取到模块资料；点击「刷新模块资料」运行一次只读查询。"),
+                meta_text(t(language, crate::localization::TextKey::ToolsNoProfileYet)),
             );
         }
     });
@@ -641,106 +847,192 @@ fn render_profile_section(
 
 fn render_capability_section(
     ui: &mut Ui,
+    language: Language,
     tools: &DeviceToolsSnapshot,
     now: SystemTime,
-    language: Language,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
     can_act: bool,
 ) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("能力证据"));
-            ui.label(meta_text("每一行只反映一次真实查询的结果"));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::ToolsEvidenceHeading,
+            )));
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsEvidenceNote,
+            )));
         });
-        for id in ToolReadId::ALL {
+        // Two columns on a desktop-width card: each capability is a short block, so one stacked
+        // column left most of the card's width unused and made the section twice as tall as it
+        // needed to be.
+        //
+        // Two explicit columns rather than a `Grid`: the grid reserved a tall empty first row,
+        // which showed as a hole between the heading and the first item. Each column is pinned to
+        // its width so a detail line wraps inside its own column instead of running past the edge.
+        let two_up = ui.available_width() >= 720.0;
+        let column_width = if two_up {
+            ((ui.available_width() - scale::BLOCK_GAP) / 2.0).floor()
+        } else {
+            ui.available_width()
+        };
+        let ids = ToolReadId::ALL;
+        let mut draw = |ui: &mut Ui, id: ToolReadId| {
+            ui.set_max_width(column_width);
             let row = tools.capability(id);
             let querying = tools.task.as_ref().is_some_and(|task| {
                 task.phase.is_active() && task.operation == ToolOperationKind::Read(id)
             });
             let (status_text, tone) = if querying {
-                ("本项查询中", StatusTone::Progress)
+                (
+                    t(language, crate::localization::TextKey::ToolsQuerying),
+                    StatusTone::Progress,
+                )
             } else {
-                row.map_or(("未查询", StatusTone::Neutral), |row| {
-                    feature_status_text(row.status)
-                })
+                row.map_or(
+                    (
+                        t(language, crate::localization::TextKey::ToolStateNotQueried),
+                        StatusTone::Neutral,
+                    ),
+                    |row| feature_status_text(row.status, language),
+                )
             };
-            egui::CollapsingHeader::new(
+            // Always open: the panel has no disclosure triangles, so a capability row shows its
+            // status and its query action together instead of hiding them behind a header.
+            ui.label(
                 RichText::new(format!(
                     "{}    {} {}",
-                    tool_read_text(id),
+                    tool_read_text(id, language),
                     tone.marker(),
                     status_text
                 ))
+                .size(scale::HEADING)
+                .strong()
                 .color(tone.color()),
-            )
-            .id_salt(("device-tools-capability", id.key()))
-            .show(ui, |ui| {
+            );
+            {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
                             can_act,
                             egui::Button::new(if row.is_some() {
-                                "重新查询此项"
+                                t(language, crate::localization::TextKey::ToolsQueryAgain)
                             } else {
-                                "查询此项"
+                                t(language, crate::localization::TextKey::ToolsQueryItem)
                             }),
                         )
                         .clicked()
                     {
-                        send_tool_command(sink, state, UiCommand::RunToolRead { id });
+                        send_tool_command(language, sink, state, UiCommand::RunToolRead { id });
                     }
                     if querying {
                         super::components::loading_spinner(ui);
-                        ui.label(meta_text("本项查询中；下方保留上次结果与采集时间"));
+                        ui.label(meta_text(t(
+                            language,
+                            crate::localization::TextKey::ToolsQueryingKeepLast,
+                        )));
                     }
                 });
                 match row {
                     Some(row) => {
                         wrapped_label(
                             ui,
-                            detail_text(format!(
-                                "原因：{}（{}）",
-                                tool_outcome_text(row.reason),
-                                row.reason.code()
+                            detail_text(crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::ToolsReason,
+                                &[&tool_outcome_text(row.reason, language), row.reason.code()],
                             )),
                         );
                         wrapped_label(
                             ui,
-                            detail_text(format!(
-                                "采集：{} · 设备代次 {} · SIM 会话 {}",
-                                observed_time_text(Some(row.observed_at), now, language),
-                                row.context.device_epoch.0,
-                                row.context.sim_epoch
+                            detail_text(crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::ToolsCaptured,
+                                &[
+                                    &observed_time_text(Some(row.observed_at), now, language),
+                                    &row.context.device_epoch.0.to_string(),
+                                    &row.context.sim_epoch.to_string(),
+                                ],
                             )),
                         );
                         if id == ToolReadId::SmsStorage
                             && matches!(row.status, FeatureStatus::Supported | FeatureStatus::Empty)
                         {
-                            wrapped_label(ui, meta_text("存储查询可用不代表模块支持发送短信。"));
+                            wrapped_label(
+                                ui,
+                                meta_text(t(
+                                    language,
+                                    crate::localization::TextKey::ToolsStorageNote,
+                                )),
+                            );
                         }
                     }
                     None => {
-                        wrapped_label(ui, meta_text("尚未执行此查询。"));
+                        wrapped_label(
+                            ui,
+                            meta_text(t(language, crate::localization::TextKey::ToolsNotRunYet)),
+                        );
                     }
                 }
-            });
+            }
             ui.separator();
+        };
+        if two_up {
+            let half = ids.len().div_ceil(2);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = scale::BLOCK_GAP;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(column_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(column_width);
+                        for id in &ids[..half] {
+                            draw(ui, *id);
+                        }
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(column_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(column_width);
+                        for id in &ids[half..] {
+                            draw(ui, *id);
+                        }
+                    },
+                );
+            });
+        } else {
+            for id in ids {
+                draw(ui, id);
+            }
         }
         wrapped_label(
             ui,
-            meta_text("注意：「短信存储」查询成功仅表示存储查询可用，不代表模块支持发送短信。"),
+            meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsStorageCaution,
+            )),
         );
     });
 }
 
-fn render_connection_section(ui: &mut Ui, profile: &dji4g_application::ModuleProfile) {
+fn render_connection_section(
+    ui: &mut Ui,
+    language: Language,
+    profile: &dji4g_application::ModuleProfile,
+) {
     section_frame(ui, |ui| {
-        ui.label(section_heading("连接配置"));
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::ToolsConnectionHeading,
+        )));
         if profile.pdp_contexts.is_empty() {
             wrapped_label(
                 ui,
-                meta_text("尚未读取到 PDP 上下文；点击「刷新模块资料」。"),
+                meta_text(t(language, crate::localization::TextKey::ToolsNoPdpYet)),
             );
         } else {
             info_grid(ui, "device-tools-pdp-grid", |ui| {
@@ -748,10 +1040,10 @@ fn render_connection_section(ui: &mut Ui, profile: &dji4g_application::ModulePro
                     ui.label(field_label(format!("CID {}", context.cid().get())));
                     ui.horizontal_wrapped(|ui| {
                         ui.label(meta_text(pdp_type_text(context.pdp_type())));
-                        ui.label(meta_text(pdp_state_text(context.state())));
+                        ui.label(meta_text(pdp_state_text(context.state(), language)));
                         ui.label(
                             RichText::new(format!("APN {}", context.apn().as_str()))
-                                .color(scale::INK),
+                                .color(scale::ink()),
                         );
                     });
                     ui.end_row();
@@ -759,25 +1051,37 @@ fn render_connection_section(ui: &mut Ui, profile: &dji4g_application::ModulePro
             });
         }
         if profile.temperature.is_empty() {
-            wrapped_label(ui, meta_text("尚未读取到温度传感器。"));
+            wrapped_label(
+                ui,
+                meta_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsNoTemperature,
+                )),
+            );
         } else {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 for (index, reading) in profile.temperature.iter().enumerate() {
                     // A firmware channel without a name is shown by its position — the module gave
                     // no identity for it, and this page never invents one.
-                    let label = reading
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("传感器{}", index + 1));
+                    let label = reading.name.clone().unwrap_or_else(|| {
+                        crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::ToolsSensor,
+                            &[&(index + 1).to_string()],
+                        )
+                    });
                     badge(
                         ui,
                         format!("{label} {} ℃", reading.celsius),
-                        scale::SECONDARY,
+                        StatusTone::Neutral,
                     );
                 }
             });
-            wrapped_label(ui, meta_text("传感器定义以固件为准。"));
+            wrapped_label(
+                ui,
+                meta_text(t(language, crate::localization::TextKey::ToolsSensorNote)),
+            );
         }
     });
 }
@@ -811,17 +1115,24 @@ fn render_controlled_actions(
         language,
     );
     section_frame(ui, |ui| {
-        ui.label(section_heading("受控操作"));
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::ToolsControlledHeading,
+        )));
         wrapped_label(
             ui,
-            meta_text(
-                "以下写入沿用修复页的受控流程：提交后仍需复核目标与风险，且超时不会自动重试。",
-            ),
+            meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsControlledNote,
+            )),
         );
         ui.add_space(6.0);
         // 修改 APN：cid + apn 两个输入，校验通过后交给受控修复流程。
         ui.horizontal_wrapped(|ui| {
-            ui.label(field_label("PDP 上下文"));
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldPdpContextShort,
+            )));
             ui.add(
                 egui::TextEdit::singleline(&mut state.apn_cid)
                     .desired_width(44.0)
@@ -831,11 +1142,14 @@ fn render_controlled_actions(
             ui.add(
                 egui::TextEdit::singleline(&mut state.apn_value)
                     .desired_width(180.0)
-                    .hint_text("例如 internet"),
+                    .hint_text(t(language, crate::localization::TextKey::ToolsApnExample)),
             );
             let filled = !state.apn_cid.trim().is_empty() && !state.apn_value.trim().is_empty();
             if ui
-                .add_enabled(apn.enabled && filled, egui::Button::new("修改 APN"))
+                .add_enabled(
+                    apn.enabled && filled,
+                    egui::Button::new(t(language, crate::localization::TextKey::ToolsEditApn)),
+                )
                 .clicked()
             {
                 state.notice = None;
@@ -847,18 +1161,21 @@ fn render_controlled_actions(
                                 // it does on the repairs page; the plan it prepares usually arrives
                                 // while the user is still reading it.
                                 sink.prepare_repair_now(request);
-                                state.notice = Some(format!(
-                                    "已弹出确认窗口；确认后执行：AT+CGDCONT={cid},\"IP\",\"{}\"",
-                                    state.apn_value.trim()
+                                state.notice = Some(crate::localization::format_positional(
+                                    language,
+                                    crate::localization::TextKey::ToolsApnConfirm,
+                                    &[&cid.to_string(), state.apn_value.trim()],
                                 ));
                             }
                             Err(error) => {
-                                state.error = Some(controlled_repair_error_text(error));
+                                state.error = Some(controlled_repair_error_text(error, language));
                             }
                         }
                     }
                     Err(_) => {
-                        state.error = Some("PDP 上下文编号必须是 1 到 16 的整数。".to_owned());
+                        state.error = Some(
+                            t(language, crate::localization::TextKey::ToolsApnRange).to_owned(),
+                        );
                     }
                 }
             }
@@ -868,37 +1185,56 @@ fn render_controlled_actions(
         }
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(field_label("USB 网络模式"));
+            ui.label(field_label(t(
+                language,
+                crate::localization::TextKey::FieldUsbNetworkMode,
+            )));
             match profile.usb_net {
                 Some(UsbNetReading::Verified(current)) => {
                     let target = match current {
                         VerifiedUsbNetProfile::DjiNdis => VerifiedUsbNetProfile::Ecm,
                         VerifiedUsbNetProfile::Ecm => VerifiedUsbNetProfile::DjiNdis,
                     };
-                    ui.label(meta_text(usb_profile_text(current)));
+                    ui.label(meta_text(usb_profile_text(current, language)));
                     if ui
                         .add_enabled(
                             usb.enabled,
-                            egui::Button::new(format!("切换为{}", usb_profile_text(target))),
+                            egui::Button::new(crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::ToolsSwitchTo,
+                                &[&usb_profile_text(target, language)],
+                            )),
                         )
-                        .on_hover_text("通过受控修复流程切换；会重枚举模块")
+                        .on_hover_text(t(language, crate::localization::TextKey::ToolsSwitchHint))
                         .clicked()
                     {
                         sink.prepare_repair_now(ControlledRepairRequest::SetUsbNetProfile {
                             profile: target,
                         });
-                        state.notice = Some(format!(
-                            "已弹出确认窗口；确认后执行：{}",
-                            normalized_write_text(&ToolWriteId::SetUsbNetProfile(target))
+                        state.notice = Some(crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::ToolsConfirmRuns,
+                            &[&normalized_write_text(&ToolWriteId::SetUsbNetProfile(
+                                target,
+                            ))],
                         ));
                     }
                 }
                 Some(UsbNetReading::Unrecognised) => {
-                    ui.label(RichText::new("未识别").color(StatusTone::Caution.color()));
-                    ui.label(meta_text("当前值未识别，本版本不提供切换。"));
+                    ui.label(
+                        RichText::new(t(language, crate::localization::TextKey::ToolNotRecognized))
+                            .color(StatusTone::Caution.color()),
+                    );
+                    ui.label(meta_text(t(
+                        language,
+                        crate::localization::TextKey::ToolsCurrentUnrecognized,
+                    )));
                 }
                 None => {
-                    ui.label(meta_text("未查询；请先刷新模块资料。"));
+                    ui.label(meta_text(t(
+                        language,
+                        crate::localization::TextKey::ToolsNotQueriedRefresh,
+                    )));
                 }
             }
         });
@@ -908,14 +1244,27 @@ fn render_controlled_actions(
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(restart.enabled, egui::Button::new("重启模块"))
-                .on_hover_text("AT+CFUN=1,1；会中断当前连接")
+                .add_enabled(
+                    restart.enabled,
+                    egui::Button::new(t(
+                        language,
+                        crate::localization::TextKey::ToolsRestartModule,
+                    )),
+                )
+                .on_hover_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsRestartCommand,
+                ))
                 .clicked()
             {
                 sink.prepare_repair_now(ControlledRepairRequest::RestartModule);
-                state.notice = Some("已弹出确认窗口；确认后执行：AT+CFUN=1,1".to_owned());
+                state.notice =
+                    Some(t(language, crate::localization::TextKey::ToolsRestartConfirm).to_owned());
             }
-            ui.label(meta_text("重启会暂时中断模块连接。"));
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsRestartNote,
+            )));
         });
         if let Some(reason) = &restart.reason {
             wrapped_label(ui, meta_text(&reason.text));
@@ -925,6 +1274,7 @@ fn render_controlled_actions(
 
 fn render_query(
     ui: &mut Ui,
+    language: Language,
     tools: &DeviceToolsSnapshot,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
@@ -932,17 +1282,29 @@ fn render_query(
 ) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("只读 AT 查询"));
-            ui.label(meta_text("只读白名单内的查询不需要逐条确认"));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::ToolsReadOnlyHeading,
+            )));
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsReadOnlyNote,
+            )));
         });
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("device-tools-read-preset")
-                .selected_text(state.query_selected.map_or("选择预设查询", tool_read_text))
+                .selected_text(state.query_selected.map_or_else(
+                    || t(language, crate::localization::TextKey::ToolsChoosePreset),
+                    |id| tool_read_text(id, language),
+                ))
                 .width(280.0)
                 .show_ui(ui, |ui| {
                     for id in ToolReadId::ALL {
                         if ui
-                            .selectable_label(state.query_selected == Some(id), tool_read_text(id))
+                            .selectable_label(
+                                state.query_selected == Some(id),
+                                tool_read_text(id, language),
+                            )
                             .clicked()
                         {
                             state.query_selected = Some(id);
@@ -954,24 +1316,34 @@ fn render_query(
                 });
             let has_input = state.query_selected.is_some() || !state.query_input.trim().is_empty();
             if ui
-                .add_enabled(can_act && has_input, egui::Button::new("运行查询"))
+                .add_enabled(
+                    can_act && has_input,
+                    egui::Button::new(t(language, crate::localization::TextKey::ToolsRunQuery)),
+                )
                 .clicked()
             {
-                run_query(sink, state);
+                run_query(language, sink, state);
             }
         });
         ui.add(
             egui::TextEdit::singleline(&mut state.query_input)
-                .hint_text("或输入白名单内的只读命令，例如 AT+CSQ")
+                .hint_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsWhitelistHint,
+                ))
                 .desired_width(f32::INFINITY)
                 .font(egui::TextStyle::Monospace),
         );
         if state.point_to_expert {
             ui.horizontal_wrapped(|ui| {
-                ui.label(meta_text(
-                    "这条命令不在只读查询列表内。若了解其作用，可到 AT 命令（高级）检查并逐条确认；不确定时请使用预设查询。",
-                ));
-                if ui.button("打开 AT 命令（高级）").clicked() {
+                ui.label(meta_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsNotInList,
+                )));
+                if ui
+                    .button(t(language, crate::localization::TextKey::ToolsOpenAdvanced))
+                    .clicked()
+                {
                     state.tab = ToolTab::Expert;
                     state.point_to_expert = false;
                 }
@@ -984,13 +1356,17 @@ fn render_query(
         {
             wrapped_label(
                 ui,
-                meta_text("任务执行期间只能读取已有结果，查询按钮已禁用。"),
+                meta_text(t(language, crate::localization::TextKey::ToolsBusyReadOnly)),
             );
         }
     });
 }
 
-fn run_query(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceToolsState) {
+fn run_query(
+    language: Language,
+    sink: &dyn crate::app::PanelCommandSink,
+    state: &mut DeviceToolsState,
+) {
     state.notice = None;
     state.point_to_expert = false;
     let text = state.query_input.trim();
@@ -999,7 +1375,7 @@ fn run_query(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceToolsSta
             state.error = sink
                 .try_send(UiCommand::RunToolRead { id })
                 .err()
-                .map(send_error_text);
+                .map(|error| send_error_text(error, language));
         }
         return;
     }
@@ -1008,21 +1384,21 @@ fn run_query(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceToolsSta
             state.error = sink
                 .try_send(UiCommand::RunToolRead { id })
                 .err()
-                .map(send_error_text);
+                .map(|error| send_error_text(error, language));
         }
         Err(ToolInputError::NotWhitelisted) => {
             state.error = Some(format!(
                 "{}（{}）。",
-                tool_input_error_text(ToolInputError::NotWhitelisted),
+                tool_input_error_text(ToolInputError::NotWhitelisted, language),
                 ToolInputError::NotWhitelisted.code()
             ));
             state.point_to_expert = true;
         }
         Err(error) => {
-            state.error = Some(format!(
-                "输入无效：{}（{}）",
-                tool_input_error_text(error),
-                error.code()
+            state.error = Some(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ToolsInvalidInput,
+                &[&tool_input_error_text(error, language), error.code()],
             ));
         }
     }
@@ -1039,33 +1415,44 @@ fn render_expert(
     let tools = &snapshot.device_tools;
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("AT 命令（高级）"));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::ToolAdvancedAt,
+            )));
             if state.expert_unlocked {
-                badge(ui, "本次会话已解锁", StatusTone::Caution.color());
+                badge(
+                    ui,
+                    t(language, crate::localization::TextKey::ToolsSessionUnlocked),
+                    StatusTone::Caution,
+                );
             } else {
                 if ui
-                    .add_enabled(can_act, egui::Button::new("启用 AT 命令输入"))
+                    .add_enabled(
+                        can_act,
+                        egui::Button::new(t(
+                            language,
+                            crate::localization::TextKey::ToolsEnableAtInput,
+                        )),
+                    )
                     .clicked()
                 {
                     state.expert_unlocked = true;
                 }
                 wrapped_label(
                     ui,
-                    meta_text("解锁只在本次会话内有效，设备或 SIM 变化后会自动重新锁定。"),
+                    meta_text(t(language, crate::localization::TextKey::ToolsUnlockScope)),
                 );
             }
         });
         wrapped_label(
             ui,
-            meta_text(
-                "供了解 AT 命令的用户排查问题。每次只发送一条经校验的命令；确认前会显示完整内容。命令可能修改配置或中断连接。",
-            ),
+            meta_text(t(language, crate::localization::TextKey::ToolsAdvancedNote)),
         );
         if state.expert_unlocked {
             ui.add_space(4.0);
             ui.add(
                 egui::TextEdit::singleline(&mut state.expert_input)
-                    .hint_text("输入一条 AT 命令，例如 AT+CSQ")
+                    .hint_text(t(language, crate::localization::TextKey::ToolsAtHint))
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace),
             );
@@ -1094,13 +1481,16 @@ fn render_expert(
                                 .as_ref()
                                 .is_none_or(|value| value.enabled)
                             && !state.expert_input.trim().is_empty(),
-                        egui::Button::new("执行"),
+                        egui::Button::new(t(language, crate::localization::TextKey::ToolsExecute)),
                     )
                     .clicked()
                 {
-                    submit_expert(sink, state);
+                    submit_expert(language, sink, state);
                 }
-                if ui.button("清空输入").clicked() {
+                if ui
+                    .button(t(language, crate::localization::TextKey::ToolsClearInput))
+                    .clicked()
+                {
                     state.expert_input.clear();
                     state.error = None;
                     state.notice = None;
@@ -1112,36 +1502,41 @@ fn render_expert(
         } else {
             wrapped_label(
                 ui,
-                meta_text("终端处于锁定状态：解锁前不会显示输入框与执行按钮。"),
+                meta_text(t(language, crate::localization::TextKey::ToolsLocked)),
             );
         }
         // The per-command confirmation is independent of the unlock switch: opening the terminal
         // never substitutes for approving one exact command.
         if let Some(pending) = &tools.pending_expert {
             ui.add_space(8.0);
-            render_pending_expert(ui, pending, sink, state, can_act);
+            render_pending_expert(ui, language, pending, sink, state, can_act);
         }
     });
 }
 
-fn submit_expert(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceToolsState) {
+fn submit_expert(
+    language: Language,
+    sink: &dyn crate::app::PanelCommandSink,
+    state: &mut DeviceToolsState,
+) {
     state.notice = None;
     let text = state.expert_input.trim();
     match ValidatedToolLine::parse(text) {
         Err(error) => {
-            state.error = Some(format!(
-                "命令未通过校验：{}（{}）",
-                tool_input_error_text(error),
-                error.code()
+            state.error = Some(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ToolsCheckFailed,
+                &[&tool_input_error_text(error, language), error.code()],
             ));
         }
         Ok(line) => match classify_known_write(&line) {
             Some(write) => {
                 // A recognized write is routed through the reviewed repair flow, and the exact
                 // normalized line is shown before/while that flow runs.
-                state.notice = Some(format!(
-                    "已识别为受控写入，将执行规范化命令：{}",
-                    normalized_write_text(&write)
+                state.notice = Some(crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::ToolsNormalizedWrite,
+                    &[&normalized_write_text(&write)],
                 ));
                 // One frozen confirmation for this action, never two: the expert switch does not
                 // add a second dialog on top of the repair confirmation.
@@ -1151,9 +1546,11 @@ fn submit_expert(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceTool
                 state.error = sink
                     .try_send(UiCommand::PrepareExpertTool { line })
                     .err()
-                    .map(send_error_text);
+                    .map(|error| send_error_text(error, language));
                 if state.error.is_none() {
-                    state.notice = Some("命令已冻结，请在下方逐条确认后才会写入模块。".to_owned());
+                    state.notice = Some(
+                        t(language, crate::localization::TextKey::ToolsCommandFrozen).to_owned(),
+                    );
                 }
             }
         },
@@ -1162,6 +1559,7 @@ fn submit_expert(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceTool
 
 fn render_pending_expert(
     ui: &mut Ui,
+    language: Language,
     pending: &PendingExpertTool,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
@@ -1172,15 +1570,21 @@ fn render_pending_expert(
         .duration_since(SystemTime::now())
         .unwrap_or_default();
     egui::Frame::none()
-        .fill(Color32::from_rgb(0xff, 0xf7, 0xe8))
+        .fill(scale::surface_sunken())
         .rounding(10.0)
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(section_heading("AT 命令待确认"));
-            wrapped_label(ui, meta_text("以下命令已冻结，确认后才会写入模块："));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::ToolsAtPending,
+            )));
+            wrapped_label(
+                ui,
+                meta_text(t(language, crate::localization::TextKey::ToolsFrozenList)),
+            );
             egui::Frame::none()
-                .fill(Color32::from_rgb(0xf5, 0xf7, 0xfb))
+                .fill(scale::surface_sunken())
                 .rounding(8.0)
                 .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                 .show(ui, |ui| {
@@ -1189,34 +1593,53 @@ fn render_pending_expert(
                         ui,
                         RichText::new(pending.line.expose_for_confirmation())
                             .monospace()
-                            .color(scale::INK),
+                            .color(scale::ink()),
                     );
                 });
             wrapped_label(
                 ui,
-                RichText::new("效果未知，可能改变配置或中断连接。")
-                    .color(StatusTone::Caution.color()),
+                RichText::new(t(
+                    language,
+                    crate::localization::TextKey::ToolsUnknownEffect,
+                ))
+                .color(StatusTone::Caution.color()),
             );
             ui.horizontal_wrapped(|ui| {
                 if remaining.is_zero() {
-                    ui.label(meta_text("已过期；需要重新准备同一条命令。"));
+                    ui.label(meta_text(t(
+                        language,
+                        crate::localization::TextKey::ToolsPlanExpired,
+                    )));
                 } else {
-                    ui.label(meta_text(format!(
-                        "剩余 {} 秒内有效，过期后需要重新准备。",
-                        remaining.as_secs()
+                    ui.label(meta_text(crate::localization::format_positional(
+                        language,
+                        crate::localization::TextKey::ToolsPlanRemaining,
+                        &[&remaining.as_secs().to_string()],
                     )));
                 }
                 if ui
                     .add_enabled(
                         can_act && !remaining.is_zero(),
-                        egui::Button::new("确认执行"),
+                        egui::Button::new(t(
+                            language,
+                            crate::localization::TextKey::ConfirmationTitle,
+                        )),
                     )
                     .clicked()
                 {
-                    send_tool_command(sink, state, UiCommand::ConfirmExpertTool { id: pending.id });
-                }
-                if ui.button("取消").clicked() {
                     send_tool_command(
+                        language,
+                        sink,
+                        state,
+                        UiCommand::ConfirmExpertTool { id: pending.id },
+                    );
+                }
+                if ui
+                    .button(t(language, crate::localization::TextKey::ButtonCancel))
+                    .clicked()
+                {
+                    send_tool_command(
+                        language,
                         sink,
                         state,
                         UiCommand::CancelExpertToolPlan { id: pending.id },
@@ -1246,44 +1669,66 @@ fn render_feedback(ui: &mut Ui, state: &DeviceToolsState) {
 
 fn render_history(
     ui: &mut Ui,
+    language: Language,
     tools: &DeviceToolsSnapshot,
     state: &mut DeviceToolsState,
     sink: &dyn crate::app::PanelCommandSink,
 ) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("命令记录"));
-            ui.label(meta_text("只保存在本机内存中的最近任务记录"));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::ToolsLogHeading,
+            )));
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::ToolsLogNote,
+            )));
         });
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!tools.history.is_empty(), egui::Button::new("复制诊断摘要"))
-                .on_hover_text("仅包含操作类型、耗时和稳定结果码，不含响应内容")
+                .add_enabled(
+                    !tools.history.is_empty(),
+                    egui::Button::new(t(language, crate::localization::TextKey::ToolsCopySummary)),
+                )
+                .on_hover_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsCopySummaryNote,
+                ))
                 .clicked()
             {
-                copy_diagnostic_summary(ui, tools);
+                copy_diagnostic_summary(ui, language, tools);
             }
             if ui
-                .add_enabled(!tools.history.is_empty(), egui::Button::new("复制原始响应"))
-                .on_hover_text("响应可能包含设备标识、号码或账户信息")
+                .add_enabled(
+                    !tools.history.is_empty(),
+                    egui::Button::new(t(language, crate::localization::TextKey::ToolsCopyRaw)),
+                )
+                .on_hover_text(t(language, crate::localization::TextKey::ToolsCopyRawNote))
                 .clicked()
             {
-                copy_raw_response(ui, tools);
+                copy_raw_response(ui, language, tools);
             }
             if ui
-                .add_enabled(!tools.history.is_empty(), egui::Button::new("清空"))
-                .on_hover_text("清空现有内存记录；正在运行的任务完成后仍可能产生新记录。")
+                .add_enabled(
+                    !tools.history.is_empty(),
+                    egui::Button::new(t(language, crate::localization::TextKey::ToolsClearLog)),
+                )
+                .on_hover_text(t(language, crate::localization::TextKey::ToolsClearLogNote))
                 .clicked()
             {
-                send_tool_command(sink, state, UiCommand::ClearToolHistory);
+                send_tool_command(language, sink, state, UiCommand::ClearToolHistory);
             }
         });
         wrapped_label(
             ui,
-            meta_text("「复制原始响应」可能包含设备或账户信息，请谨慎粘贴分享。"),
+            meta_text(t(language, crate::localization::TextKey::ToolsShareCaution)),
         );
         if tools.history.is_empty() {
-            wrapped_label(ui, meta_text("暂无任务记录；运行任意查询后在此查看响应。"));
+            wrapped_label(
+                ui,
+                meta_text(t(language, crate::localization::TextKey::ToolsNoLog)),
+            );
             return;
         }
         egui::ScrollArea::vertical()
@@ -1293,42 +1738,46 @@ fn render_history(
             .show(ui, |ui| {
                 // Newest first: the entry the user just triggered stays in view.
                 for entry in tools.history.entries().iter().rev() {
-                    render_history_entry(ui, entry);
+                    render_history_entry(ui, language, entry);
                 }
             });
     });
 }
 
 fn send_tool_command(
+    language: Language,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
     command: UiCommand,
 ) {
     state.notice = None;
-    state.error = sink.try_send(command).err().map(send_error_text);
+    state.error = sink
+        .try_send(command)
+        .err()
+        .map(|error| send_error_text(error, language));
 }
 
-fn render_history_entry(ui: &mut Ui, entry: &ToolHistoryEntry) {
+fn render_history_entry(ui: &mut Ui, language: Language, entry: &ToolHistoryEntry) {
     egui::Frame::none()
-        .fill(Color32::from_rgb(0xf8, 0xf9, 0xfc))
+        .fill(scale::surface_sunken())
         .rounding(8.0)
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(tool_operation_text(entry.operation))
+                    RichText::new(tool_operation_text(entry.operation, language))
                         .strong()
-                        .color(scale::INK),
+                        .color(scale::ink()),
                 );
                 ui.label(
-                    RichText::new(tool_outcome_text(entry.outcome))
+                    RichText::new(tool_outcome_text(entry.outcome, language))
                         .color(tool_outcome_tone(entry.outcome).color()),
                 );
                 ui.label(meta_text(format!(
                     "{} · {}",
                     entry.outcome.code(),
-                    format_elapsed(entry.elapsed)
+                    format_elapsed(entry.elapsed, language)
                 )));
                 if let Some(clock) = super::clock_hms(entry.finished_at) {
                     ui.label(meta_text(clock));
@@ -1337,36 +1786,55 @@ fn render_history_entry(ui: &mut Ui, entry: &ToolHistoryEntry) {
             for line in entry.transcript.lines() {
                 wrapped_label(
                     ui,
-                    RichText::new(line)
+                    RichText::new(transcript_line_text(language, line))
                         .monospace()
                         .size(scale::META)
-                        .color(scale::DETAIL),
+                        .color(scale::secondary()),
                 );
             }
             if entry.transcript.is_empty() {
-                ui.label(meta_text("（无响应内容）"));
+                ui.label(meta_text(t(
+                    language,
+                    crate::localization::TextKey::ToolsEmptyResponse,
+                )));
             }
             if entry.transcript.is_truncated() {
                 ui.label(
-                    RichText::new("响应过长，已截断")
-                        .size(scale::META)
-                        .color(StatusTone::Caution.color()),
+                    RichText::new(t(
+                        language,
+                        crate::localization::TextKey::ToolsResponseTruncated,
+                    ))
+                    .size(scale::META)
+                    .color(StatusTone::Caution.color()),
                 );
             }
         });
     ui.add_space(6.0);
 }
 
+/// One transcript line as a person reads it: a module-initiated report is marked with the
+/// catalog's own label, so the transport sentinel never reaches the screen or the clipboard.
+fn transcript_line_text(language: Language, line: &str) -> String {
+    match urc_transcript_payload(line) {
+        Some(payload) => crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ToolUrcLine,
+            &[payload],
+        ),
+        None => line.to_owned(),
+    }
+}
+
 /// Diagnostic summary: operation type, elapsed time and the stable outcome code only — never the
 /// response text.
-fn copy_diagnostic_summary(ui: &mut Ui, tools: &DeviceToolsSnapshot) {
-    let mut text = String::from("设备工具历史摘要（不含响应内容）\n");
+fn copy_diagnostic_summary(ui: &mut Ui, language: Language, tools: &DeviceToolsSnapshot) {
+    let mut text = t(language, crate::localization::TextKey::ToolsHistoryHeader);
     for entry in tools.history.entries() {
         text.push_str(&format!(
             "- {} | {} | {}\n",
-            tool_operation_text(entry.operation),
+            tool_operation_text(entry.operation, language),
             entry.outcome.code(),
-            format_elapsed(entry.elapsed)
+            format_elapsed(entry.elapsed, language)
         ));
     }
     ui.ctx().copy_text(text);
@@ -1374,21 +1842,24 @@ fn copy_diagnostic_summary(ui: &mut Ui, tools: &DeviceToolsSnapshot) {
 
 /// Raw response copy: a separate, explicitly labelled action whose output may contain device or
 /// account information.
-fn copy_raw_response(ui: &mut Ui, tools: &DeviceToolsSnapshot) {
+fn copy_raw_response(ui: &mut Ui, language: Language, tools: &DeviceToolsSnapshot) {
     let mut text = String::new();
     for entry in tools.history.entries() {
         text.push_str(&format!(
             "### {} | {} | {}\n",
-            tool_operation_text(entry.operation),
+            tool_operation_text(entry.operation, language),
             entry.outcome.code(),
-            format_elapsed(entry.elapsed)
+            format_elapsed(entry.elapsed, language)
         ));
         for line in entry.transcript.lines() {
-            text.push_str(line);
+            text.push_str(&transcript_line_text(language, line));
             text.push('\n');
         }
         if entry.transcript.is_truncated() {
-            text.push_str("[响应过长，已截断]\n");
+            text.push_str(&t(
+                language,
+                crate::localization::TextKey::ToolsTruncatedMark,
+            ));
         }
     }
     ui.ctx().copy_text(text);
@@ -1507,16 +1978,19 @@ mod tests {
 
     #[test]
     fn the_masked_device_id_keeps_only_a_short_tail() {
-        let masked = masked_device_id(&identity());
+        let masked = masked_device_id(&identity(), Language::ZhCn);
         assert_eq!(masked, "…&0&1");
         assert!(!masked.contains("2A1B3C4D"));
         assert_eq!(
-            masked_device_id(&StableDeviceIdentity {
-                container_id: String::new(),
-                device_instance_id: "USB\\VID_2CA3&PID_4006\\ABCDEF".to_owned(),
-                vid: 0x2CA3,
-                pid: 0x4006,
-            }),
+            masked_device_id(
+                &StableDeviceIdentity {
+                    container_id: String::new(),
+                    device_instance_id: "USB\\VID_2CA3&PID_4006\\ABCDEF".to_owned(),
+                    vid: 0x2CA3,
+                    pid: 0x4006,
+                },
+                Language::ZhCn,
+            ),
             "…CDEF"
         );
     }
@@ -1556,7 +2030,7 @@ mod tests {
             ToolOutcome::OutcomeUnknown,
             ToolOutcome::ContextChanged,
         ] {
-            assert!(!tool_outcome_text(outcome).trim().is_empty());
+            assert!(!tool_outcome_text(outcome, Language::ZhCn).trim().is_empty());
             assert!(!outcome.code().trim().is_empty());
         }
         for error in [
@@ -1569,7 +2043,11 @@ mod tests {
             ToolInputError::NotWhitelisted,
             ToolInputError::InteractiveCommand,
         ] {
-            assert!(!tool_input_error_text(error).trim().is_empty());
+            assert!(
+                !tool_input_error_text(error, Language::ZhCn)
+                    .trim()
+                    .is_empty()
+            );
             assert!(!error.code().trim().is_empty());
         }
         for status in [
@@ -1581,7 +2059,12 @@ mod tests {
             FeatureStatus::FormatMismatch,
             FeatureStatus::TransportFailure,
         ] {
-            assert!(!feature_status_text(status).0.trim().is_empty());
+            assert!(
+                !feature_status_text(status, Language::ZhCn)
+                    .0
+                    .trim()
+                    .is_empty()
+            );
         }
     }
 
@@ -1591,7 +2074,10 @@ mod tests {
             ValidatedToolLine::parse_read_only("AT+CFUN=1,1"),
             Err(ToolInputError::NotWhitelisted)
         );
-        assert!(tool_input_error_text(ToolInputError::NotWhitelisted).contains("白名单"));
+        assert!(
+            tool_input_error_text(ToolInputError::NotWhitelisted, Language::ZhCn)
+                .contains("白名单")
+        );
     }
 
     /// Records both the plain commands and the controlled writes the page prepared, so a test can
@@ -1607,13 +2093,19 @@ mod tests {
         let sink = RecordingSink::default();
         let mut state = DeviceToolsState::default();
         send_tool_command(
+            Language::ZhCn,
             &sink,
             &mut state,
             UiCommand::RunToolRead {
                 id: ToolReadId::Temperature,
             },
         );
-        send_tool_command(&sink, &mut state, UiCommand::ClearToolHistory);
+        send_tool_command(
+            Language::ZhCn,
+            &sink,
+            &mut state,
+            UiCommand::ClearToolHistory,
+        );
         assert!(matches!(
             sink.sent.lock().unwrap().as_slice(),
             [
@@ -1640,7 +2132,12 @@ mod tests {
             notice: Some("上次提示".into()),
             ..Default::default()
         };
-        send_tool_command(&Full, &mut state, UiCommand::ClearToolHistory);
+        send_tool_command(
+            Language::ZhCn,
+            &Full,
+            &mut state,
+            UiCommand::ClearToolHistory,
+        );
         assert!(state.notice.is_none());
         assert!(state.error.as_deref().unwrap().contains("队列"));
     }
@@ -1649,7 +2146,7 @@ mod tests {
     /// confirmation controls, rather than only calling the shared submission helper.
     fn click_button(label: &str, mut render: impl FnMut(&mut Ui)) {
         let ctx = egui::Context::default();
-        super::super::style_root(&ctx);
+        super::super::apply_style(&ctx);
         let mut point = None;
         for tick in 0..4 {
             let events = if tick >= 2 {
@@ -1739,18 +2236,31 @@ mod tests {
                         })
                         .unwrap();
                     let tools = controller.snapshot().device_tools;
-                    click_button("取消", |ui| {
-                        render_task_strip(ui, &tools, &sink, &mut state);
-                    });
+                    click_button(
+                        &t(Language::ZhCn, crate::localization::TextKey::ButtonCancel),
+                        |ui| {
+                            render_task_strip(ui, Language::ZhCn, &tools, &sink, &mut state);
+                        },
+                    );
                 } else {
                     let pending = pending_fixture(SystemTime::now() + Duration::from_secs(60));
                     let label = if action == "expert-confirm" {
-                        "确认执行"
+                        t(
+                            Language::ZhCn,
+                            crate::localization::TextKey::ConfirmationTitle,
+                        )
                     } else {
-                        "取消"
+                        t(Language::ZhCn, crate::localization::TextKey::ButtonCancel)
                     };
-                    click_button(label, |ui| {
-                        render_pending_expert(ui, &pending, &sink, &mut state, true);
+                    click_button(&label, |ui| {
+                        render_pending_expert(
+                            ui,
+                            Language::ZhCn,
+                            &pending,
+                            &sink,
+                            &mut state,
+                            true,
+                        );
                     });
                 }
                 assert_eq!(
@@ -1761,7 +2271,7 @@ mod tests {
                 assert!(state.notice.is_none(), "{action}");
                 assert_eq!(
                     state.error.as_deref(),
-                    Some(send_error_text(error.clone()).as_str()),
+                    Some(send_error_text(error.clone(), Language::ZhCn).as_str()),
                     "{action}"
                 );
             }
@@ -1781,9 +2291,15 @@ mod tests {
             } else {
                 SystemTime::now() + Duration::from_secs(60)
             });
-            click_button("确认执行", |ui| {
-                render_pending_expert(ui, &pending, &sink, &mut state, can_act);
-            });
+            click_button(
+                &t(
+                    Language::ZhCn,
+                    crate::localization::TextKey::ConfirmationTitle,
+                ),
+                |ui| {
+                    render_pending_expert(ui, Language::ZhCn, &pending, &sink, &mut state, can_act);
+                },
+            );
             assert_eq!(sink.attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert!(state.error.is_none());
         }
@@ -1809,7 +2325,7 @@ mod tests {
             query_input: "AT+CSQ".to_owned(),
             ..DeviceToolsState::default()
         };
-        run_query(&sink, &mut state);
+        run_query(Language::ZhCn, &sink, &mut state);
         assert!(state.error.is_none());
         assert!(matches!(
             sink.sent.lock().expect("healthy lock").as_slice(),
@@ -1824,7 +2340,7 @@ mod tests {
             query_selected: Some(ToolReadId::SmsStorage),
             ..DeviceToolsState::default()
         };
-        run_query(&sink, &mut state);
+        run_query(Language::ZhCn, &sink, &mut state);
         assert!(matches!(
             sink.sent.lock().expect("healthy lock").as_slice(),
             [UiCommand::RunToolRead {
@@ -1838,7 +2354,7 @@ mod tests {
             query_input: "AT+CFUN=1,1".to_owned(),
             ..DeviceToolsState::default()
         };
-        run_query(&sink, &mut state);
+        run_query(Language::ZhCn, &sink, &mut state);
         assert!(
             sink.sent.lock().expect("healthy lock").is_empty(),
             "the query tab must never dispatch a non-whitelisted line"
@@ -1859,7 +2375,7 @@ mod tests {
             expert_input: "AT+CFUN=1,1".to_owned(),
             ..DeviceToolsState::default()
         };
-        submit_expert(&sink, &mut state);
+        submit_expert(Language::ZhCn, &sink, &mut state);
         // A recognized write goes through the reviewed repair flow's own confirmation; it must not
         // be queued as a plain command, so it cannot bypass that confirmation.
         assert!(sink.sent.lock().expect("healthy lock").is_empty());
@@ -1880,7 +2396,7 @@ mod tests {
             expert_input: "AT+QCFG=\"usbnet\"".to_owned(),
             ..DeviceToolsState::default()
         };
-        submit_expert(&sink, &mut state);
+        submit_expert(Language::ZhCn, &sink, &mut state);
         match sink.sent.lock().expect("healthy lock").as_slice() {
             [UiCommand::PrepareExpertTool { line }] => {
                 assert_eq!(line.expose_for_confirmation(), "AT+QCFG=\"usbnet\"");
@@ -1895,7 +2411,7 @@ mod tests {
             expert_input: "AT+CMGS=12".to_owned(),
             ..DeviceToolsState::default()
         };
-        submit_expert(&sink, &mut state);
+        submit_expert(Language::ZhCn, &sink, &mut state);
         assert!(sink.sent.lock().expect("healthy lock").is_empty());
         assert!(
             state

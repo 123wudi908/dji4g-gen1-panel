@@ -1,7 +1,6 @@
 use std::fmt;
 
-const TARGET_VID: u16 = 0x2CA3;
-const TARGET_PID: u16 = 0x4006;
+use dji4g_domain::DeviceProfile;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UsbIdentity {
@@ -39,12 +38,19 @@ fn parse_usb_identity(value: &str) -> Option<UsbIdentity> {
     })
 }
 
-fn is_exact_target_identity(value: &str) -> bool {
+/// The declared module profile named by one USB hardware id, or `None` when it names none.
+///
+/// Recognition covers the read-only generic module (`2C7C:0125`) as well as the write-capable
+/// DJI 一代 one; this is discovery only and never grants write access.
+/// [`DeviceProfile::allows_controlled_actions`] is the single predicate that does.
+fn module_profile_of(value: &str) -> Option<DeviceProfile> {
     parse_usb_identity(value)
-        == Some(UsbIdentity {
-            vid: TARGET_VID,
-            pid: TARGET_PID,
-        })
+        .and_then(|identity| DeviceProfile::from_vid_pid(identity.vid, identity.pid))
+}
+
+/// `true` only for a USB hardware id whose VID/PID matches a declared module profile.
+fn is_supported_module_identity(value: &str) -> bool {
+    module_profile_of(value).is_some()
 }
 
 fn has_usb_interface_token(value: &str) -> bool {
@@ -57,13 +63,16 @@ fn has_usb_interface_token(value: &str) -> bool {
 }
 
 fn is_proven_root(node: &PnpNode) -> bool {
-    is_exact_target_identity(&node.instance_id)
-        && !has_usb_interface_token(&node.instance_id)
+    let Some(profile) = module_profile_of(&node.instance_id) else {
+        return false;
+    };
+    !has_usb_interface_token(&node.instance_id)
         && !node.hardware_ids.is_empty()
-        && node
-            .hardware_ids
-            .iter()
-            .all(|id| is_exact_target_identity(id) && !has_usb_interface_token(id))
+        && node.hardware_ids.iter().all(|id| {
+            // Every hardware id must name the *same* declared profile as the instance id: a root
+            // may not mix two recognized modules' identities.
+            module_profile_of(id) == Some(profile) && !has_usb_interface_token(id)
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -218,6 +227,17 @@ impl DjiDevice {
     #[must_use]
     pub fn container_id(&self) -> Option<&str> {
         self.container_id.as_deref()
+    }
+
+    /// The declared module profile of this proven root, or `None` when its instance id does not
+    /// name a recognized profile.
+    ///
+    /// A snapshot only ever holds roots that passed [`is_proven_root`], so this reflects the same
+    /// exact VID/PID proof the inventory used; it never upgrades an unrecognized device.
+    #[must_use]
+    pub fn profile(&self) -> Option<DeviceProfile> {
+        parse_usb_identity(&self.root_instance_id)
+            .and_then(|identity| DeviceProfile::from_vid_pid(identity.vid, identity.pid))
     }
 
     #[must_use]
@@ -572,7 +592,7 @@ fn is_target(candidate: &ComCandidate) -> bool {
         && candidate
             .ancestry
             .iter()
-            .any(|value| is_exact_target_identity(value) && !has_usb_interface_token(value))
+            .any(|value| is_supported_module_identity(value) && !has_usb_interface_token(value))
 }
 
 #[cfg(test)]
@@ -1112,7 +1132,7 @@ mod native {
                     && net_paths.contains_key(&info.dev_inst)
                     && ancestry
                         .iter()
-                        .any(|value| super::is_exact_target_identity(value))
+                        .any(|value| super::is_supported_module_identity(value))
                 {
                     registry_net_cfg_instance_id(set.0, &info)?
                 } else {
@@ -1152,7 +1172,7 @@ mod native {
     ) -> InventoryResult<Option<T>> {
         if !ancestry
             .iter()
-            .any(|id| super::is_exact_target_identity(id))
+            .any(|id| super::is_supported_module_identity(id))
         {
             return Ok(None);
         }

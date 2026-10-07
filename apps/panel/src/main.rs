@@ -101,6 +101,10 @@ fn main() {
         }
     };
 
+    // The saved language, resolved once the config is known: the installer hand-off notice below
+    // and the window title both have to be in it.
+    let language = dji4g_panel::localization::language_of(config.language);
+
     let _logging_guard: Option<LoggingGuard> =
         paths.as_ref().and_then(|paths| {
             match init_logging(LoggingConfig {
@@ -136,7 +140,13 @@ fn main() {
             // A concurrent manual launch can win the instance mutex while the installer is
             // finishing. Do not silently lose its closed result when activating that window.
             if let Some(outcome) = startup.driver_setup_result {
-                dji4g_windows_platform::show_message_box("模块驱动安装结果", outcome.message());
+                dji4g_windows_platform::show_message_box(
+                    dji4g_panel::localization::template(
+                        language,
+                        TextKey::DriverInstallResultTitle,
+                    ),
+                    &dji4g_panel::localization::stable_code_display(language, outcome.code()),
+                );
             }
             let request = if startup.autostart {
                 ActivationRequest::OpenAndRefresh
@@ -204,6 +214,7 @@ fn main() {
     let feature_probe = composition.feature_probe_state();
     let (mut controller, ports) = composition.into_parts();
     controller.set_language(config.language);
+    controller.set_theme(config.theme);
     controller.set_start_minimized(config.start_minimized);
     controller.set_active_probe(config.active_probe);
     controller.set_log_level(config.log_level);
@@ -269,7 +280,13 @@ fn main() {
     ));
 
     let mut tray_error: Option<TrayError> = None;
-    let tray = match TrayController::initialize(NativeTrayBackend::default(), TrayLabels::zh_cn()) {
+    // The tray is built before the panel reads its first snapshot, so it takes the language from the
+    // saved configuration directly.
+    let tray_language = dji4g_panel::localization::language_of(config.language);
+    let tray = match TrayController::initialize(
+        NativeTrayBackend::default(),
+        TrayLabels::for_language(tray_language),
+    ) {
         Ok(tray) => Some(tray),
         Err(error) => {
             tray_error = Some(error);
@@ -298,8 +315,10 @@ fn main() {
         viewport,
         ..Default::default()
     };
+    // The window title is a fixed process identity, not prose: a second launch finds the running
+    // window by this exact string, so it must not follow the interface language.
     let result = eframe::run_native(
-        "DJI 一代 4G 面板",
+        dji4g_panel::app::PANEL_WINDOW_TITLE,
         native_options,
         Box::new(move |cc| {
             let mut app = PanelApp::new(inputs, cc);

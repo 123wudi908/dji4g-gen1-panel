@@ -73,7 +73,12 @@ pub fn confirm_message_for_action(
     ActionKindTag::from_action(action)?;
     let disruption = disruption?;
     let risk = risk?;
-    let mut message = format!("操作：{}\n", action_text(action, language).text);
+    let mut message = crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::DialogActionLine,
+        &[&action_text(action, language).text],
+    );
+    message.push('\n');
     match action {
         ActionKind::ApplyDnsProfile {
             profile: dji4g_domain::DnsProfile::Static { servers },
@@ -103,22 +108,29 @@ pub fn confirm_message_for_action(
         }
         _ => {}
     }
-    message.push_str(&format!(
-        "中断：{}\n",
-        LocalizedText::new(language, disruption_level(disruption)).text
+    message.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::DialogDisruptionLine,
+        &[&LocalizedText::new(language, disruption_level(disruption)).text],
     ));
-    message.push_str(&format!(
-        "风险：{}\n",
-        LocalizedText::new(language, risk_level(risk)).text
+    message.push('\n');
+    message.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::DialogRiskLine,
+        &[&LocalizedText::new(language, risk_level(risk)).text],
     ));
-    message.push_str(&format!(
-        "提权：{}\n",
-        if requires_elevation {
-            LocalizedText::new(language, TextKey::ConfirmationElevationRequired).text
-        } else {
-            LocalizedText::new(language, TextKey::ConfirmationElevationNotRequired).text
-        }
+    message.push('\n');
+    let elevation = if requires_elevation {
+        LocalizedText::new(language, TextKey::ConfirmationElevationRequired).text
+    } else {
+        LocalizedText::new(language, TextKey::ConfirmationElevationNotRequired).text
+    };
+    message.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::DialogElevationLine,
+        &[&elevation],
     ));
+    message.push('\n');
     message.push_str(&format!(
         "{}\n{}",
         LocalizedText::new(language, TextKey::ConfirmationStateRecheck).text,

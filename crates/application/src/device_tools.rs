@@ -263,6 +263,27 @@ pub struct ToolTranscript {
     truncated: bool,
 }
 
+/// Transport sentinel in front of a transcript line the module sent on its own (a URC).
+///
+/// It is a marker, not prose: this crate sits below the panel and owns no wording, so the
+/// presentation layer turns a marked line into the localized 「模块主动上报」 label (see
+/// [`urc_transcript_payload`]). The two unit separators cannot appear in an AT response — the
+/// module's own text is printable ASCII — so a real response line can never be mistaken for a
+/// marker and silently dropped from the response view.
+pub const URC_TRANSCRIPT_PREFIX: &str = "\u{1f}urc\u{1f}";
+
+/// Mark one module-initiated (URC) line for the UI transcript.
+#[must_use]
+pub fn urc_transcript_line(line: &str) -> String {
+    format!("{URC_TRANSCRIPT_PREFIX}{line}")
+}
+
+/// The module's own text of a marked transcript line, or `None` for an ordinary response line.
+#[must_use]
+pub fn urc_transcript_payload(line: &str) -> Option<&str> {
+    line.strip_prefix(URC_TRANSCRIPT_PREFIX)
+}
+
 impl fmt::Debug for ToolTranscript {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED_TOOL_TRANSCRIPT]")
@@ -686,7 +707,7 @@ pub fn transcript_from_response(response: &ToolResponse) -> ToolTranscript {
         transcript.push(line.clone());
     }
     for line in &response.urc_lines {
-        transcript.push(format!("[模块主动上报] {line}"));
+        transcript.push(urc_transcript_line(line));
     }
     transcript
 }

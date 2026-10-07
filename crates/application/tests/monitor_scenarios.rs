@@ -2283,3 +2283,93 @@ fn slow_diagnostics_leave_a_full_interval_for_terminal_results() {
     clock.advance_wall(REFRESH_INTERVAL);
     assert!(runner.poll_monitoring_cadence());
 }
+
+#[test]
+fn presentation_settings_publish_while_device_observation_is_blocked() {
+    use dji4g_application::{SettingsPersistenceState, SettingsSaveOutcome, ThemeCode, UiCommand};
+    let epoch = DeviceEpoch(1);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let at = Arc::new(GatedRateAt {
+        armed: std::sync::atomic::AtomicBool::new(true),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let controller = Controller::new(
+        ReducerState::new(NOW),
+        Arc::new(FakeActionExecutor::new()),
+        Arc::new(FakeClock::new(NOW)),
+    );
+    let (handle, runner) = ControllerRunner::new(controller);
+    let mut runner = runner.with_ports(MonitorPorts {
+        inventory: Arc::new(StaticInventory {
+            result: Ok(full_inventory(epoch)),
+        }),
+        at,
+        adapter: Arc::new(StaticAdapter {
+            result: Ok(full_adapter(epoch)),
+        }),
+        probe: Arc::new(StaticProbe {
+            result: Ok(full_probe(epoch)),
+            calls: AtomicUsize::new(0),
+        }),
+        hotspot: None,
+        sms: None,
+        device_tools: None,
+    });
+    let task = std::thread::spawn(move || {
+        runner.run_one_refresh();
+        runner
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    handle.try_send(UiCommand::SmsRefresh).unwrap();
+    let mut observations = Vec::new();
+    for (theme, language) in [
+        (ThemeCode::Dark, LanguageCode::EnUs),
+        (ThemeCode::Light, LanguageCode::ZhTw),
+        (ThemeCode::System, LanguageCode::ZhCn),
+    ] {
+        handle.try_send(UiCommand::SetTheme(theme)).unwrap();
+        handle.try_send(UiCommand::SetLanguage(language)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut snapshot = handle.subscribe().borrow();
+        while (snapshot.settings.theme != theme || snapshot.settings.language != language)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+            snapshot = handle.subscribe().borrow();
+        }
+        observations.push((
+            snapshot.settings.theme == theme && snapshot.settings.language == language,
+            !snapshot.sms_refresh_pending && !snapshot.serial_work_busy,
+        ));
+    }
+    let revision = handle.subscribe().borrow().settings.revision;
+    handle
+        .try_send(UiCommand::SettingsPersisted(SettingsSaveOutcome {
+            revision,
+            result: Ok(()),
+        }))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while matches!(
+        handle.subscribe().borrow().settings.persistence,
+        SettingsPersistenceState::Saving
+    ) && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let saved = handle.subscribe().borrow().settings.persistence.clone();
+    release_tx.send(()).unwrap();
+    let mut runner = task.join().unwrap();
+    assert!(
+        observations.iter().all(|(applied, safe)| *applied && *safe),
+        "{observations:?}"
+    );
+    assert!(matches!(saved, SettingsPersistenceState::Clean));
+    runner.poll_commands();
+    assert!(
+        runner.controller().snapshot().sms_refresh_pending,
+        "hardware command must stay queued until observation finishes"
+    );
+}

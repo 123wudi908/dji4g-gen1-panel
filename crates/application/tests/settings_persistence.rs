@@ -262,3 +262,45 @@ fn finishing_an_autostart_write_does_not_reset_the_persistence_state() {
     // The registry readback is not a settings value; only the config write resolves persistence.
     assert_eq!(persistence(&controller), SettingsPersistenceState::Saving);
 }
+
+#[test]
+fn theme_changes_save_once_and_surface_failures() {
+    use dji4g_application::{SettingsSaveOutcome, ThemeCode};
+    let mut controller = Controller::for_test(NOW);
+    for theme in [ThemeCode::Light, ThemeCode::Dark, ThemeCode::System] {
+        let before = controller.snapshot();
+        handle(&mut controller, UiCommand::SetTheme(theme));
+        let changed = controller.snapshot();
+        assert_eq!(changed.settings.theme, theme);
+        assert_eq!(changed.settings.revision, before.settings.revision + 1);
+        assert_eq!(
+            changed.app.revision, before.app.revision,
+            "appearance must not invalidate device evidence"
+        );
+        assert_eq!(persistence(&controller), SettingsPersistenceState::Saving);
+        handle(&mut controller, UiCommand::SetTheme(theme));
+        assert_eq!(
+            controller.snapshot().settings.revision,
+            changed.settings.revision
+        );
+        handle(
+            &mut controller,
+            UiCommand::SettingsPersisted(SettingsSaveOutcome {
+                revision: changed.settings.revision,
+                result: Err(code("config:write_failed")),
+            }),
+        );
+        assert!(matches!(
+            persistence(&controller),
+            SettingsPersistenceState::Failed { .. }
+        ));
+        handle(
+            &mut controller,
+            UiCommand::SettingsPersisted(SettingsSaveOutcome {
+                revision: changed.settings.revision,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(persistence(&controller), SettingsPersistenceState::Clean);
+    }
+}

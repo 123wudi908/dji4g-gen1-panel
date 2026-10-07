@@ -15,7 +15,7 @@ use std::{
 };
 
 use dji4g_application::{
-    AutostartKnownState, AutostartStatus, LanguageCode, LogLevel, SettingsSnapshot,
+    AutostartKnownState, AutostartStatus, LanguageCode, LogLevel, SettingsSnapshot, ThemeCode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,7 @@ pub struct ConfigV1 {
     pub onboarding_completed: bool,
     pub sms_archive_enabled: bool,
     pub language: LanguageCode,
+    pub theme: ThemeCode,
     pub autostart: bool,
     pub start_minimized: bool,
     pub active_probe: bool,
@@ -41,6 +42,7 @@ impl Default for ConfigV1 {
             onboarding_completed: false,
             sms_archive_enabled: false,
             language: LanguageCode::ZhCn,
+            theme: ThemeCode::System,
             autostart: false,
             start_minimized: false,
             active_probe: true,
@@ -72,6 +74,7 @@ impl ConfigV1 {
             onboarding_completed: false,
             sms_archive_enabled: false,
             language: settings.language,
+            theme: settings.theme,
             autostart,
             start_minimized: settings.start_minimized,
             active_probe: settings.active_probe,
@@ -503,10 +506,16 @@ struct ConfigDocument {
     sms_archive_enabled: bool,
     schema_version: u32,
     language: String,
+    #[serde(default = "default_theme")]
+    theme: String,
     autostart: bool,
     start_minimized: bool,
     active_probe: bool,
     log_level: String,
+}
+
+fn default_theme() -> String {
+    "system".to_owned()
 }
 
 fn encode_config(config: &ConfigV1) -> Result<String, ConfigError> {
@@ -516,8 +525,15 @@ fn encode_config(config: &ConfigV1) -> Result<String, ConfigError> {
         schema_version: 1,
         language: match config.language {
             LanguageCode::ZhCn => "zh-CN".to_owned(),
+            LanguageCode::ZhTw => "zh-TW".to_owned(),
             LanguageCode::EnUs => "en-US".to_owned(),
         },
+        theme: match config.theme {
+            ThemeCode::System => "system",
+            ThemeCode::Light => "light",
+            ThemeCode::Dark => "dark",
+        }
+        .to_owned(),
         autostart: config.autostart,
         start_minimized: config.start_minimized,
         active_probe: config.active_probe,
@@ -546,7 +562,14 @@ fn decode_config(bytes: &[u8]) -> Result<ConfigV1, &'static str> {
     }
     let language = match document.language.as_str() {
         "zh-CN" => LanguageCode::ZhCn,
+        "zh-TW" => LanguageCode::ZhTw,
         "en-US" => LanguageCode::EnUs,
+        _ => return Err("config:parse_failed"),
+    };
+    let theme = match document.theme.as_str() {
+        "system" => ThemeCode::System,
+        "light" => ThemeCode::Light,
+        "dark" => ThemeCode::Dark,
         _ => return Err("config:parse_failed"),
     };
     let log_level = match document.log_level.as_str() {
@@ -560,6 +583,7 @@ fn decode_config(bytes: &[u8]) -> Result<ConfigV1, &'static str> {
         onboarding_completed: document.onboarding_completed,
         sms_archive_enabled: document.sms_archive_enabled,
         language,
+        theme,
         autostart: document.autostart,
         start_minimized: document.start_minimized,
         active_probe: document.active_probe,
@@ -720,5 +744,18 @@ extra = true
 "#;
         assert!(decode_config(unknown).is_err());
         assert!(decode_config(br#"schema_version = 1"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod theme_persistence_regressions {
+    use super::*;
+    #[test]
+    fn default_config_serializes_the_system_theme() {
+        assert!(
+            encode_config(&ConfigV1::default())
+                .unwrap()
+                .contains("theme = \"system\"")
+        );
     }
 }

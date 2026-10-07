@@ -1,9 +1,23 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 //! The unelevated outer process owns the return path. The elevated helper only installs.
+use dji4g_panel::localization::Language;
 use dji4g_windows_platform::driver_setup::{self, DriverSetupOutcome as Outcome};
 use std::{io::Write, process::Command};
 
+/// One catalog string in the language this page was rendered with.
+fn t(
+    language: dji4g_panel::localization::Language,
+    key: dji4g_panel::localization::TextKey,
+) -> String {
+    dji4g_panel::localization::LocalizedText::new(language, key).text
+}
+
 const SCRIPT: &str = include_str!("../../../../packaging/scripts/local-driver-install.ps1");
+
+/// The catalog text for one stable code from the driver helper.
+fn code_text(language: Language, code: &str) -> String {
+    dji4g_panel::localization::stable_code_display(language, code)
+}
 
 fn panel_pid(argument: Option<&str>) -> Option<u32> {
     argument?
@@ -14,6 +28,7 @@ fn panel_pid(argument: Option<&str>) -> Option<u32> {
 }
 
 fn main() {
+    let language = dji4g_panel::localization::configured_language();
     let argument = std::env::args().nth(1);
     let check = matches!(argument.as_deref(), Some("--check" | "--plan"));
     if std::env::args().len() > 2
@@ -26,20 +41,27 @@ fn main() {
         std::process::exit(64);
     }
     if check {
-        let result = run_script(argument.as_deref().unwrap());
+        let result = run_script(language, argument.as_deref().unwrap());
         if let Err(error) = &result {
             eprintln!("{error}");
         }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     if argument.as_deref() == Some("--install") {
-        let (outcome, note) = match run_script("--install") {
+        let (outcome, note) = match run_script(language, "--install") {
             Ok(report) => report,
             Err(error) => (Outcome::Failed, error),
         };
         dji4g_windows_platform::show_message_box(
-            "模块驱动检查结果",
-            &format!("{}\n\n{note}\n\n点击“确定”返回面板。", outcome.message()),
+            &t(
+                language,
+                dji4g_panel::localization::TextKey::DriverResultTitle,
+            ),
+            &dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::DriverResultBody,
+                &[&code_text(language, outcome.code()), &note],
+            ),
         );
         std::process::exit(outcome.exit_code() as i32);
     }
@@ -51,11 +73,17 @@ fn main() {
                 std::time::Duration::from_secs(30),
             )
         });
-        if waited.is_err() {
+        if let Err(error) = waited {
+            // A driver-setup error always carries a stable code as its message, so the reason can
+            // be told apart: the panel was still running, was not this directory's panel, or did
+            // not exit in time.
             // Do not open a duplicate panel while the existing one may still own the serial port.
             dji4g_windows_platform::show_message_box(
-                "尚未开始安装",
-                "面板尚未完全退出，或无法核实正在运行的面板。请返回原面板；关闭托盘中的面板后再尝试安装。未执行驱动安装。",
+                &t(
+                    language,
+                    dji4g_panel::localization::TextKey::DriverNotStarted,
+                ),
+                &code_text(language, &error.to_string()),
             );
             std::process::exit(1);
         }
@@ -63,11 +91,17 @@ fn main() {
     if argument.is_none()
         && !dji4g_windows_platform::confirm_message_box(
             None,
-            "安装模块驱动",
-            "将校验随程序附带的驱动，仅为缺驱动接口选择匹配包。Windows 可能更新其他匹配同一驱动包的设备，不强制覆盖更优驱动。\n\n请先退出大疆 4G 面板（含托盘）。点击“是”后申请管理员授权，结束后自动返回面板。",
+            &t(
+                language,
+                dji4g_panel::localization::TextKey::DriverInstallTitle,
+            ),
+            &t(
+                language,
+                dji4g_panel::localization::TextKey::DriverInstallBody,
+            ),
         )
     {
-        return_to_panel(Outcome::Cancelled);
+        return_to_panel(language, Outcome::Cancelled);
         std::process::exit(1223);
     }
     let outcome = match driver_setup::elevate_current_driver_installer() {
@@ -78,32 +112,58 @@ fn main() {
             } else {
                 Outcome::Failed
             };
-            dji4g_windows_platform::show_message_box("管理员授权未完成", result.message());
+            dji4g_windows_platform::show_message_box(
+                &t(
+                    language,
+                    dji4g_panel::localization::TextKey::DriverElevationFailed,
+                ),
+                &code_text(language, result.code()),
+            );
             result
         }
     };
-    return_to_panel(outcome);
+    return_to_panel(language, outcome);
     std::process::exit(outcome.exit_code() as i32);
 }
 
-fn return_to_panel(outcome: Outcome) {
+fn return_to_panel(language: Language, outcome: Outcome) {
     if driver_setup::reopen_panel(outcome).is_err() {
         dji4g_windows_platform::show_message_box(
-            "请打开面板继续",
-            &format!(
-                "{}\n\n未能自动返回。请从桌面正常打开“大疆 4G 面板”，在设置中打开首次连接引导。",
-                outcome.message()
+            &t(
+                language,
+                dji4g_panel::localization::TextKey::DriverOpenPanel,
+            ),
+            &dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::DriverNoReturn,
+                &[&code_text(language, outcome.code())],
             ),
         );
     }
 }
 
-fn run_script(mode_argument: &str) -> Result<(Outcome, String), String> {
-    let exe =
-        std::env::current_exe().map_err(|_| "无法确定程序位置，请重新打开完整程序。".to_owned())?;
-    let root = exe.parent().ok_or("无法确定程序目录。")?.join("drivers");
-    let shell = dji4g_windows_platform::driver_setup_powershell()
-        .map_err(|_| "无法启动 Windows 驱动检查组件，请联系技术支持。".to_owned())?;
+fn run_script(language: Language, mode_argument: &str) -> Result<(Outcome, String), String> {
+    let exe = std::env::current_exe().map_err(|_| {
+        t(
+            language,
+            dji4g_panel::localization::TextKey::DriverNoExePath,
+        )
+        .to_owned()
+    })?;
+    let root = exe
+        .parent()
+        .ok_or(t(
+            language,
+            dji4g_panel::localization::TextKey::DriverNoExeDir,
+        ))?
+        .join("drivers");
+    let shell = dji4g_windows_platform::driver_setup_powershell().map_err(|_| {
+        t(
+            language,
+            dji4g_panel::localization::TextKey::DriverCheckComponentFailed,
+        )
+        .to_owned()
+    })?;
     let mode = match mode_argument {
         "--check" => "check",
         "--plan" => "plan",
@@ -115,17 +175,32 @@ fn run_script(mode_argument: &str) -> Result<(Outcome, String), String> {
     } else {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "系统时间异常，未开始安装。")?
+            .map_err(|_| {
+                t(
+                    language,
+                    dji4g_panel::localization::TextKey::DriverClockInvalid,
+                )
+            })?
             .as_nanos();
         let path = exe.with_file_name(format!("driver-setup-{stamp}-{}.log", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(|_| "无法创建安装日志，未开始安装。请将完整程序放在可写目录后重试。")?;
+            .map_err(|_| {
+                t(
+                    language,
+                    dji4g_panel::localization::TextKey::DriverLogCreateFailed,
+                )
+            })?;
         writeln!(file, "Driver setup started; mode={mode}")
             .and_then(|()| file.flush())
-            .map_err(|_| "无法写入日志，未开始安装。")?;
+            .map_err(|_| {
+                t(
+                    language,
+                    dji4g_panel::localization::TextKey::DriverLogWriteFailed,
+                )
+            })?;
         Some((path, file))
     };
     let mut command = Command::new(shell);
@@ -153,16 +228,27 @@ fn run_script(mode_argument: &str) -> Result<(Outcome, String), String> {
         writeln!(file, "{report}")
             .and_then(|()| file.flush())
             .map_err(|_| {
-                format!(
-                    "安装日志写入失败，请检查设备实际状态。日志位置：{}",
-                    path.display()
+                dji4g_panel::localization::format_positional(
+                    language,
+                    dji4g_panel::localization::TextKey::DriverLogAppendFailed,
+                    &[&path.display().to_string()],
                 )
             })?;
-        format!("详细安装日志：{}", path.display())
+        dji4g_panel::localization::format_positional(
+            language,
+            dji4g_panel::localization::TextKey::DriverLogPath,
+            &[&path.display().to_string()],
+        )
     } else {
         String::new()
     };
-    let output = output.map_err(|_| format!("Windows 驱动检查未能启动。{log_note}"))?;
+    let output = output.map_err(|_| {
+        dji4g_panel::localization::format_positional(
+            language,
+            dji4g_panel::localization::TextKey::DriverCheckNotStarted,
+            &[&log_note],
+        )
+    })?;
     if check {
         print!("{}", String::from_utf8_lossy(&output.stdout));
         return if output.status.success() {

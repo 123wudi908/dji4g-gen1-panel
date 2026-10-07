@@ -24,6 +24,9 @@ pub fn sms_send_controlled(
     text: &str,
     control: SmsTransactionControl,
 ) -> SmsSubmitReceipt {
+    if let Err(error) = crate::sms::require_sms_device(device) {
+        return failed(error.code, &control);
+    }
     if expected_sim.is_none() {
         return failed("sms:sim_identity_required", &control);
     }

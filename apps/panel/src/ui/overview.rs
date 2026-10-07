@@ -1,24 +1,35 @@
-//! Overview page laid out like the Fluent HTML reference: device/cellular facts in a left
-//! column, the live rate section on the right, then the Windows network facts and the hotspot
-//! control across the full width.
+//! Overview page: the read-only answer to 「现在能用吗」.
+//!
+//! The title, verdict banner and summary line span the full width; below them the cards pair up —
+//! the measured rate trend beside the device's own record, then the Windows network facts — so a
+//! desktop-width window shows the whole state without scrolling.
+//!
+//! Nothing on this page acts. It reports a value, a curve, a row of facts or a timeline entry, and
+//! that is all: a check, a retry, a switch, a repair or an export belongs to the page that owns the
+//! subject, and lives there. The one exception is the panel-wide 刷新 / 更多 pair in the header,
+//! which is deliberately the overview's own.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use dji4g_application::{AdapterMetrics, ControllerSnapshot, UiCommand};
-use dji4g_domain::{ActionKind, NumberLookup, Timeline};
+use dji4g_application::{AdapterMetrics, ControllerSnapshot};
+use dji4g_domain::{NumberLookup, Timeline};
 use eframe::egui::{self, RichText, Ui};
 
 use super::{
-    DisplayValue, HotspotAction, HotspotVm, carrier_display_name, clock_hms, field_label,
-    format_age, format_mbps, hotspot_vm, info_grid, meta_text, render_rate_section, scale,
-    section_frame, section_heading, speed_grade, wrapped_label,
+    DisplayValue, carrier_display_name, clock_hms, field_label, format_age, format_mbps, info_grid,
+    meta_text, render_rate_section, scale, section_frame, section_heading, speed_grade,
+    two_columns, wrapped_label,
 };
-use crate::app::PanelCommandSink;
 use crate::feature_probe::FeatureProbeView;
 use crate::localization::{
     Language, LocalizedText, TextArgs, TextKey, bound_dns_status, default_route_owner,
-    feature_status_note, format_text_in, registration_state, sim_state, timeline_kind_text,
+    feature_status_note, format_text_in, registration_state, sim_state, timeline_detail_text,
 };
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OverviewVm {
@@ -54,7 +65,6 @@ pub struct OverviewVm {
     pub adapter_metrics: AdapterMetricsVm,
     pub timeline: Vec<TimelineRowVm>,
     pub identity: IdentityVm,
-    pub hotspot: HotspotVm,
 }
 
 /// Projection of the bound-adapter interface metrics (research §7.1). Counters are per-interface
@@ -117,10 +127,19 @@ pub fn overview_vm_with_probes(
     let cellular = app.cellular.as_ref();
     let network = app.network.as_ref();
     let probes = probes.filter(|view| view.captured);
-    let device = if app.device.is_some() {
-        DisplayValue::new("DJI 一代 4G 模块")
-    } else {
-        DisplayValue::new("未检测到")
+    let device = match app.device.as_ref() {
+        // The 型号 row names the module the inventory actually proved, so a recognized generic
+        // module is never labelled as a DJI one.
+        Some(device) => device.identity.profile().map_or_else(
+            || DisplayValue::new(t(language, crate::localization::TextKey::DeviceModelName)),
+            |profile| {
+                DisplayValue::new(t(language, crate::localization::device_model_name(profile)))
+            },
+        ),
+        None => DisplayValue::new(t(
+            language,
+            crate::localization::TextKey::AvailabilityNotDetectedTitle,
+        )),
     };
     // 网速分档与速率面板同源（`speed_grade`）：封闭阈值只在 ui/mod.rs 定义一次，文案走本地化
     // 词表。分档是展示词汇，不参与任何可用性判定。
@@ -131,18 +150,28 @@ pub fn overview_vm_with_probes(
         .and_then(|value| value.carrier.as_deref())
         .filter(|value| !value.trim().is_empty())
         .map_or_else(
-            || DisplayValue::new("未获取"),
-            |value| DisplayValue::new(carrier_display_name(value)),
+            || DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable)),
+            |value| DisplayValue::new(carrier_display_name(value, language)),
         );
     let radio_access_technology = cellular
         .and_then(|value| value.radio_access_technology.as_deref())
         .filter(|value| !value.trim().is_empty())
-        .map_or_else(|| DisplayValue::new("未获取"), DisplayValue::new);
+        .map_or_else(
+            || DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable)),
+            DisplayValue::new,
+        );
     let signal = cellular
         .and_then(|value| value.signal_rssi_dbm)
         .map_or_else(
-            || DisplayValue::new("未获取"),
-            |value| DisplayValue::new(format!("{value} dBm（速度：{grade_text}）")),
+            || DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable)),
+            |value| {
+                let reading = value.to_string();
+                DisplayValue::new(crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::SignalWithGrade,
+                    &[&reading, &grade_text],
+                ))
+            },
         );
     let registration = cellular.map_or_else(
         || LocalizedText::new(language, TextKey::ValueNotAvailable),
@@ -155,24 +184,27 @@ pub fn overview_vm_with_probes(
     let firmware = cellular
         .and_then(|value| value.firmware.as_deref())
         .filter(|value| !value.trim().is_empty())
-        .map_or_else(|| DisplayValue::new("未获取"), DisplayValue::new);
+        .map_or_else(
+            || DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable)),
+            DisplayValue::new,
+        );
     let pdp = cellular
         .and_then(|value| value.pdp_state.as_deref())
         .map_or_else(
-            || DisplayValue::new("未获取"),
+            || DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable)),
             |value| {
                 DisplayValue::new(match value {
-                    "active" => "已激活",
-                    "inactive" => "未激活",
-                    other => other,
+                    "active" => t(language, crate::localization::TextKey::PdpActive),
+                    "inactive" => t(language, crate::localization::TextKey::PdpInactive),
+                    other => other.to_owned(),
                 })
             },
         );
     let serving_cell = cellular
         .and_then(|value| value.serving_cell.as_ref())
         .map_or_else(
-            || DisplayValue::new("未获取"),
-            |cell| DisplayValue::new(serving_cell_text(cell)),
+            || DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable)),
+            |cell| DisplayValue::new(serving_cell_text(cell, language)),
         );
     // The provisional-layout note is about parsing output, so it rides with the report itself.
     let serving_cell_provisional = cellular
@@ -186,9 +218,9 @@ pub fn overview_vm_with_probes(
         .map(|network| network.addresses.clone())
         .unwrap_or_default();
     let adapter_addresses = if addresses.is_empty() {
-        DisplayValue::new("未获取")
+        DisplayValue::new(t(language, crate::localization::TextKey::ValueNotAvailable))
     } else {
-        DisplayValue::copyable(preview_values(&addresses))
+        DisplayValue::copyable(preview_values(&addresses, language))
     };
     let dns = network.map_or_else(
         || LocalizedText::new(language, TextKey::ValueNotAvailable),
@@ -230,7 +262,6 @@ pub fn overview_vm_with_probes(
         adapter_metrics: adapter_metrics_vm(snapshot.adapter_metrics, language),
         timeline: timeline_rows(&snapshot.timeline, language),
         identity: identity_vm(cellular, probes, language),
-        hotspot: hotspot_vm(app.hotspot, language),
     }
 }
 
@@ -336,8 +367,8 @@ pub fn adapter_metrics_vm(metrics: Option<AdapterMetrics>, language: Language) -
     }
 }
 
-/// The newest [`TIMELINE_VISIBLE`] transitions, newest first. The event's own closed detail phrase
-/// is the display text; an empty detail falls back to the localized category label.
+/// The newest [`TIMELINE_VISIBLE`] transitions, newest first. The row's wording is resolved here,
+/// in the page's language, from the closed values the reducer recorded.
 #[must_use]
 pub fn timeline_rows(timeline: &Timeline, language: Language) -> Vec<TimelineRowVm> {
     timeline
@@ -347,14 +378,7 @@ pub fn timeline_rows(timeline: &Timeline, language: Language) -> Vec<TimelineRow
         .take(TIMELINE_VISIBLE)
         .map(|event| TimelineRowVm {
             time: clock_hms(event.at),
-            text: if event.detail.trim().is_empty() {
-                LocalizedText::new(language, timeline_kind_text(event.kind))
-            } else {
-                LocalizedText {
-                    key: timeline_kind_text(event.kind),
-                    text: event.detail.clone(),
-                }
-            },
+            text: timeline_detail_text(language, event.kind, event.detail),
         })
         .collect()
 }
@@ -423,17 +447,27 @@ fn identity_vm(
 /// module degrades to 未驻留 instead of a row of empty brackets. SINR is kept raw with an
 /// explicit 「单位待确认」 note until the firmware scaling is confirmed (research §5.2), and the
 /// field layout itself is annotated as provisional at the row level (research §10).
-fn serving_cell_text(cell: &dji4g_domain::ServingCell) -> String {
+fn serving_cell_text(cell: &dji4g_domain::ServingCell, language: Language) -> String {
     if cell.rat.is_none() {
         return match cell.state.as_deref() {
-            Some("SEARCH") => "正在搜索".to_owned(),
-            Some("LIMSRV") => "受限服务".to_owned(),
-            Some("NOCELL") => "无小区".to_owned(),
-            _ => "未驻留（搜索中）".to_owned(),
+            Some("SEARCH") => {
+                t(language, crate::localization::TextKey::ServingSearching).to_owned()
+            }
+            Some("LIMSRV") => t(
+                language,
+                crate::localization::TextKey::ServingLimitedService,
+            )
+            .to_owned(),
+            Some("NOCELL") => t(language, crate::localization::TextKey::ServingNoCell).to_owned(),
+            _ => t(language, crate::localization::TextKey::ServingNotCamped).to_owned(),
         };
     }
     let mut parts = vec![cell.rat.clone().unwrap_or_default()];
-    if let Some(phrase) = cell.state.as_deref().and_then(serving_state_phrase) {
+    if let Some(phrase) = cell
+        .state
+        .as_deref()
+        .and_then(|state| serving_state_phrase(state, language))
+    {
         parts.push(phrase);
     }
     if let (Some(mcc), Some(mnc)) = (cell.mcc.as_deref(), cell.mnc.as_deref()) {
@@ -463,7 +497,12 @@ fn serving_cell_text(cell: &dji4g_domain::ServingCell) -> String {
         parts.push(format!("RSRQ {rsrq} dB"));
     }
     if let Some(sinr) = cell.sinr_raw {
-        parts.push(format!("SINR {sinr}（单位待确认）"));
+        let sinr = sinr.to_string();
+        parts.push(crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ServingSinr,
+            &[&sinr],
+        ));
     }
     parts.join(" · ")
 }
@@ -471,20 +510,26 @@ fn serving_cell_text(cell: &dji4g_domain::ServingCell) -> String {
 /// User-facing phrase for a serving-cell state code. `CONNECT` carries no phrase (it is the
 /// ordinary in-call/active state and the RAT line already implies it); unknown codes are passed
 /// through verbatim rather than guessed at.
-fn serving_state_phrase(state: &str) -> Option<String> {
+fn serving_state_phrase(state: &str, language: Language) -> Option<String> {
     match state {
         "CONNECT" => None,
-        "NOCONN" => Some("已驻留（空闲）".to_owned()),
-        "SEARCH" => Some("正在搜索".to_owned()),
-        "LIMSRV" => Some("受限服务".to_owned()),
-        "NOCELL" => Some("无小区".to_owned()),
+        "NOCONN" => Some(t(language, crate::localization::TextKey::ServingCampedIdle).to_owned()),
+        "SEARCH" => Some(t(language, crate::localization::TextKey::ServingSearching).to_owned()),
+        "LIMSRV" => Some(
+            t(
+                language,
+                crate::localization::TextKey::ServingLimitedService,
+            )
+            .to_owned(),
+        ),
+        "NOCELL" => Some(t(language, crate::localization::TextKey::ServingNoCell).to_owned()),
         other => Some(other.to_owned()),
     }
 }
 
-fn preview_values(values: &[String]) -> String {
+fn preview_values(values: &[String], language: Language) -> String {
     if values.is_empty() {
-        return "未获取".into();
+        return t(language, crate::localization::TextKey::ValueNotAvailable);
     }
     let preview = values
         .iter()
@@ -493,19 +538,29 @@ fn preview_values(values: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("、");
     if values.len() > 2 {
-        format!("{preview}（另有 {} 项）", values.len() - 2)
+        let more = (values.len() - 2).to_string();
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ValuePreviewMore,
+            &[&preview, &more],
+        )
     } else {
         preview
     }
 }
 
+/// The read-only verdict at the top of the overview: what the panel concluded, and one quiet line
+/// of the numbers behind it.
+///
+/// It carries no button. Every check, retry, switch and repair lives on the page that owns it — the
+/// overview states the result and nothing else — so the only thing this can return is nothing at
+/// all.
 pub(crate) fn render_summary(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
     language: Language,
     probes: Option<&FeatureProbeView>,
-) -> Option<crate::app::Page> {
-    let mut destination = None;
+) {
     let vm = overview_vm_with_probes(snapshot, language, probes);
     let availability = super::availability_vm(
         &snapshot.app,
@@ -519,45 +574,25 @@ pub(crate) fn render_summary(
         &availability.reason.text,
         availability.tone,
     );
-    ui.scope(|ui| {
-        let next = super::driver_setup::next_step_vm(snapshot, std::time::SystemTime::now());
-        if next.state != super::driver_setup::GuideState::Passed {
-            wrapped_label(ui, meta_text(next.text));
-            if let Some(page) = next.destination {
-                if ui
-                    .button(if page == crate::app::Page::Settings {
-                        "打开设置"
-                    } else {
-                        "查看诊断原因"
-                    })
-                    .clicked()
-                {
-                    destination = Some(page);
-                }
-            }
-        }
-    });
     // A quiet summary line; live throughput already has its own chart immediately below.
     wrapped_label(
         ui,
-        meta_text(format!(
-            "运营商 {}  ·  信号 {}  ·  温度 {}",
-            vm.carrier.text, vm.signal.text, vm.temperature.text
+        meta_text(crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::OverviewSummaryLine,
+            &[&vm.carrier.text, &vm.signal.text, &vm.temperature.text],
         )),
     );
-    destination
 }
 
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
     language: Language,
-    sink: &dyn PanelCommandSink,
     rate_history: &crate::ui::RateHistory,
     temperature_history: &crate::ui::TemperatureHistory,
     probes: Option<&FeatureProbeView>,
-) -> Option<crate::app::Page> {
-    let mut destination = None;
+) {
     let mut vm = overview_vm_with_probes(snapshot, language, probes);
     if !snapshot.rates_sampled_at.is_some_and(|time| {
         std::time::SystemTime::now()
@@ -567,183 +602,263 @@ pub(crate) fn render(
         vm.down_rate = None;
         vm.up_rate = None;
     }
-    let cellular = snapshot.app.cellular.as_ref();
-    section_frame(ui, |ui| {
-        let tab_id = egui::Id::new("overview-chart-tab");
-        let mut tab = ui.data(|data| data.get_temp::<u8>(tab_id)).unwrap_or(0);
-        super::components::segmented_control(
+    render_cards(
+        ui,
+        &vm,
+        snapshot.app.cellular.as_ref(),
+        language,
+        rate_history,
+        temperature_history,
+        snapshot.app.observed_at,
+    );
+}
+
+fn render_cards(
+    ui: &mut Ui,
+    vm: &OverviewVm,
+    cellular: Option<&dji4g_domain::CellularSnapshot>,
+    language: Language,
+    rate_history: &crate::ui::RateHistory,
+    temperature_history: &crate::ui::TemperatureHistory,
+    observed_at: std::time::SystemTime,
+) {
+    if ui.available_width() >= super::TWO_COLUMN_MIN_WIDTH {
+        two_columns(
             ui,
-            tab_id.with("control"),
-            &mut tab,
-            &[
-                super::components::TabItem::new(0, "收发速率"),
-                super::components::TabItem::new(1, "模块温度"),
-            ],
-        );
-        ui.data_mut(|data| data.insert_temp(tab_id, tab));
-        if tab == 0 {
-            render_rate_section(ui, rate_history, vm.down_rate, vm.up_rate, language);
-        } else {
-            render_temperature_section(
-                ui,
-                &vm,
-                temperature_history,
-                snapshot.app.observed_at,
-                language,
-            );
-        }
-    });
-    egui::CollapsingHeader::new("连接检查与使用引导")
-        .default_open(
-            super::driver_setup::next_step_vm(snapshot, SystemTime::now()).state
-                == super::driver_setup::GuideState::Failed,
-        )
-        .show(ui, |ui| {
-            super::driver_setup::render_guide(ui, snapshot, std::time::SystemTime::now(), language);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("诊断").clicked() {
-                    destination = Some(crate::app::Page::Diagnostics);
-                }
-                if ui.button("驱动与连接修复").clicked() {
-                    destination = Some(crate::app::Page::Repairs);
-                }
-                if ui.button("收发短信").clicked() {
-                    destination = Some(crate::app::Page::Sms);
-                }
-            });
-        });
-    section_frame(ui, |ui| {
-        egui::CollapsingHeader::new("设备与 SIM 详情").show(ui, |ui| {
-            info_grid(ui, "overview-device-details", |ui| {
-                for (label, value) in [
-                    ("运营商", &vm.carrier.text),
-                    ("接入制式", &vm.radio_access_technology.text),
-                    ("注册", &vm.registration.text),
-                    ("SIM", &vm.sim.text),
-                    ("型号", &vm.device.text),
-                    ("固件", &vm.firmware.text),
-                    ("PDP 状态", &vm.pdp.text),
-                ] {
-                    ui.label(field_label(label));
-                    wrapped_label(ui, value);
-                    ui.end_row();
-                }
-                ui.label(field_label("服务小区"));
-                render_serving_cell_value(ui, &vm, language);
-                ui.end_row();
-                ui.label(field_label("温度"));
-                render_temperature_value(ui, &vm);
-                ui.end_row();
-            });
-            if cellular.is_some() {
-                render_identity_area(ui, &vm.identity, cellular, language);
-            }
-        });
-    });
-    section_frame(ui, |ui| {
-        egui::CollapsingHeader::new("Windows 网络详情").show(ui, |ui| {
-            info_grid(ui, "overview-network-grid", |ui| {
-                ui.label(field_label("默认路由"));
-                wrapped_label(ui, vm.route.text.clone());
-                ui.end_row();
-                ui.label(field_label("DNS"));
-                wrapped_label(ui, vm.dns.text.clone());
-                ui.end_row();
-                ui.label(field_label("IP 地址"));
-                render_addresses(ui, &vm, language);
-                ui.end_row();
-                ui.label(field_label(
-                    LocalizedText::new(language, TextKey::FieldAdapterErrors).text,
-                ));
-                wrapped_label(ui, vm.adapter_metrics.errors.text.clone());
-                ui.end_row();
-                ui.label(field_label(
-                    LocalizedText::new(language, TextKey::FieldAdapterDiscards).text,
-                ));
-                wrapped_label(ui, vm.adapter_metrics.discards.text.clone());
-                ui.end_row();
-                ui.label(field_label(
-                    LocalizedText::new(language, TextKey::FieldAdapterLinkRate).text,
-                ));
-                wrapped_label(ui, vm.adapter_metrics.link_rate.text.clone());
-                ui.end_row();
-            });
-            if let Some(note) = &vm.adapter_metrics.link_note {
-                wrapped_label(ui, meta_text(note.text.clone()));
-            }
-        });
-    });
-    section_frame(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("移动热点"));
-            ui.colored_label(vm.hotspot.tone.color(), &vm.hotspot.status.text);
-        });
-        if !matches!(vm.hotspot.reason.key, TextKey::ValueNotApplicable) {
-            wrapped_label(ui, meta_text(vm.hotspot.reason.text.clone()));
-        }
-        if let Some(action) = vm.hotspot.action {
-            // A failed hotspot offers 重试, which is a plain refresh (re-observe the hotspot
-            // state and the rest of the evidence) — not a repair plan: `ActionKind::Refresh` is
-            // deliberately not a confirmable action, so it must go through the refresh signal.
-            if action == HotspotAction::Retry {
-                if ui
-                    .add_enabled(
-                        !vm.hotspot.busy,
-                        egui::Button::new(TextKey::ButtonRetry.to_string(language)),
-                    )
-                    .clicked()
-                {
-                    let _ = sink.try_send(UiCommand::Refresh);
-                }
-                return;
-            }
-            let (label, command) = match action {
-                HotspotAction::Enable => (
-                    TextKey::ActionEnableHotspot.to_string(language),
-                    ActionKind::ToggleHotspot { enabled: true },
-                ),
-                HotspotAction::Disable => (
-                    TextKey::ActionDisableHotspot.to_string(language),
-                    ActionKind::ToggleHotspot { enabled: false },
-                ),
-                HotspotAction::Retry => unreachable!("handled above"),
-            };
-            if ui
-                .add_enabled(!vm.hotspot.busy, egui::Button::new(label))
-                .clicked()
-            {
-                sink.prepare_action_now(command);
-            }
-        } else if vm.hotspot.busy {
-            wrapped_label(ui, meta_text(TextKey::StatusLoading.to_string(language)));
-        }
-    });
-    section_frame(ui, |ui| {
-        ui.label(section_heading(
-            LocalizedText::new(language, TextKey::TimelineHeading).text,
-        ));
-        ui.add_space(8.0);
-        if vm.timeline.is_empty() {
-            wrapped_label(
-                ui,
-                meta_text(LocalizedText::new(language, TextKey::TimelineEmpty).text),
-            );
-            return;
-        }
-        for row in &vm.timeline {
-            ui.horizontal_wrapped(|ui| {
-                let time = row.time.clone().unwrap_or_else(|| "--:--:--".to_owned());
-                ui.label(meta_text(time));
-                wrapped_label(
+            |ui| {
+                render_trend_card(
                     ui,
-                    RichText::new(row.text.text.clone())
-                        .size(scale::BODY)
-                        .color(scale::INK),
+                    vm,
+                    language,
+                    rate_history,
+                    temperature_history,
+                    observed_at,
                 );
+                render_network_card(ui, vm, language);
+            },
+            |ui| {
+                render_device_card(ui, vm, cellular, language);
+            },
+        );
+    } else {
+        render_trend_card(
+            ui,
+            vm,
+            language,
+            rate_history,
+            temperature_history,
+            observed_at,
+        );
+        render_device_card(ui, vm, cellular, language);
+        render_network_card(ui, vm, language);
+    }
+    render_timeline_card(ui, vm, language);
+}
+
+fn render_trend_card(
+    ui: &mut Ui,
+    vm: &OverviewVm,
+    language: Language,
+    rate_history: &crate::ui::RateHistory,
+    temperature_history: &crate::ui::TemperatureHistory,
+    observed_at: std::time::SystemTime,
+) {
+    let response = ui
+        .scope(|ui| {
+            section_frame(ui, |ui| {
+                let tab_id = egui::Id::new("overview-chart-tab");
+                let mut tab = ui.data(|data| data.get_temp::<u8>(tab_id)).unwrap_or(0);
+                super::components::segmented_control(
+                    ui,
+                    tab_id.with("control"),
+                    &mut tab,
+                    &[
+                        super::components::TabItem::new(
+                            0,
+                            t(language, crate::localization::TextKey::OverviewTabRate),
+                        ),
+                        super::components::TabItem::new(
+                            1,
+                            t(
+                                language,
+                                crate::localization::TextKey::TemperatureSectionHeading,
+                            ),
+                        ),
+                    ],
+                );
+                ui.data_mut(|data| data.insert_temp(tab_id, tab));
+                if tab == 0 {
+                    render_rate_section(ui, rate_history, vm.down_rate, vm.up_rate, language);
+                } else {
+                    render_temperature_section(ui, vm, temperature_history, observed_at, language);
+                }
             });
-        }
-    });
-    destination
+        })
+        .response;
+    #[cfg(test)]
+    ui.data_mut(|data| data.insert_temp(egui::Id::new("overview-trend-rect"), response.rect));
+    let _ = response;
+}
+
+fn render_device_card(
+    ui: &mut Ui,
+    vm: &OverviewVm,
+    cellular: Option<&dji4g_domain::CellularSnapshot>,
+    language: Language,
+) {
+    let response = ui
+        .scope(|ui| {
+            section_frame(ui, |ui| {
+                ui.label(section_heading(t(
+                    language,
+                    crate::localization::TextKey::OverviewDeviceHeading,
+                )));
+                info_grid(ui, "overview-device-details", |ui| {
+                    for (label, value) in [
+                        (
+                            t(language, crate::localization::TextKey::FieldCarrier),
+                            &vm.carrier.text,
+                        ),
+                        (
+                            t(
+                                language,
+                                crate::localization::TextKey::FieldRadioAccessTechnology,
+                            ),
+                            &vm.radio_access_technology.text,
+                        ),
+                        (
+                            t(
+                                language,
+                                crate::localization::TextKey::FieldRegistrationShort,
+                            ),
+                            &vm.registration.text,
+                        ),
+                        ("SIM".to_owned(), &vm.sim.text),
+                        (
+                            t(language, crate::localization::TextKey::FieldModelShort),
+                            &vm.device.text,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::FieldFirmware),
+                            &vm.firmware.text,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::FieldPdpState),
+                            &vm.pdp.text,
+                        ),
+                    ] {
+                        ui.label(field_label(label));
+                        wrapped_label(ui, value);
+                        ui.end_row();
+                    }
+                    ui.label(field_label(t(
+                        language,
+                        crate::localization::TextKey::FieldServingCell,
+                    )));
+                    render_serving_cell_value(ui, vm, language);
+                    ui.end_row();
+                    ui.label(field_label(t(
+                        language,
+                        crate::localization::TextKey::FieldTemperature,
+                    )));
+                    render_temperature_value(ui, vm);
+                    ui.end_row();
+                });
+                if cellular.is_some() {
+                    render_identity_area(ui, &vm.identity, cellular, language);
+                }
+            });
+        })
+        .response;
+    #[cfg(test)]
+    ui.data_mut(|data| data.insert_temp(egui::Id::new("overview-device-rect"), response.rect));
+    let _ = response;
+}
+
+fn render_network_card(ui: &mut Ui, vm: &OverviewVm, language: Language) {
+    let response = ui
+        .scope(|ui| {
+            section_frame(ui, |ui| {
+                ui.label(section_heading(t(
+                    language,
+                    crate::localization::TextKey::OverviewNetworkHeading,
+                )));
+                info_grid(ui, "overview-network-grid", |ui| {
+                    ui.label(field_label(t(
+                        language,
+                        crate::localization::TextKey::FieldDefaultRouteShort,
+                    )));
+                    wrapped_label(ui, vm.route.text.clone());
+                    ui.end_row();
+                    ui.label(field_label("DNS"));
+                    wrapped_label(ui, vm.dns.text.clone());
+                    ui.end_row();
+                    ui.label(field_label(t(
+                        language,
+                        crate::localization::TextKey::FieldIpAddresses,
+                    )));
+                    render_addresses(ui, vm, language);
+                    ui.end_row();
+                    ui.label(field_label(
+                        LocalizedText::new(language, TextKey::FieldAdapterErrors).text,
+                    ));
+                    wrapped_label(ui, vm.adapter_metrics.errors.text.clone());
+                    ui.end_row();
+                    ui.label(field_label(
+                        LocalizedText::new(language, TextKey::FieldAdapterDiscards).text,
+                    ));
+                    wrapped_label(ui, vm.adapter_metrics.discards.text.clone());
+                    ui.end_row();
+                    ui.label(field_label(
+                        LocalizedText::new(language, TextKey::FieldAdapterLinkRate).text,
+                    ));
+                    wrapped_label(ui, vm.adapter_metrics.link_rate.text.clone());
+                    ui.end_row();
+                });
+                if let Some(note) = &vm.adapter_metrics.link_note {
+                    wrapped_label(ui, meta_text(note.text.clone()));
+                }
+            });
+        })
+        .response;
+    #[cfg(test)]
+    ui.data_mut(|data| data.insert_temp(egui::Id::new("overview-network-rect"), response.rect));
+    let _ = response;
+}
+
+fn render_timeline_card(ui: &mut Ui, vm: &OverviewVm, language: Language) {
+    let response = ui
+        .scope(|ui| {
+            section_frame(ui, |ui| {
+                ui.label(section_heading(
+                    LocalizedText::new(language, TextKey::TimelineHeading).text,
+                ));
+                ui.add_space(8.0);
+                if vm.timeline.is_empty() {
+                    wrapped_label(
+                        ui,
+                        meta_text(LocalizedText::new(language, TextKey::TimelineEmpty).text),
+                    );
+                    return;
+                }
+                for row in &vm.timeline {
+                    ui.horizontal_wrapped(|ui| {
+                        let time = row.time.clone().unwrap_or_else(|| "--:--:--".to_owned());
+                        ui.label(meta_text(time));
+                        wrapped_label(
+                            ui,
+                            RichText::new(row.text.text.clone())
+                                .size(scale::BODY)
+                                .color(scale::ink()),
+                        );
+                    });
+                }
+            });
+        })
+        .response;
+    #[cfg(test)]
+    ui.data_mut(|data| data.insert_temp(egui::Id::new("overview-timeline-rect"), response.rect));
+    let _ = response;
 }
 
 /// The 温度 value cell: the reading (or the honest 未读取到) plus its firmware-scope note, the
@@ -823,7 +938,7 @@ fn render_temperature_section(
                 ui,
                 RichText::new(window_text)
                     .size(scale::RATE_AUX)
-                    .color(scale::SECONDARY),
+                    .color(scale::secondary()),
             );
         });
     });
@@ -835,13 +950,13 @@ fn render_temperature_section(
                 ui,
                 RichText::new(format!("{celsius} °C"))
                     .size(scale::RATE_NUMBER)
-                    .color(scale::INK),
+                    .color(scale::ink()),
             ),
             None => wrapped_label(
                 ui,
                 RichText::new(vm.temperature.text.clone())
                     .size(scale::BODY)
-                    .color(scale::FAINT),
+                    .color(scale::faint()),
             ),
         };
         if let Some(delta) = vm
@@ -852,7 +967,7 @@ fn render_temperature_section(
                 ui,
                 RichText::new(temperature_delta_text(delta, language).text)
                     .size(scale::RATE_AUX)
-                    .color(scale::SECONDARY),
+                    .color(scale::secondary()),
             );
         }
         if let Ok(age) = std::time::SystemTime::now().duration_since(observed_at) {
@@ -867,7 +982,7 @@ fn render_temperature_section(
                     ui,
                     RichText::new(age_text)
                         .size(scale::RATE_AUX)
-                        .color(scale::SECONDARY),
+                        .color(scale::secondary()),
                 );
             });
         }
@@ -1042,7 +1157,7 @@ fn render_phone_number_value(
                 RichText::new(numbers.join("\n"))
                     .monospace()
                     .size(scale::RATE_AUX)
-                    .color(scale::INK),
+                    .color(scale::ink()),
             );
         } else if let Some(absent) = &identity.number_absent {
             wrapped_label(ui, absent.text.clone());
@@ -1055,7 +1170,9 @@ fn render_phone_number_value(
         }
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if ui.button(TextKey::ButtonShow.to_string(language)).clicked() {
+            if super::components::plain_button(ui, TextKey::ButtonShow.to_string(language))
+                .clicked()
+            {
                 toggle_reveal(ui, reveal_id);
             }
             let copied_label = if just_copied(ui, copy_id) {
@@ -1063,7 +1180,7 @@ fn render_phone_number_value(
             } else {
                 TextKey::ButtonCopy
             };
-            if ui.button(copied_label.to_string(language)).clicked() {
+            if super::components::plain_button(ui, copied_label.to_string(language)).clicked() {
                 if let Some(numbers) = &plain {
                     ui.ctx().copy_text(numbers.join("\n"));
                     mark_copied(ui, copy_id);
@@ -1092,10 +1209,11 @@ fn render_iccid_value(ui: &mut Ui, identity: &IdentityVm, language: Language) {
                     RichText::new(shown)
                         .monospace()
                         .size(scale::RATE_AUX)
-                        .color(scale::INK),
+                        .color(scale::ink()),
                 );
                 if identity.iccid_reveal_full.is_some()
-                    && ui.button(TextKey::ButtonShow.to_string(language)).clicked()
+                    && super::components::plain_button(ui, TextKey::ButtonShow.to_string(language))
+                        .clicked()
                 {
                     toggle_reveal(ui, reveal_id);
                 }
@@ -1115,39 +1233,118 @@ fn render_iccid_value(ui: &mut Ui, identity: &IdentityVm, language: Language) {
 
 /// IP addresses as monospace lines (like the reference's `.address`), a note for the hidden
 /// remainder, and a copy button that copies every address.
-fn render_addresses(ui: &mut Ui, vm: &OverviewVm, language: Language) {
+fn render_addresses(ui: &mut Ui, vm: &OverviewVm, language: Language) -> egui::Response {
+    let copy_id = egui::Id::new("overview-copy-address");
+    let copied_at = ui.data(|data| data.get_temp::<Instant>(copy_id));
+    let just_copied = copied_at.is_some_and(|at| at.elapsed() < Duration::from_secs(2));
+    let copy_label = TextKey::ButtonCopyAddress.to_string(language);
+    let copied_label = TextKey::ButtonCopied.to_string(language);
+    let label = if just_copied {
+        &copied_label
+    } else {
+        &copy_label
+    };
+    let width = ui.available_width().max(1.0);
+    let spacing = ui.spacing().item_spacing;
+    let button_width = ui.fonts(|fonts| {
+        [&copy_label, &copied_label]
+            .into_iter()
+            .map(|label| {
+                fonts
+                    .layout_no_wrap(
+                        label.clone(),
+                        egui::FontId::proportional(scale::BODY),
+                        scale::ink(),
+                    )
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max)
+    }) + 2.0 * ui.spacing().button_padding.x;
+    let button_width = button_width.max(scale::BUTTON_MIN_W).min(width);
+    let inline = width - button_width - spacing.x >= 120.0;
+    let text_width = if inline {
+        width - button_width - spacing.x
+    } else {
+        width
+    };
+    let mut texts: Vec<(String, egui::FontId, egui::Color32)> = vm
+        .addresses
+        .iter()
+        .take(2)
+        .map(|address| {
+            (
+                address.clone(),
+                egui::FontId::monospace(scale::RATE_AUX),
+                scale::ink(),
+            )
+        })
+        .collect();
+    if texts.is_empty() {
+        texts.push((
+            TextKey::ValueNotAvailable.to_string(language),
+            egui::FontId::proportional(scale::BODY),
+            scale::secondary(),
+        ));
+    }
     let more = vm.addresses.len().saturating_sub(2);
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            for address in vm.addresses.iter().take(2) {
-                wrapped_label(
-                    ui,
-                    RichText::new(address)
-                        .monospace()
-                        .size(scale::RATE_AUX)
-                        .color(scale::INK),
-                );
-            }
-            if more > 0 {
-                wrapped_label(ui, meta_text(format!("另有 {more} 项（未展开）")));
-            }
-        });
-        let copy_id = egui::Id::new("overview-copy-address");
-        let copied_at = ui.data(|data| data.get_temp::<Instant>(copy_id));
-        let just_copied = copied_at.is_some_and(|at| at.elapsed() < Duration::from_secs(2));
-        let label = if just_copied {
-            "已复制".to_owned()
-        } else {
-            TextKey::ButtonCopyAddress.to_string(language)
-        };
-        if ui
-            .add_enabled(!vm.addresses.is_empty(), egui::Button::new(label))
-            .clicked()
-        {
-            ui.ctx().copy_text(vm.addresses.join("\n"));
-            ui.data_mut(|data| data.insert_temp(copy_id, Instant::now()));
-        }
+    if more > 0 {
+        texts.push((
+            format_text_in(language, TextKey::ValueMoreItems, &TextArgs::count(more)).text,
+            egui::FontId::proportional(scale::META),
+            scale::faint(),
+        ));
+    }
+    let galleys: Vec<_> = ui.fonts(|fonts| {
+        texts
+            .into_iter()
+            .map(|(text, font, color)| fonts.layout(text, font, color, text_width))
+            .collect()
     });
+    let text_height = galleys.iter().map(|galley| galley.size().y).sum::<f32>()
+        + spacing.y * galleys.len().saturating_sub(1) as f32;
+    let height = if inline {
+        text_height.max(scale::CONTROL_H)
+    } else {
+        text_height + spacing.y + scale::CONTROL_H
+    };
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        if inline {
+            egui::Layout::left_to_right(egui::Align::Min)
+        } else {
+            egui::Layout::top_down(egui::Align::Min)
+        },
+        |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, text_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(text_width);
+                    for galley in galleys {
+                        ui.add(egui::Label::new(galley));
+                    }
+                },
+            );
+            let button = ui
+                .add_enabled_ui(!vm.addresses.is_empty(), |ui| {
+                    super::components::centered_button(
+                        ui,
+                        label.as_str(),
+                        egui::Button::new("").min_size(egui::vec2(button_width, scale::CONTROL_H)),
+                        egui::vec2(button_width, scale::CONTROL_H),
+                    )
+                })
+                .inner;
+            #[cfg(test)]
+            ui.data_mut(|data| data.insert_temp(copy_id.with("button-rect"), button.rect));
+            if button.clicked() {
+                ui.ctx().copy_text(vm.addresses.join("\n"));
+                ui.data_mut(|data| data.insert_temp(copy_id, Instant::now()));
+            }
+        },
+    )
+    .response
 }
 
 trait LocalizedKeyText {
@@ -1164,23 +1361,12 @@ impl LocalizedKeyText for TextKey {
 mod tests {
     #[test]
     fn overview_fits_narrow_content_without_invalid_column_bounds() {
-        struct Sink;
-        impl crate::app::UiCommandSink for Sink {
-            fn try_send(
-                &self,
-                _: dji4g_application::UiCommand,
-            ) -> Result<(), dji4g_application::UiSendError> {
-                Ok(())
-            }
-        }
         for width in [520.0, 760.0, 1000.0] {
             let context = eframe::egui::Context::default();
-            crate::ui::style_root(&context);
+            crate::ui::apply_style(&context);
             let snapshot = std::sync::Arc::new(
                 dji4g_application::ReducerState::new(std::time::SystemTime::UNIX_EPOCH).snapshot(),
             );
-            let sink =
-                crate::app::PanelApp::from_snapshot(snapshot.clone(), std::sync::Arc::new(Sink));
             let _ = context.run(
                 eframe::egui::RawInput {
                     screen_rect: Some(eframe::egui::Rect::from_min_size(
@@ -1196,7 +1382,6 @@ mod tests {
                             ui,
                             &snapshot,
                             crate::localization::Language::ZhCn,
-                            &sink,
                             &crate::ui::RateHistory::default(),
                             &crate::ui::TemperatureHistory::default(),
                             None,
@@ -1222,7 +1407,7 @@ mod tests {
     use dji4g_at_protocol::SensorTemperature;
     use dji4g_domain::{
         AttachState, CellularSnapshot, FeatureStatus, NumberLookup, PhoneNumber, RegistrationState,
-        SimIdentity, SimState, Timeline, TimelineEvent, TimelineEventKind,
+        SimIdentity, SimState, Timeline, TimelineDetail, TimelineEvent, TimelineEventKind,
     };
     use std::time::{Duration, SystemTime};
 
@@ -1342,15 +1527,24 @@ mod tests {
 
     #[test]
     fn serving_cell_state_phrases_cover_the_known_codes() {
-        assert_eq!(serving_state_phrase("CONNECT"), None);
-        assert_eq!(
-            serving_state_phrase("NOCONN").as_deref(),
-            Some("已驻留（空闲）")
-        );
-        assert_eq!(serving_state_phrase("SEARCH").as_deref(), Some("正在搜索"));
-        assert_eq!(serving_state_phrase("LIMSRV").as_deref(), Some("受限服务"));
-        assert_eq!(serving_state_phrase("NOCELL").as_deref(), Some("无小区"));
-        assert_eq!(serving_state_phrase("WEIRD").as_deref(), Some("WEIRD"));
+        let zh = Language::ZhCn;
+        assert_eq!(serving_state_phrase("CONNECT", zh), None);
+        for (code, key) in [
+            ("NOCONN", crate::localization::TextKey::ServingCampedIdle),
+            ("SEARCH", crate::localization::TextKey::ServingSearching),
+            (
+                "LIMSRV",
+                crate::localization::TextKey::ServingLimitedService,
+            ),
+            ("NOCELL", crate::localization::TextKey::ServingNoCell),
+        ] {
+            assert_eq!(
+                serving_state_phrase(code, zh),
+                Some(crate::localization::LocalizedText::new(zh, key).text),
+                "{code}"
+            );
+        }
+        assert_eq!(serving_state_phrase("WEIRD", zh).as_deref(), Some("WEIRD"));
     }
 
     fn empty_cell(state: Option<&str>) -> dji4g_domain::ServingCell {
@@ -1378,12 +1572,18 @@ mod tests {
     #[test]
     fn serving_cell_text_handles_state_only_and_full_reports() {
         // State-only reports (research §10: SEARCH/LIMSRV are valid states, not errors).
-        for (state, expected) in [
-            ("SEARCH", "正在搜索"),
-            ("LIMSRV", "受限服务"),
-            ("NOCELL", "无小区"),
+        for (state, key) in [
+            ("SEARCH", crate::localization::TextKey::ServingSearching),
+            (
+                "LIMSRV",
+                crate::localization::TextKey::ServingLimitedService,
+            ),
+            ("NOCELL", crate::localization::TextKey::ServingNoCell),
         ] {
-            assert_eq!(serving_cell_text(&empty_cell(Some(state))), expected);
+            assert_eq!(
+                serving_cell_text(&empty_cell(Some(state)), Language::ZhCn),
+                crate::localization::LocalizedText::new(Language::ZhCn, key).text
+            );
         }
 
         // A full NOCONN report renders the idle phrase, the PLMN, hex identifiers and the raw
@@ -1407,10 +1607,17 @@ mod tests {
             sinr_raw: Some(15),
             srxlev_raw: None,
         };
-        let text = serving_cell_text(&full);
+        let text = serving_cell_text(&full, Language::ZhCn);
         assert!(text.contains("LTE"), "RAT first: {text}");
         assert!(
-            text.contains("已驻留（空闲）"),
+            text.contains(
+                crate::localization::LocalizedText::new(
+                    Language::ZhCn,
+                    crate::localization::TextKey::ServingCampedIdle,
+                )
+                .text
+                .as_str()
+            ),
             "NOCONN reads as idle: {text}"
         );
         assert!(
@@ -1429,8 +1636,12 @@ mod tests {
     #[test]
     fn serving_cell_unknown_state_degrades_to_searching_note_without_a_rat() {
         assert_eq!(
-            serving_cell_text(&empty_cell(Some("???"))),
-            "未驻留（搜索中）"
+            serving_cell_text(&empty_cell(Some("???")), Language::ZhCn),
+            crate::localization::LocalizedText::new(
+                Language::ZhCn,
+                crate::localization::TextKey::ServingNotCamped
+            )
+            .text
         );
     }
 
@@ -1469,7 +1680,14 @@ mod tests {
 
         // Without any cellular evidence the row degrades to 未获取.
         let (value, note) = temperature_vm(None, Language::ZhCn);
-        assert_eq!(value.text, "未获取");
+        assert_eq!(
+            value.text,
+            crate::localization::LocalizedText::new(
+                Language::ZhCn,
+                crate::localization::TextKey::ValueNotAvailable
+            )
+            .text
+        );
         assert!(note.is_none());
     }
 
@@ -1558,17 +1776,38 @@ mod tests {
         );
 
         let vm = adapter_metrics_vm(None, Language::ZhCn);
-        assert_eq!(vm.errors.text, "未获取");
-        assert_eq!(vm.discards.text, "未获取");
-        assert_eq!(vm.link_rate.text, "未获取");
+        assert_eq!(
+            vm.errors.text,
+            crate::localization::LocalizedText::new(
+                Language::ZhCn,
+                crate::localization::TextKey::ValueNotAvailable
+            )
+            .text
+        );
+        assert_eq!(
+            vm.discards.text,
+            crate::localization::LocalizedText::new(
+                Language::ZhCn,
+                crate::localization::TextKey::ValueNotAvailable
+            )
+            .text
+        );
+        assert_eq!(
+            vm.link_rate.text,
+            crate::localization::LocalizedText::new(
+                Language::ZhCn,
+                crate::localization::TextKey::ValueNotAvailable
+            )
+            .text
+        );
         assert!(vm.link_note.is_none());
     }
 
-    fn timeline_event(at: SystemTime, detail: &str) -> TimelineEvent {
+    fn timeline_event(at: SystemTime, detail: TimelineDetail) -> TimelineEvent {
         TimelineEvent {
             at,
             kind: TimelineEventKind::CellChanged,
-            detail: detail.to_owned(),
+            detail,
         }
     }
 
@@ -1578,27 +1817,260 @@ mod tests {
         for index in 0..12_u64 {
             timeline.push(timeline_event(
                 SystemTime::UNIX_EPOCH + Duration::from_secs(index),
-                &format!("事件 {index}"),
+                TimelineDetail::Kind,
             ));
         }
         let rows = timeline_rows(&timeline, Language::ZhCn);
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0].time.as_deref(), Some("00:00:11"));
-        assert_eq!(rows[0].text.text, "事件 11");
+        assert_eq!(
+            rows[0].text.text,
+            template(Language::ZhCn, TextKey::TimelineCellChangedDetail)
+        );
         assert_eq!(rows[9].time.as_deref(), Some("00:00:02"));
-        assert_eq!(rows[9].text.text, "事件 2");
+        assert_eq!(
+            rows[9].text.text,
+            template(Language::ZhCn, TextKey::TimelineCellChangedDetail)
+        );
 
         assert!(timeline_rows(&Timeline::new(), Language::ZhCn).is_empty());
     }
 
+    /// The row is written by the page, not by the reducer: the same recorded values read in the
+    /// page's language, with the transition's values in the catalog's `{}` slots.
     #[test]
-    fn timeline_rows_fall_back_to_the_kind_label_without_a_detail_phrase() {
+    fn timeline_rows_render_the_recorded_values_in_the_page_language() {
         let mut timeline = Timeline::new();
-        timeline.push(timeline_event(SystemTime::UNIX_EPOCH, "   "));
-        let rows = timeline_rows(&timeline, Language::ZhCn);
+        timeline.push(TimelineEvent {
+            at: SystemTime::UNIX_EPOCH,
+            kind: TimelineEventKind::RegistrationChanged,
+            detail: TimelineDetail::Registration {
+                from: RegistrationState::Searching,
+                to: RegistrationState::RegisteredHome,
+            },
+        });
+        let zh = timeline_rows(&timeline, Language::ZhCn);
+        assert_eq!(zh[0].text.text, "注册状态：正在搜索 → 已注册到本地网络");
+        assert_eq!(zh[0].text.key, TextKey::TimelineRegistrationChangedDetail);
+
+        let en = timeline_rows(&timeline, Language::EnUs);
         assert_eq!(
-            rows[0].text.text,
-            template(Language::ZhCn, TextKey::TimelineCellChanged)
+            en[0].text.text,
+            "Registration: Searching → Registered on the home network"
         );
+
+        let mut dns = Timeline::new();
+        dns.push(TimelineEvent {
+            at: SystemTime::UNIX_EPOCH,
+            kind: TimelineEventKind::DnsChanged,
+            detail: TimelineDetail::Dns {
+                from: dji4g_domain::BoundDnsStatus::Succeeded,
+                to: dji4g_domain::BoundDnsStatus::Failed,
+            },
+        });
+        assert_eq!(
+            timeline_rows(&dns, Language::ZhCn)[0].text.text,
+            "DNS 探测：通过 → 失败"
+        );
+    }
+}
+
+#[cfg(test)]
+mod address_layout_regressions {
+    use super::*;
+    fn fixture(count: usize, language: Language) -> OverviewVm {
+        let snapshot =
+            dji4g_application::ReducerState::new(std::time::SystemTime::now()).snapshot();
+        let mut vm = overview_vm_with_probes(&snapshot, language, None);
+        vm.addresses = (0..count)
+            .map(|n| format!("2408:845d:b02:89dc:ffff:ffff:ffff:{n:04x}"))
+            .collect();
+        vm
+    }
+    fn address_row_height(height: f32) -> f32 {
+        let ctx = egui::Context::default();
+        crate::ui::apply_style(&ctx);
+        let vm = fixture(4, Language::ZhCn);
+        let mut measured = 0.0;
+        for _ in 0..6 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(540.0, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        info_grid(ui, "address-row-regression", |ui| {
+                            ui.label("IP");
+                            measured = ui
+                                .scope(|ui| {
+                                    render_addresses(ui, &vm, Language::ZhCn);
+                                })
+                                .response
+                                .rect
+                                .height();
+                            ui.end_row();
+                            ui.label("errors");
+                            ui.label("0 / 0");
+                            ui.end_row();
+                        });
+                    });
+                },
+            );
+        }
+        measured
+    }
+    #[test]
+    fn multi_ipv6_row_is_compact_and_independent_of_window_height() {
+        let short = address_row_height(600.0);
+        let tall = address_row_height(1400.0);
+        assert!(short < 100.0, "unexpected address row height: {short}");
+        assert!(
+            (short - tall).abs() < 1.0,
+            "address row expanded with the window: {short} -> {tall}"
+        );
+    }
+    #[test]
+    fn cards_follow_the_shared_breakpoint_in_all_languages_and_tabs() {
+        for width in [759.0, 760.0, 761.0] {
+            for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+                for count in [0, 1, 2, 4] {
+                    for tab in [0_u8, 1] {
+                        let ctx = egui::Context::default();
+                        crate::ui::apply_style(&ctx);
+                        ctx.data_mut(|data| {
+                            data.insert_temp(egui::Id::new("overview-chart-tab"), tab)
+                        });
+                        let vm = fixture(count, language);
+                        for _ in 0..6 {
+                            let _ = ctx.run(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(width, 1800.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    egui::CentralPanel::default()
+                                        .frame(egui::Frame::none())
+                                        .show(ctx, |ui| {
+                                            render_cards(
+                                                ui,
+                                                &vm,
+                                                None,
+                                                language,
+                                                &crate::ui::RateHistory::default(),
+                                                &crate::ui::TemperatureHistory::default(),
+                                                std::time::SystemTime::now(),
+                                            );
+                                        });
+                                },
+                            );
+                        }
+                        let rect = |name: &str| {
+                            ctx.data(|data| {
+                                data.get_temp::<egui::Rect>(egui::Id::new(format!(
+                                    "overview-{name}-rect"
+                                )))
+                                .unwrap()
+                            })
+                        };
+                        let (trend, device, network, timeline) = (
+                            rect("trend"),
+                            rect("device"),
+                            rect("network"),
+                            rect("timeline"),
+                        );
+                        assert!(timeline.top() >= network.bottom() - 1.0);
+                        if width >= super::super::TWO_COLUMN_MIN_WIDTH {
+                            assert!(network.top() >= trend.bottom() - 1.0);
+                            assert!((network.left() - trend.left()).abs() < 1.0);
+                            assert!(device.left() > trend.right());
+                            assert!((device.top() - trend.top()).abs() < 1.0);
+                        } else {
+                            assert!(device.top() >= trend.bottom() - 1.0);
+                            assert!(network.top() >= device.bottom() - 1.0);
+                        }
+                        let button = ctx.data(|data| {
+                            data.get_temp::<egui::Rect>(
+                                egui::Id::new("overview-copy-address").with("button-rect"),
+                            )
+                            .unwrap()
+                        });
+                        assert!(
+                            network.expand(1.0).contains_rect(button),
+                            "button overflow: {width} {language:?} {count} {button:?} vs {network:?}"
+                        );
+                        assert!(network.right() <= width + 1.0, "network overflow: {width}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn address_copy_uses_all_addresses_and_keeps_the_button_slot() {
+        for width in [210.0, 500.0] {
+            for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+                for count in [0, 1, 2, 4] {
+                    let ctx = egui::Context::default();
+                    crate::ui::apply_style(&ctx);
+                    let vm = fixture(count, language);
+                    let frame = |events| {
+                        ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 800.0),
+                                )),
+                                events,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    render_addresses(ui, &vm, language);
+                                });
+                            },
+                        )
+                    };
+                    for _ in 0..4 {
+                        let _ = frame(vec![]);
+                    }
+                    let before = ctx.data(|data| {
+                        data.get_temp::<egui::Rect>(
+                            egui::Id::new("overview-copy-address").with("button-rect"),
+                        )
+                        .unwrap()
+                    });
+                    let point = before.center();
+                    let mut copied = String::new();
+                    for pressed in [true, false] {
+                        let output = frame(vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]);
+                        copied.push_str(&output.platform_output.copied_text);
+                    }
+                    let _ = frame(vec![]);
+                    let after = ctx.data(|data| {
+                        data.get_temp::<egui::Rect>(
+                            egui::Id::new("overview-copy-address").with("button-rect"),
+                        )
+                        .unwrap()
+                    });
+                    assert_eq!(copied, vm.addresses.join("\n"));
+                    assert_eq!(before, after, "copy changed the button slot");
+                }
+            }
+        }
     }
 }

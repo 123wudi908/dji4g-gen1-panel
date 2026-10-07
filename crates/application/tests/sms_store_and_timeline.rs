@@ -20,10 +20,10 @@ use dji4g_application::{
     TargetContext, UiCommand, mask_recipient, reduce_state,
 };
 use dji4g_domain::{
-    AtControlAvailability, AttachState, CellularSnapshot, DJI_GEN1, DevicePresence, FeatureStatus,
-    ProtocolCoverage, RegistrationState, ServingCell, SimIdentity, SimState, SmsDirection,
-    SmsEncoding, SmsMessage, SmsStatus, SmsStorageId, StableDeviceIdentity, TIMELINE_CAPACITY,
-    TimelineEventKind,
+    AtControlAvailability, AttachState, BoundDnsStatus, CellularSnapshot, DJI_GEN1, DevicePresence,
+    FeatureStatus, ProtocolCoverage, RegistrationState, ServingCell, SimIdentity, SimState,
+    SmsDirection, SmsEncoding, SmsMessage, SmsStatus, SmsStorageId, StableDeviceIdentity,
+    TIMELINE_CAPACITY, TimelineDetail, TimelineEventKind,
 };
 
 const NOW: SystemTime = SystemTime::UNIX_EPOCH;
@@ -313,7 +313,7 @@ fn the_store_is_capped_and_evicts_the_oldest_first() {
 // --- Timeline derivation ----------------------------------------------------------------------
 
 #[test]
-fn timeline_records_a_registration_change_with_closed_chinese_wording() {
+fn timeline_records_a_registration_change_with_closed_values_not_wording() {
     let mut state = ReducerState::new(NOW);
     let epoch = DeviceEpoch(1);
     state = reduce_state(
@@ -340,7 +340,13 @@ fn timeline_records_a_registration_change_with_closed_chinese_wording() {
     assert_eq!(timeline.events().len(), 1);
     let event = &timeline.events()[0];
     assert_eq!(event.kind, TimelineEventKind::RegistrationChanged);
-    assert_eq!(event.detail, "注册状态：已注册到本地网络 → 正在搜索");
+    assert_eq!(
+        event.detail,
+        TimelineDetail::Registration {
+            from: RegistrationState::RegisteredHome,
+            to: RegistrationState::Searching,
+        }
+    );
 
     state = reduce_state(
         &state,
@@ -405,7 +411,7 @@ fn timeline_ignores_signal_only_variation_and_records_cell_identity_changes() {
     let timeline = state.snapshot().timeline;
     assert_eq!(timeline.events().len(), 1);
     assert_eq!(timeline.events()[0].kind, TimelineEventKind::CellChanged);
-    assert_eq!(timeline.events()[0].detail, "服务小区已变化");
+    assert_eq!(timeline.events()[0].detail, TimelineDetail::Kind);
 }
 
 #[test]
@@ -445,7 +451,7 @@ fn timeline_records_a_sim_change_through_the_existing_epoch_logic() {
     let timeline = state.snapshot().timeline;
     assert_eq!(timeline.events().len(), 1);
     assert_eq!(timeline.events()[0].kind, TimelineEventKind::SimChanged);
-    assert_eq!(timeline.events()[0].detail, "SIM 已更换");
+    assert_eq!(timeline.events()[0].detail, TimelineDetail::Kind);
 }
 
 #[test]
@@ -468,13 +474,13 @@ fn timeline_records_device_removal_and_reappearance() {
     let timeline = state.snapshot().timeline;
     assert_eq!(timeline.events().len(), 1);
     assert_eq!(timeline.events()[0].kind, TimelineEventKind::DeviceRemoved);
-    assert_eq!(timeline.events()[0].detail, "设备已断开");
+    assert_eq!(timeline.events()[0].detail, TimelineDetail::Kind);
 
     state = with_device(state, DeviceEpoch(2));
     let timeline = state.snapshot().timeline;
     assert_eq!(timeline.events().len(), 2);
     assert_eq!(timeline.events()[1].kind, TimelineEventKind::DeviceArrived);
-    assert_eq!(timeline.events()[1].detail, "设备已重新枚举");
+    assert_eq!(timeline.events()[1].detail, TimelineDetail::Kind);
 }
 
 #[test]
@@ -519,9 +525,15 @@ fn timeline_records_adapter_link_and_dns_changes() {
         timeline.events()[0].kind,
         TimelineEventKind::AdapterLinkChanged
     );
-    assert_eq!(timeline.events()[0].detail, "网卡链路状态变化");
+    assert_eq!(timeline.events()[0].detail, TimelineDetail::Kind);
     assert_eq!(timeline.events()[1].kind, TimelineEventKind::DnsChanged);
-    assert_eq!(timeline.events()[1].detail, "DNS 探测：通过 → 失败");
+    assert_eq!(
+        timeline.events()[1].detail,
+        TimelineDetail::Dns {
+            from: BoundDnsStatus::Succeeded,
+            to: BoundDnsStatus::Failed,
+        }
+    );
 }
 
 #[test]

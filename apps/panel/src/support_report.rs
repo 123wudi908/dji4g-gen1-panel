@@ -9,20 +9,68 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 const SCRIPT: &str = include_str!("../../../packaging/scripts/collect-support-info.ps1");
 const OUTPUT_LIMIT: usize = 512 * 1024;
 const FILE_LIMIT: u64 = 256 * 1024;
-const SECTIONS: &[(&str, &str)] = &[
-    ("system", "系统及程序进程"),
-    ("usb-and-problem-devices", "USB 与异常设备"),
-    ("installed-drivers", "已绑定驱动与 INF"),
-    ("serial-ports", "串口枚举"),
-    ("network-adapters", "网卡与驱动"),
-    ("ip-dns-routes", "IP、DNS 与默认路由"),
-    ("security-products", "安全软件状态"),
-    ("driver-install-events", "Windows 驱动安装记录"),
-    ("bundle-integrity", "程序及驱动文件完整性"),
-];
+/// The report's sections: the collector script's key plus the heading it prints. Built per run so
+/// the headings follow the interface language the export was started in.
+fn sections(language: crate::localization::Language) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "system",
+            t(language, crate::localization::TextKey::ReportSectionSystem),
+        ),
+        (
+            "usb-and-problem-devices",
+            t(language, crate::localization::TextKey::ReportSectionUsb),
+        ),
+        (
+            "installed-drivers",
+            t(language, crate::localization::TextKey::ReportSectionDrivers),
+        ),
+        (
+            "serial-ports",
+            t(language, crate::localization::TextKey::ReportSectionSerial),
+        ),
+        (
+            "network-adapters",
+            t(
+                language,
+                crate::localization::TextKey::ReportSectionAdapters,
+            ),
+        ),
+        (
+            "ip-dns-routes",
+            t(language, crate::localization::TextKey::ReportSectionNetwork),
+        ),
+        (
+            "security-products",
+            t(
+                language,
+                crate::localization::TextKey::ReportSectionSecurity,
+            ),
+        ),
+        (
+            "driver-install-events",
+            t(
+                language,
+                crate::localization::TextKey::ReportSectionDriverHistory,
+            ),
+        ),
+        (
+            "bundle-integrity",
+            t(
+                language,
+                crate::localization::TextKey::ReportSectionIntegrity,
+            ),
+        ),
+    ]
+}
 
 pub enum ReportEvent {
     Progress(String),
@@ -35,6 +83,9 @@ pub struct ReportState {
     pub status: String,
     pub path: Option<PathBuf>,
     history: std::collections::VecDeque<String>,
+    /// The language the export was started in, so progress and result text stay in it even if the
+    /// user switches language while the collector runs.
+    language: crate::localization::Language,
 }
 
 impl ReportState {
@@ -55,25 +106,42 @@ impl ReportState {
         }
     }
 
-    pub fn request(&mut self, directory: Option<PathBuf>, snapshot: Arc<ControllerSnapshot>) {
+    pub fn request(
+        &mut self,
+        language: crate::localization::Language,
+        directory: Option<PathBuf>,
+        snapshot: Arc<ControllerSnapshot>,
+    ) {
+        self.language = language;
         if self.busy() {
             return;
         }
         self.path = None;
         let Some(directory) = directory else {
-            self.status = "无法导出：当前用户的日志目录不可用".into();
+            self.status = t(
+                self.language,
+                crate::localization::TextKey::ReportNoLogDirectory,
+            );
             return;
         };
         match start(
+            self.language,
             directory,
             snapshot,
             self.history.iter().cloned().collect::<Vec<_>>().join("\n"),
         ) {
             Ok(receiver) => {
                 self.receiver = Some(receiver);
-                self.status = "正在准备详细日志…".into();
+                self.status = t(self.language, crate::localization::TextKey::ReportPreparing);
             }
-            Err(error) => self.status = format!("无法启动导出：{error}"),
+            Err(error) => {
+                let detail = error.to_string();
+                self.status = crate::localization::format_positional(
+                    self.language,
+                    crate::localization::TextKey::ReportStartFailed,
+                    &[&detail],
+                )
+            }
         }
     }
 
@@ -84,18 +152,29 @@ impl ReportState {
             };
             match receiver.try_recv() {
                 Ok(ReportEvent::Progress(text)) => {
-                    self.status = format!("正在导出详细日志 · {text}")
+                    self.status = crate::localization::format_positional(
+                        self.language,
+                        crate::localization::TextKey::ReportExporting,
+                        &[&text],
+                    )
                 }
                 Ok(ReportEvent::Finished(result)) => {
                     self.receiver = None;
                     match result {
                         Ok(path) => {
-                            self.status = format!("详细日志已导出：{}", path.display());
+                            self.status = crate::localization::format_positional(
+                                self.language,
+                                crate::localization::TextKey::ReportExported,
+                                &[&path.display().to_string()],
+                            );
                             self.path = Some(path);
                         }
                         Err(error) => {
-                            self.status =
-                                format!("导出未完成：{error}（已生成的部分报告保留在导出目录）")
+                            self.status = crate::localization::format_positional(
+                                self.language,
+                                crate::localization::TextKey::ReportIncomplete,
+                                &[&error],
+                            )
                         }
                     }
                     return;
@@ -103,7 +182,10 @@ impl ReportState {
                 Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.receiver = None;
-                    self.status = "导出线程提前结束，部分报告保留在导出目录".into();
+                    self.status = t(
+                        self.language,
+                        crate::localization::TextKey::ReportThreadEnded,
+                    );
                     return;
                 }
             }
@@ -130,6 +212,7 @@ pub fn open_report_folder(path: &Path) -> io::Result<()> {
 /// Called on the UI thread, but performs all I/O on a separate worker. A stalled
 /// controller is never asked to service this request.
 pub fn start(
+    language: crate::localization::Language,
     directory: PathBuf,
     snapshot: Arc<ControllerSnapshot>,
     history: String,
@@ -138,7 +221,7 @@ pub fn start(
     std::thread::Builder::new()
         .name("support-report".into())
         .spawn(move || {
-            let result = collect(&directory, &snapshot, &history, |text| {
+            let result = collect(language, &directory, &snapshot, &history, |text| {
                 let _ = tx.send(ReportEvent::Progress(text));
             })
             .map_err(|error| error.to_string());
@@ -287,13 +370,18 @@ fn run_bounded(command: &mut Command, timeout: Duration) -> String {
 }
 
 pub fn collect(
+    language: crate::localization::Language,
     directory: &Path,
     snapshot: &ControllerSnapshot,
     history: &str,
     mut progress: impl FnMut(String),
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(directory)?;
-    let name = format!("大疆4G详细诊断-{}-{}.txt", millis(), std::process::id());
+    let name = crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::ReportFileName,
+        &[&millis().to_string(), &std::process::id().to_string()],
+    );
     let path = directory.join(name);
     let mut output = OpenOptions::new()
         .write(true)
@@ -305,32 +393,49 @@ pub fn collect(
         .ok_or_else(|| io::Error::other("executable directory missing"))?;
     writeln!(
         output,
-        "DJI 4G SUPPORT REPORT schema=1\nREPORT_STARTED unix_ms={}\napp_version={} exe={} pid={} architecture={}\n包含设备实例 ID、硬件 ID、驱动、网络配置及本程序日志。请仅发给排障人员。\n不读取短信正文、通讯录、SIM 号码或口令；不安装驱动、不修改网络、不发送 AT 命令。\n某节失败或超时不会阻止其他节导出。文件末尾 REPORT_COMPLETE 表示收集流程结束，不代表设备正常。\n",
-        millis(),
-        env!("CARGO_PKG_VERSION"),
-        exe.display(),
-        std::process::id(),
-        std::env::consts::ARCH
+        "{}",
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ReportHeader,
+            &[
+                &millis().to_string(),
+                env!("CARGO_PKG_VERSION"),
+                &exe.display().to_string(),
+                &std::process::id().to_string(),
+                std::env::consts::ARCH,
+            ],
+        )
     )?;
     let summary = crate::diagnostics_export::build(snapshot, SystemTime::now());
-    section(&mut output, "界面诊断摘要", &summary.human)?;
-    section(&mut output, "机器可读快照", &summary.json)?;
     section(
         &mut output,
-        "检测阶段、时间、错误码和设备绑定",
+        &t(language, crate::localization::TextKey::ReportUiSummary),
+        &summary.human,
+    )?;
+    section(
+        &mut output,
+        &t(
+            language,
+            crate::localization::TextKey::ReportMachineSnapshot,
+        ),
+        &summary.json,
+    )?;
+    section(
+        &mut output,
+        &t(language, crate::localization::TextKey::ReportSnapshotNote),
         &snapshot_detail(snapshot),
     )?;
     section(
         &mut output,
-        "最近检测状态变化（仅本次进程已观察到的变化）",
+        &t(language, crate::localization::TextKey::ReportTimelineNote),
         history,
     )?;
-    progress("收集程序及驱动安装日志".into());
+    progress(t(language, crate::localization::TextKey::ReportCollectLogs));
     let log_root = directory.parent().map(|parent| parent.join("logs"));
     if let Some(root) = log_root {
-        collect_logs(&mut output, &root, "dji4g-panel", 5)?;
+        collect_logs(language, &mut output, &root, "dji4g-panel", 5)?;
     }
-    collect_logs(&mut output, app_root, "driver-setup-", 8)?;
+    collect_logs(language, &mut output, app_root, "driver-setup-", 8)?;
     // The user may have used an older standalone/setup build before this one.
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         for family in ["standalone", "versions"] {
@@ -354,29 +459,34 @@ pub fn collect(
                         )
                     });
                     if dirs.len() > 12 {
+                        let capped = t(language, crate::localization::TextKey::ReportHistoryCapped);
                         section(
                             &mut output,
-                            "历史安装日志范围",
-                            "目录超过 12 个，仅收集最近 12 个版本",
+                            &t(language, crate::localization::TextKey::ReportHistoryScope),
+                            &capped,
                         )?;
                     }
                     for entry in dirs.into_iter().take(12) {
                         if entry.path() != app_root {
-                            collect_logs(&mut output, &entry.path(), "driver-setup-", 2)?;
+                            collect_logs(language, &mut output, &entry.path(), "driver-setup-", 2)?;
                         }
                     }
                 }
                 Err(error) => section(
                     &mut output,
-                    "历史安装日志",
+                    &t(language, crate::localization::TextKey::ReportHistoryHeading),
                     &format!("{}: {error}", root.display()),
                 )?,
             }
         }
     }
     let shell = dji4g_windows_platform::driver_setup_powershell();
-    for (index, (id, title)) in SECTIONS.iter().enumerate() {
-        progress(format!("{}/{}：{title}", index + 1, SECTIONS.len()));
+    for (index, (id, title)) in sections(language).iter().enumerate() {
+        progress(format!(
+            "{}/{} · {title}",
+            index + 1,
+            sections(language).len()
+        ));
         let result = match &shell {
             Ok(shell) => run_bounded(
                 Command::new(shell)
@@ -407,6 +517,7 @@ fn section(output: &mut impl Write, title: &str, content: &str) -> io::Result<()
 }
 
 fn collect_logs(
+    language: crate::localization::Language,
     output: &mut impl Write,
     root: &Path,
     prefix: &str,
@@ -414,7 +525,13 @@ fn collect_logs(
 ) -> io::Result<()> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) => return section(output, "日志目录", &format!("{}: {error}", root.display())),
+        Err(error) => {
+            return section(
+                output,
+                &t(language, crate::localization::TextKey::ReportLogDirectory),
+                &format!("{}: {error}", root.display()),
+            );
+        }
     };
     let mut files: Vec<_> = entries
         .filter_map(Result::ok)
@@ -437,7 +554,10 @@ fn collect_logs(
     });
     section(
         output,
-        "日志收集范围",
+        &t(
+            language,
+            crate::localization::TextKey::ReportCollectionScope,
+        ),
         &format!(
             "directory={} matched={} selected_limit={max_files} tail_byte_limit={FILE_LIMIT}",
             root.display(),
@@ -596,7 +716,14 @@ mod tests {
         )
         .unwrap();
         let mut output = Vec::new();
-        collect_logs(&mut output, &root, "dji4g-panel", 5).unwrap();
+        collect_logs(
+            crate::localization::Language::ZhCn,
+            &mut output,
+            &root,
+            "dji4g-panel",
+            5,
+        )
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("error=28"));
         assert!(text.contains("tail_only=true"));

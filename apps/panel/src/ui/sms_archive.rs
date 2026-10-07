@@ -1,7 +1,13 @@
 //! A read-only personal history surface. It never constructs live module commands.
+use super::modal;
 use crate::sms_archive::ArchiveService;
 use eframe::egui::{self, Ui};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Default)]
 pub(crate) struct ArchiveUi {
@@ -25,35 +31,52 @@ pub(crate) enum ArchiveAction {
 
 pub(crate) fn render(
     ui: &mut Ui,
+    language: crate::localization::Language,
     archive: Option<&ArchiveService>,
     state: &mut ArchiveUi,
 ) -> Option<ArchiveAction> {
-    ui.heading("本地历史");
-    ui.label("开启后，已读到的收件短信会保存在这台电脑。断开模块或重启软件后仍可查看；这里不能删除模块中的短信。");
-    ui.small("仅当前 Windows 用户可解密；最多保存 5000 条，超过保存日期 90 天自动清除。关闭保存不会删除已有历史。");
+    ui.heading(t(language, crate::localization::TextKey::ArchiveHeading));
+    ui.label(t(language, crate::localization::TextKey::ArchiveIntro));
+    ui.small(t(language, crate::localization::TextKey::ArchiveRetention));
     let Some(archive) = archive else {
-        ui.label("本地历史暂不可用：无法确定用户目录，或当前处于模拟演示。");
+        ui.label(t(
+            language,
+            crate::localization::TextKey::ArchiveUnavailable,
+        ));
         return None;
     };
     let mut action = None;
     let mut enabled = archive.enabled();
     if ui
-        .checkbox(&mut enabled, "在这台电脑保存短信历史（可随时关闭）")
+        .checkbox(
+            &mut enabled,
+            t(language, crate::localization::TextKey::ArchiveToggle),
+        )
         .changed()
     {
         action = Some(ArchiveAction::SetEnabled(enabled));
     }
-    ui.label(archive.status());
+    // The service reports stable codes; the panel turns them into prose in the current language.
+    let status = crate::localization::stable_code_text(archive.status()).map_or_else(
+        || archive.status().to_owned(),
+        |key| crate::localization::LocalizedText::new(language, key).text,
+    );
+    ui.label(status);
     if let Some(error) = &state.error {
         ui.colored_label(super::StatusTone::Negative.color(), error);
     }
     if let Some(path) = &state.export_path {
-        ui.label(format!("导出目标：{}", path.display()));
+        let target = path.display().to_string();
+        ui.label(crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ArchiveExportTarget,
+            &[&target],
+        ));
     }
     ui.horizontal_wrapped(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut state.search)
-                .hint_text("搜索号码或正文")
+                .hint_text(t(language, crate::localization::TextKey::ArchiveSearchHint))
                 .desired_width(200.0),
         );
         super::components::segmented_control(
@@ -61,22 +84,34 @@ pub(crate) fn render(
             egui::Id::new("archive-date-filter"),
             &mut state.days,
             &[
-                super::components::TabItem::new(0, "全部历史"),
-                super::components::TabItem::new(7, "近 7 天保存"),
-                super::components::TabItem::new(30, "近 30 天保存"),
+                super::components::TabItem::new(
+                    0,
+                    t(language, crate::localization::TextKey::ArchiveFilterAll),
+                ),
+                super::components::TabItem::new(
+                    7,
+                    t(language, crate::localization::TextKey::ArchiveFilterWeek),
+                ),
+                super::components::TabItem::new(
+                    30,
+                    t(language, crate::localization::TextKey::ArchiveFilterMonth),
+                ),
             ],
         );
         if ui
             .add_enabled(
                 !archive.busy() && !archive.rows().is_empty(),
-                egui::Button::new("导出 TXT"),
+                egui::Button::new(t(language, crate::localization::TextKey::ArchiveExportTxt)),
             )
             .clicked()
         {
             state.confirm = Some(Confirmation::Export);
         }
         if ui
-            .add_enabled(!archive.busy(), egui::Button::new("清空本地历史"))
+            .add_enabled(
+                !archive.busy(),
+                egui::Button::new(t(language, crate::localization::TextKey::ArchiveClear)),
+            )
             .clicked()
         {
             state.confirm = Some(Confirmation::Clear);
@@ -99,55 +134,102 @@ pub(crate) fn render(
                     || row.body().to_lowercase().contains(&query))
         })
         .collect::<Vec<_>>();
-    ui.label(format!(
-        "显示 {} / {} 条 · 按保存顺序排列",
-        rows.len(),
-        archive.rows().len()
+    let shown = rows.len().to_string();
+    let saved = archive.rows().len().to_string();
+    ui.label(crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::ArchiveCount,
+        &[&shown, &saved],
     ));
     if rows.is_empty() {
-        ui.label(if archive.rows().is_empty() { "暂无本地历史。开启保存后，在“模块短信”中读取短信即可；无法找回模块中已被删除且未保存的消息。" } else { "没有符合筛选条件的记录。" });
+        let empty = if archive.rows().is_empty() {
+            t(language, crate::localization::TextKey::ArchiveEmpty)
+        } else {
+            t(language, crate::localization::TextKey::ArchiveNoMatch)
+        };
+        ui.label(empty);
     }
     egui::ScrollArea::vertical()
         .id_salt("archive-rows")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for row in &rows {
-                egui::CollapsingHeader::new(format!(
-                    "{}    {}{}",
-                    row.sender(),
-                    row.reported_timestamp().unwrap_or("发送时间未提供"),
-                    if row.incomplete() {
-                        " · 分片未齐"
+                // A stored message is a flat, always-open card: the sender/timestamp line is the
+                // card's heading and the body is readable without a disclosure click.  The body and
+                // source note keep the quiet tiers so an always-visible list stays scannable.
+                super::section_frame(ui, |ui| {
+                    let timestamp =
+                        row.reported_timestamp()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                t(language, crate::localization::TextKey::ArchiveNoTimestamp)
+                            });
+                    let incomplete = if row.incomplete() {
+                        t(language, crate::localization::TextKey::ArchiveIncompleteTag)
                     } else {
-                        ""
-                    }
-                ))
-                .id_salt(("archive-row", row.stable_id()))
-                .show(ui, |ui| {
-                    ui.label(row.body());
-                    ui.small(format!("来源分组：{} · 历史副本", row.context_label()));
-                    if ui.button("复制正文").clicked() {
+                        String::new()
+                    };
+                    ui.label(super::section_heading(format!(
+                        "{}    {timestamp}{incomplete}",
+                        row.sender(),
+                    )));
+                    super::wrapped_label(ui, super::detail_text(row.body()));
+                    let group = row.context_label();
+                    ui.label(super::meta_text(crate::localization::format_positional(
+                        language,
+                        crate::localization::TextKey::ArchiveSourceGroup,
+                        &[&group],
+                    )));
+                    if ui
+                        .button(t(language, crate::localization::TextKey::ArchiveCopyBody))
+                        .clicked()
+                    {
                         ui.ctx().copy_text(row.body().to_owned());
                     }
                 });
             }
         });
     if let Some(confirm) = state.confirm {
-        egui::Window::new(match confirm { Confirmation::Clear => "清空本地历史", Confirmation::Export => "导出短信明文" })
-            .collapsible(false).resizable(false).default_width(370.0).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ui.ctx(), |ui| {
-                ui.label(match confirm {
-                    Confirmation::Clear => "将删除这台电脑保存的全部短信历史，并关闭后续保存。模块中的短信不受影响。此操作无法撤销。",
-                    Confirmation::Export => "将全部已保存历史（包含号码和正文）导出为未加密 TXT。请妥善保管，分享前检查隐私。",
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() { state.confirm = None; }
-                    if ui.add_enabled(!archive.busy(), egui::Button::new(match confirm { Confirmation::Clear => "确认清空", Confirmation::Export => "确认导出全部" })).clicked() {
-                        state.confirm = None;
-                        action = Some(match confirm { Confirmation::Clear => ArchiveAction::Clear, Confirmation::Export => ArchiveAction::Export });
-                    }
-                });
-            });
+        let (title, description, confirm_label, confirmed_action) = match confirm {
+            Confirmation::Clear => (
+                t(language, crate::localization::TextKey::ArchiveClear),
+                t(
+                    language,
+                    crate::localization::TextKey::ArchiveClearDescription,
+                ),
+                t(language, crate::localization::TextKey::ArchiveClearConfirm),
+                ArchiveAction::Clear,
+            ),
+            Confirmation::Export => (
+                t(language, crate::localization::TextKey::ArchiveExportTitle),
+                t(
+                    language,
+                    crate::localization::TextKey::ArchiveExportDescription,
+                ),
+                t(language, crate::localization::TextKey::ArchiveExportConfirm),
+                ArchiveAction::Export,
+            ),
+        };
+        let confirm_action = match confirm {
+            Confirmation::Clear => modal::DialogAction::destructive(&confirm_label),
+            Confirmation::Export => modal::DialogAction::primary(&confirm_label),
+        };
+        let cancel_label = t(language, crate::localization::TextKey::ArchiveCancel);
+        let outcome = modal::show(
+            ui.ctx(),
+            &modal::Dialog::new("sms-archive-confirmation", &title).description(&description),
+            |_ui| {},
+            &[
+                confirm_action.enabled(!archive.busy()),
+                modal::DialogAction::cancel(&cancel_label),
+            ],
+        );
+        if outcome.dismissed() {
+            state.confirm = None;
+        }
+        if outcome.chosen() == Some(0) {
+            action = Some(confirmed_action);
+        }
     }
     action
 }
@@ -156,73 +238,73 @@ pub(crate) fn render(
 mod tests {
     use super::*;
 
+    /// Every stored message is a flat, always-open card, so the sender line and the body are
+    /// painted on the first frame with no click.  Filtering narrows the list; it can no longer
+    /// change whether a listed message is open, because there is no disclosure state left.
     #[test]
-    fn filtering_keeps_the_same_message_open_and_does_not_open_a_different_message() {
+    fn history_rows_show_sender_and_body_without_a_disclosure_click() {
         let archive = ArchiveService::review_fixture(true);
-        let target = archive.rows()[1].sender().to_owned();
-        let body = archive.rows()[1].body().to_owned();
+        let first = archive.rows()[0].sender().to_owned();
+        let second = archive.rows()[1].sender().to_owned();
+        let body = archive.rows()[0].body().to_owned();
         let context = egui::Context::default();
         context.style_mut(|style| style.animation_time = 0.0);
         let mut state = ArchiveUi::default();
-        let render_frame = |state: &mut ArchiveUi, events: Vec<egui::Event>| {
+        let render_frame = |state: &mut ArchiveUi| {
             context.run(
                 egui::RawInput {
-                    events,
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(900.0, 700.0),
+                        egui::vec2(900.0, 900.0),
                     )),
                     ..Default::default()
                 },
                 |context| {
                     egui::CentralPanel::default().show(context, |ui| {
-                        assert!(render(ui, Some(&archive), state).is_none());
+                        assert!(
+                            render(
+                                ui,
+                                crate::localization::Language::ZhCn,
+                                Some(&archive),
+                                state,
+                            )
+                            .is_none()
+                        );
                     });
                 },
             )
         };
-        render_frame(&mut state, vec![]);
-        let output = render_frame(&mut state, vec![]);
-        let point = output
-            .shapes
-            .iter()
-            .find_map(|shape| {
-                if let egui::Shape::Text(text) = &shape.shape
-                    && text.galley.text().starts_with(&target)
-                {
-                    Some(text.pos + text.galley.size() * 0.5)
-                } else {
-                    None
-                }
-            })
-            .expect("target history row should be visible");
-        for pressed in [true, false] {
-            render_frame(
-                &mut state,
-                vec![
-                    egui::Event::PointerMoved(point),
-                    egui::Event::PointerButton {
-                        pos: point,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
+        let texts = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let shown = texts(&render_frame(&mut state));
+        for sender in [&first, &second] {
+            assert!(
+                shown.iter().any(|text| text.starts_with(sender.as_str())),
+                "row heading for {sender} should be visible"
             );
         }
-        let contains_body = |output: &egui::FullOutput| {
-            output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == body))
-        };
-        assert!(contains_body(&render_frame(&mut state, vec![])));
-        state.search = target;
         assert!(
-            contains_body(&render_frame(&mut state, vec![])),
-            "filtering changes the row index, not its open state"
+            shown.iter().filter(|text| **text == body).count() >= 3,
+            "every stored body should be visible without a click"
         );
-        state.search = archive.rows()[0].sender().to_owned();
+        state.search = first.clone();
+        let filtered = texts(&render_frame(&mut state));
+        assert!(filtered.iter().any(|text| text.starts_with(&first)));
         assert!(
-            !contains_body(&render_frame(&mut state, vec![])),
-            "a different message must keep its own closed state"
+            !filtered.iter().any(|text| text.starts_with(&second)),
+            "filtering still narrows the list"
+        );
+        assert!(
+            filtered.contains(&body),
+            "a listed message keeps showing its body"
         );
     }
 }

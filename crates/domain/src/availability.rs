@@ -25,6 +25,9 @@ pub enum LimitedReason {
     CompetingDefaultRoute,
     AtControlUnavailable,
     IncompleteEvidence,
+    /// The module answered every read-only check, but it is a recognized read-only module: the
+    /// panel inspects it and never writes to it.
+    ReadOnlyModule,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,14 +85,29 @@ fn classify_status(input: &ClassificationInput, now: SystemTime) -> Availability
         return Availability::Detecting;
     };
 
-    match &device_presence.value {
-        DevicePresence::Supported(profile) if *profile == crate::DJI_GEN1 => {}
+    let read_only = match &device_presence.value {
+        // Every recognized profile (DJI 一代 and the read-only generic module) may reach the
+        // read-only classification below; recognition is not write eligibility.
+        DevicePresence::Supported(profile) => !profile.allows_controlled_actions(),
         DevicePresence::NotDetected => return Availability::NotDetected,
         DevicePresence::Unsupported { .. } => return Availability::UnsupportedDevice,
         DevicePresence::PermissionDenied => return Availability::Detecting,
-        DevicePresence::Supported(_) => return Availability::UnsupportedDevice,
-    }
+    };
 
+    let status = classify_data_path(input, now);
+    if read_only && status == Availability::Available {
+        // A recognized read-only module may be *inspected*, and its real data path may well be
+        // perfect, but it must never read as fully `Available`: that verdict is the master enable
+        // for the write, repair and driver surfaces.  Reporting the read-only limitation here keeps
+        // the honest data-path verdict for every worse outcome (`Limited`/`Unavailable` are
+        // returned unchanged) while never unlocking a write for this module.
+        return Availability::Limited(LimitedReason::ReadOnlyModule);
+    }
+    status
+}
+
+/// The data-path verdict, independent of whether the identified module may be written to.
+fn classify_data_path(input: &ClassificationInput, now: SystemTime) -> Availability {
     if input.phase != ClassificationPhase::Stable {
         return Availability::Detecting;
     }
@@ -253,8 +271,9 @@ fn at_control_known_unavailable(input: &ClassificationInput, now: SystemTime) ->
 
 /// The honest "the full data path could not be proven" verdict for a device that *is* recognized.
 ///
-/// Every call site is reached only after `DevicePresence::Supported(DJI_GEN1)`, a fresh supported
-/// target identity, and `ClassificationPhase::Stable`, so the device is known to be present.  When
+/// Every call site is reached only after `DevicePresence::Supported(<a recognized profile>)`, a
+/// fresh supported target identity, and `ClassificationPhase::Stable`, so the device is known to
+/// be present.  When
 /// the AT port is additionally known to be unavailable, that concrete fact is reported instead of
 /// the generic incomplete-evidence wording, which would otherwise hide an actionable hardware/driver
 /// fault behind 「现有证据不足」.

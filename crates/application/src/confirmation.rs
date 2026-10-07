@@ -492,7 +492,10 @@ pub(crate) fn build_plan(
         summary: PreparedActionSnapshot {
             id,
             action: tag,
-            target_profile: DeviceProfile::DJI_GEN1,
+            // `ActionPlan::try_new` accepted the plan, so the target proves a profile the panel
+            // may write to (today only `DJI_GEN1`). Report the proven profile rather than
+            // assuming it.
+            target_profile: plan.target.profile().unwrap_or(DeviceProfile::DJI_GEN1),
             based_on_revision: plan.snapshot_revision,
             expires_at: plan.expires_at,
             disruption,

@@ -10,13 +10,11 @@ use eframe::egui::{self, RichText, Ui};
 
 use crate::{app::UiCommandSink, localization::Language};
 
-use super::{StatusTone, section_frame, wrapped_label};
+use super::{StatusTone, detail_text, section_frame, section_heading, wrapped_label};
 
-fn copy(language: Language, zh: &'static str, en: &'static str) -> &'static str {
-    match language {
-        Language::ZhCn => zh,
-        Language::EnUs => en,
-    }
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
 }
 
 fn busy(phase: HostNetworkPhase) -> bool {
@@ -41,36 +39,22 @@ pub fn brief(
             StatusTone::Progress,
             match host.phase {
                 HostNetworkPhase::Preparing => {
-                    copy(language, "正在准备修复方案…", "Preparing the repair plan…")
+                    t(language, crate::localization::TextKey::HostPreparingPlan)
                 }
-                HostNetworkPhase::Applying => copy(
-                    language,
-                    "正在备份并修复代理配置…",
-                    "Backing up and repairing proxy configuration…",
-                ),
-                HostNetworkPhase::Restoring => copy(
-                    language,
-                    "正在恢复原配置…",
-                    "Restoring the original configuration…",
-                ),
-                _ => copy(
-                    language,
-                    "正在检查电脑网络与代理设置…",
-                    "Checking computer network and proxy settings…",
-                ),
-            }
-            .into(),
+                HostNetworkPhase::Applying => {
+                    t(language, crate::localization::TextKey::HostBackingUp)
+                }
+                HostNetworkPhase::Restoring => {
+                    t(language, crate::localization::TextKey::HostRestoring)
+                }
+                _ => t(language, crate::localization::TextKey::HostChecking),
+            },
         );
     }
     if host.phase == HostNetworkPhase::AwaitingRestart {
         return (
             StatusTone::Caution,
-            copy(
-                language,
-                "代理配置已修改；重启代理后请重新检查。",
-                "Proxy configuration changed. Restart the client, then check again.",
-            )
-            .into(),
+            t(language, crate::localization::TextKey::HostConfigChanged),
         );
     }
     if let Some(code) = &host.error_code {
@@ -78,34 +62,20 @@ pub fn brief(
             StatusTone::Caution,
             format!(
                 "{} ({code})",
-                copy(
-                    language,
-                    "本次电脑网络检查或修复未完成",
-                    "Computer network check or repair did not finish"
-                )
+                t(language, crate::localization::TextKey::HostNotFinished)
             ),
         );
     }
     let Some(observation) = &host.observation else {
         return (
             StatusTone::Neutral,
-            copy(
-                language,
-                "电脑网络与代理尚未检查。",
-                "Computer network and proxy have not been checked.",
-            )
-            .into(),
+            t(language, crate::localization::TextKey::HostNotChecked),
         );
     };
     if !host_observation_is_fresh(observation.observed_at, now) {
         return (
             StatusTone::Caution,
-            copy(
-                language,
-                "电脑网络信息已过期，请重新检查。",
-                "Computer network information is stale. Check again.",
-            )
-            .into(),
+            t(language, crate::localization::TextKey::HostStale),
         );
     }
     if let Some(binding) = &observation.binding
@@ -113,54 +83,35 @@ pub fn brief(
     {
         return (
             StatusTone::Caution,
-            match language {
-                Language::ZhCn => format!(
-                    "磁盘配置引用了网卡“{}”，尚未核实当前运行态。",
-                    binding.interface_alias
-                ),
-                Language::EnUs => format!(
-                    "Disk configuration references adapter '{}'; the current runtime is unverified.",
-                    binding.interface_alias
-                ),
-            },
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::HostConfiguredAdapterRef,
+                &[&binding.interface_alias],
+            ),
         );
     }
     match host.finding {
         Some(HostNetworkFinding::MissingBoundInterface) => {
             let module = if snapshot.app.availability == Availability::Available {
-                copy(language, "模块连接正常；", "The module connection passed; ")
+                t(language, crate::localization::TextKey::HostModulePassed)
             } else {
-                ""
+                String::new()
             };
             (
                 StatusTone::Negative,
                 format!(
                     "{module}{}",
-                    copy(
-                        language,
-                        "代理软件指定的出口网卡已不存在。",
-                        "the proxy client references a missing network adapter."
-                    )
+                    t(language, crate::localization::TextKey::HostMissingAdapter)
                 ),
             )
         }
         Some(HostNetworkFinding::BoundInterfaceDown) => (
             StatusTone::Caution,
-            copy(
-                language,
-                "代理指定的网卡仍在电脑上，但当前未连接或已禁用。",
-                "The proxy-bound adapter exists but is down or disabled.",
-            )
-            .into(),
+            t(language, crate::localization::TextKey::HostAdapterDown),
         ),
         Some(HostNetworkFinding::BindingAmbiguous | HostNetworkFinding::EvidenceIncomplete) => (
             StatusTone::Caution,
-            copy(
-                language,
-                "暂时无法确定代理出口问题，请查看处理步骤。",
-                "The proxy outlet could not be determined; see guidance.",
-            )
-            .into(),
+            t(language, crate::localization::TextKey::HostOutletUnknown),
         ),
         _ => {
             let tun = snapshot.app.network.as_ref().is_some_and(|network| {
@@ -170,47 +121,34 @@ pub fn brief(
                 )
             });
             if tun {
-                (StatusTone::Neutral, copy(language, "电脑正在通过代理或 VPN 接口联网；模块通路单独检查。", "A proxy or VPN interface is in use; the module path is checked separately.").into())
+                (
+                    StatusTone::Neutral,
+                    t(language, crate::localization::TextKey::HostProxyInUse),
+                )
             } else {
                 (
                     StatusTone::Neutral,
-                    copy(
-                        language,
-                        "未发现已知的固定出口网卡问题。",
-                        "No known fixed-outlet adapter problem was found.",
-                    )
-                    .into(),
+                    t(language, crate::localization::TextKey::HostNoKnownProblem),
                 )
             }
         }
     }
 }
 
-pub(crate) fn render_brief(
-    ui: &mut Ui,
-    snapshot: &ControllerSnapshot,
-    now: SystemTime,
-    language: Language,
-) -> bool {
-    let (tone, message) = brief(snapshot, now, language);
-    let mut open = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.colored_label(tone.color(), format!("{} {message}", tone.marker()));
-        if ui
-            .button(copy(language, "电脑网络详情", "Computer network details"))
-            .clicked()
-        {
-            open = true;
-        }
-    });
-    open
-}
-
-fn send(ui: &mut Ui, sink: &dyn UiCommandSink, command: UiCommand) {
+fn send(ui: &mut Ui, language: Language, sink: &dyn UiCommandSink, command: UiCommand) {
     let id = egui::Id::new("host-network-send-error");
     match sink.try_send(command) {
         Ok(()) => ui.data_mut(|data| data.remove::<String>(id)),
-        Err(_) => ui.data_mut(|data| data.insert_temp(id, "命令未提交，请稍后重试。".to_owned())),
+        Err(_) => ui.data_mut(|data| {
+            data.insert_temp(
+                id,
+                t(
+                    language,
+                    crate::localization::TextKey::HostCommandNotSubmitted,
+                )
+                .to_owned(),
+            )
+        }),
     }
 }
 
@@ -224,11 +162,7 @@ pub(crate) fn render(
     let host = &snapshot.host_network;
     let busy = busy(host.phase);
     section_frame(ui, |ui| {
-        ui.heading(copy(
-            language,
-            "电脑网络与代理",
-            "Computer network and proxy",
-        ));
+        ui.heading(t(language, crate::localization::TextKey::HostHeading));
         let (tone, message) = brief(snapshot, now, language);
         wrapped_label(
             ui,
@@ -237,22 +171,18 @@ pub(crate) fn render(
         if snapshot.app.device.is_none() {
             wrapped_label(
                 ui,
-                copy(
-                    language,
-                    "未连接模块，仍可检查电脑网络与代理设置。",
-                    "No module is connected. Computer and proxy checks remain available.",
-                ),
+                t(language, crate::localization::TextKey::HostNoModuleHint),
             );
         }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(copy(language, "重新检查", "Check again")),
+                    egui::Button::new(t(language, crate::localization::TextKey::HostCheckAgain)),
                 )
                 .clicked()
             {
-                send(ui, sink, UiCommand::InspectHostNetwork);
+                send(ui, language, sink, UiCommand::InspectHostNetwork);
             }
             if host.finding == Some(HostNetworkFinding::MissingBoundInterface)
                 && host
@@ -267,10 +197,15 @@ pub(crate) fn render(
                 && host.phase == HostNetworkPhase::Ready
                 && let Some(finding_id) = host.finding_id
                 && ui
-                    .button(copy(language, "查看修复方案", "Review repair"))
+                    .button(t(language, crate::localization::TextKey::HostReviewRepair))
                     .clicked()
             {
-                send(ui, sink, UiCommand::PrepareProxyRepair { finding_id });
+                send(
+                    ui,
+                    language,
+                    sink,
+                    UiCommand::PrepareProxyRepair { finding_id },
+                );
             }
         });
         if let Some(error) =
@@ -284,28 +219,24 @@ pub(crate) fn render(
         {
             ui.separator();
             let mode = match observation.system_proxy {
-                HostProxyMode::Disabled => copy(language, "未开启", "Off"),
-                HostProxyMode::Manual => copy(language, "手动代理", "Manual"),
-                HostProxyMode::AutoConfig => copy(
-                    language,
-                    "自动配置脚本；未执行脚本",
-                    "Automatic script; script not executed",
-                ),
-                HostProxyMode::AutoDetect => {
-                    copy(language, "自动检测；尚未验证", "Auto-detect; not verified")
+                HostProxyMode::Disabled => t(language, crate::localization::TextKey::HostProxyOff),
+                HostProxyMode::Manual => t(language, crate::localization::TextKey::HostProxyManual),
+                HostProxyMode::AutoConfig => {
+                    t(language, crate::localization::TextKey::HostProxyAutoScript)
                 }
-                HostProxyMode::Mixed => copy(
-                    language,
-                    "多种代理设置；需进一步确认",
-                    "Multiple proxy settings; needs review",
-                ),
-                HostProxyMode::Unknown => copy(language, "未获取", "Unavailable"),
+                HostProxyMode::AutoDetect => {
+                    t(language, crate::localization::TextKey::HostProxyAutoDetect)
+                }
+                HostProxyMode::Mixed => t(language, crate::localization::TextKey::HostProxyMixed),
+                HostProxyMode::Unknown => {
+                    t(language, crate::localization::TextKey::HostProxyUnknown)
+                }
             };
             wrapped_label(
                 ui,
                 format!(
                     "{}：{mode}",
-                    copy(language, "Windows 系统代理", "Windows system proxy")
+                    t(language, crate::localization::TextKey::HostWindowsProxy)
                 ),
             );
             for family in [IpFamily::V4, IpFamily::V6] {
@@ -342,13 +273,15 @@ pub(crate) fn render(
                     format!(
                         "{}：{}",
                         if binding.source == dji4g_domain::ProxyBindingSource::ConfigurationOnly {
-                            copy(
+                            t(
                                 language,
-                                "磁盘配置引用网卡（运行态未核实）",
-                                "Configured adapter (runtime unverified)",
+                                crate::localization::TextKey::HostConfiguredAdapter,
                             )
                         } else {
-                            copy(language, "代理指定网卡", "Proxy-bound adapter")
+                            t(
+                                language,
+                                crate::localization::TextKey::HostProxyBoundAdapter,
+                            )
                         },
                         binding.interface_alias
                     ),
@@ -357,16 +290,22 @@ pub(crate) fn render(
                     ui,
                     format!(
                         "Clash Verge Rev {}",
-                        binding.version.as_deref().unwrap_or("版本未确认")
+                        binding
+                            .version
+                            .as_deref()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| t(
+                                language,
+                                crate::localization::TextKey::HostVersionUnknown
+                            ))
                     ),
                 );
                 if !binding.repairable {
                     wrapped_label(
                         ui,
-                        copy(
+                        t(
                             language,
-                            "此配置或版本暂不支持自动修改，请在代理软件中检查出站接口设置。",
-                            "This configuration cannot be changed automatically. Review the outbound interface in the proxy client.",
+                            crate::localization::TextKey::HostUnsupportedConfig,
                         ),
                     );
                 }
@@ -376,11 +315,7 @@ pub(crate) fn render(
                     ui,
                     format!(
                         "{} ({code})",
-                        copy(
-                            language,
-                            "代理配置无法可靠读取",
-                            "Proxy configuration could not be read reliably"
-                        )
+                        t(language, crate::localization::TextKey::HostConfigUnreadable)
                     ),
                 );
             }
@@ -392,16 +327,14 @@ pub(crate) fn render(
                 ui,
                 format!(
                     "{}“{}”{}",
-                    copy(
+                    t(
                         language,
-                        "将取消代理软件对",
-                        "Remove the proxy client's fixed outlet for "
+                        crate::localization::TextKey::HostRemoveOutletPrefix
                     ),
                     preview.interface_alias,
-                    copy(
+                    t(
                         language,
-                        "的固定出口设置。之后可能使用 Wi-Fi、有线网络或其他可用出口。将先备份原配置。请先完整退出 Clash Verge Rev 及相关核心。",
-                        ". It may then use Wi-Fi, Ethernet or another available outlet. The original will be backed up. Exit Clash Verge Rev and its core first."
+                        crate::localization::TextKey::HostRemoveOutletSuffix
                     )
                 ),
             );
@@ -409,29 +342,28 @@ pub(crate) fn render(
             if expired {
                 wrapped_label(
                     ui,
-                    RichText::new(copy(
-                        language,
-                        "修复方案已过期，请重新检查后再查看方案。",
-                        "This repair plan expired. Check again before preparing a new plan.",
-                    ))
-                    .color(StatusTone::Caution.color()),
+                    RichText::new(t(language, crate::localization::TextKey::HostPlanExpired))
+                        .color(StatusTone::Caution.color()),
                 );
             }
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
                         !busy,
-                        egui::Button::new(copy(language, "保留原设置", "Keep original settings")),
+                        egui::Button::new(t(
+                            language,
+                            crate::localization::TextKey::HostKeepOriginal,
+                        )),
                     )
-                    .on_disabled_hover_text(copy(
+                    .on_disabled_hover_text(t(
                         language,
-                        "正在处理，请等待本次操作结束",
-                        "Wait for the current operation to finish",
+                        crate::localization::TextKey::HostWaitCurrentOperation,
                     ))
                     .clicked()
                 {
                     send(
                         ui,
+                        language,
                         sink,
                         UiCommand::CancelProxyRepair {
                             plan_id: preview.plan_id,
@@ -441,12 +373,16 @@ pub(crate) fn render(
                 if ui
                     .add_enabled(
                         !expired && !busy,
-                        egui::Button::new(copy(language, "备份并修复", "Back up and repair")),
+                        egui::Button::new(t(
+                            language,
+                            crate::localization::TextKey::HostBackupAndRepair,
+                        )),
                     )
                     .clicked()
                 {
                     send(
                         ui,
+                        language,
                         sink,
                         UiCommand::ConfirmProxyRepair {
                             plan_id: preview.plan_id,
@@ -458,30 +394,28 @@ pub(crate) fn render(
         if let Some(result) = &host.result {
             wrapped_label(
                 ui,
-                copy(
+                t(
                     language,
-                    "配置已修改。重启代理后点击“重新检查”；配置改动不等于互联网已经恢复。",
-                    "Configuration changed. Restart the proxy and check again; this does not prove Internet access.",
+                    crate::localization::TextKey::HostRestartedCheckAgain,
                 ),
             );
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(copy(
+                    egui::Button::new(t(
                         language,
-                        "恢复原配置",
-                        "Restore original configuration",
+                        crate::localization::TextKey::HostRestoreOriginal,
                     )),
                 )
-                .on_disabled_hover_text(copy(
+                .on_disabled_hover_text(t(
                     language,
-                    "正在处理，请等待本次操作结束",
-                    "Wait for the current operation to finish",
+                    crate::localization::TextKey::HostWaitCurrentOperation,
                 ))
                 .clicked()
             {
                 send(
                     ui,
+                    language,
                     sink,
                     UiCommand::RestoreProxyRepair {
                         backup_id: result.backup_id,
@@ -489,9 +423,16 @@ pub(crate) fn render(
                 );
             }
         }
-        egui::CollapsingHeader::new(copy(language, "查看处理步骤", "Troubleshooting steps")).show(ui, |ui| {
-            wrapped_label(ui, copy(language, "先检查模块与 SIM；若模块公网检查通过，但代理仍报找不到网卡，请在代理软件中检查“出站接口”是否指向已移除或改名的网卡。多网卡用户可能有意固定出口，修改前确认用途。配置来源不明确时，请在代理软件中手动调整。", "Check the module and SIM. If the module path passes but the proxy reports a missing interface, review its outbound-interface setting. A fixed outlet may be intentional on computers with multiple adapters. Use the proxy client to edit ambiguous configurations."));
-        });
+        // The troubleshooting steps used to hide behind a disclosure triangle inside this card;
+        // they are now a flat always-visible block, kept at the quiet tier so the card stays short.
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::HostStepsHeading,
+        )));
+        wrapped_label(
+            ui,
+            detail_text(t(language, crate::localization::TextKey::HostStepsBody)),
+        );
     });
 }
 
@@ -533,7 +474,7 @@ mod tests {
             HostNetworkPhase::Restoring,
         ] {
             let ctx = egui::Context::default();
-            super::super::style_root(&ctx);
+            super::super::apply_style(&ctx);
             let mut snapshot =
                 dji4g_application::Controller::for_test(SystemTime::UNIX_EPOCH).snapshot();
             snapshot.host_network.phase = phase;

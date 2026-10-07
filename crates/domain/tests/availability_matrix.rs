@@ -3,9 +3,9 @@ use std::time::{Duration, SystemTime};
 use dji4g_domain::{
     AdapterBinding, AdapterState, AtControlAvailability, Availability, BoundDnsStatus,
     BoundEvidence, BoundPublicStatus, CellularBlock, ClassificationInput, ClassificationPhase,
-    DefaultRouteOwner, DeviceEpoch, DevicePresence, DeviceProfile, Evidence, EvidenceSource,
-    GlobalConnectivity, LimitedReason, ProtocolCoverage, StableDeviceIdentity, UnavailableReason,
-    classify,
+    DJI_GEN1, DefaultRouteOwner, DeviceEpoch, DevicePresence, DeviceProfile, Evidence,
+    EvidenceSource, GlobalConnectivity, LimitedReason, ProtocolCoverage, QUECTEL_GENERIC,
+    SUPPORTED, StableDeviceIdentity, UnavailableReason, classify,
 };
 
 const EPOCH: DeviceEpoch = DeviceEpoch(7);
@@ -17,6 +17,19 @@ fn evidence<T>(now: SystemTime, source: EvidenceSource, value: T) -> Evidence<T>
         ttl: Duration::from_secs(30),
         source,
         value,
+    }
+}
+
+/// One module profile's USB instance identity, spelled exactly as the inventory proves it.
+fn identity_for(profile: DeviceProfile) -> StableDeviceIdentity {
+    StableDeviceIdentity {
+        container_id: "{f5af1065-56f4-42f4-a3bd-09caa15a31aa}".to_owned(),
+        device_instance_id: format!(
+            "USB\\VID_{:04X}&PID_{:04X}\\REDACTED",
+            profile.vid, profile.pid
+        ),
+        vid: profile.vid,
+        pid: profile.pid,
     }
 }
 
@@ -130,6 +143,112 @@ fn only_pid_4006_matches_the_first_generation_profile() {
     assert!(DeviceProfile::DJI_GEN1.matches(0x2CA3, 0x4006));
     assert!(!DeviceProfile::DJI_GEN1.matches(0x2CA3, 0x4009));
     assert!(!DeviceProfile::DJI_GEN1.matches(0x1234, 0x4006));
+}
+
+/// The generic Quectel module is recognized (so it can be inspected) but never write-capable.
+#[test]
+fn profile_lookup_separates_recognition_from_write_eligibility() {
+    assert_eq!(
+        DeviceProfile::from_vid_pid(0x2CA3, 0x4006),
+        Some(DeviceProfile::DJI_GEN1)
+    );
+    assert_eq!(
+        DeviceProfile::from_vid_pid(0x2C7C, 0x0125),
+        Some(QUECTEL_GENERIC)
+    );
+    assert_eq!(DeviceProfile::from_vid_pid(0x2CA3, 0x4009), None);
+    assert_eq!(DeviceProfile::from_vid_pid(0x2C7C, 0x0126), None);
+    assert_eq!(SUPPORTED, [DJI_GEN1, QUECTEL_GENERIC]);
+
+    assert!(DeviceProfile::DJI_GEN1.allows_controlled_actions());
+    assert!(!QUECTEL_GENERIC.allows_controlled_actions());
+
+    let dji = identity_for(DeviceProfile::DJI_GEN1);
+    assert!(dji.is_supported());
+    assert_eq!(dji.profile(), Some(DeviceProfile::DJI_GEN1));
+    assert!(dji.allows_controlled_actions());
+
+    let generic = identity_for(QUECTEL_GENERIC);
+    assert!(
+        generic.is_supported(),
+        "the generic module must be accepted"
+    );
+    assert_eq!(generic.profile(), Some(QUECTEL_GENERIC));
+    assert!(!generic.allows_controlled_actions());
+
+    // A scalar VID/PID that disagrees with the instance identity proves nothing, even when both
+    // halves are individually recognized.
+    let contradictory = StableDeviceIdentity {
+        device_instance_id: "USB\\VID_2CA3&PID_4006\\REDACTED".to_owned(),
+        vid: QUECTEL_GENERIC.vid,
+        pid: QUECTEL_GENERIC.pid,
+        ..generic
+    };
+    assert!(!contradictory.is_supported());
+    assert_eq!(contradictory.profile(), None);
+    assert!(!contradictory.allows_controlled_actions());
+}
+
+/// The generic module is *readable*: the same evidence set that makes a DJI module `Available`
+/// must never make it `UnsupportedDevice` (that would be no support at all) nor `Available` (that
+/// verdict is the master enable for the write, repair and driver surfaces).
+#[test]
+fn generic_module_reaches_a_limited_read_only_verdict_instead_of_available() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+    // Same evidence, DJI identity: unchanged, still `Available`.
+    assert_eq!(
+        classify(&bound_public_and_dns_ok(now), now).status,
+        Availability::Available
+    );
+
+    let mut generic = bound_public_and_dns_ok(now);
+    generic.device_presence = Some(evidence(
+        now,
+        EvidenceSource::Pnp,
+        DevicePresence::Supported(QUECTEL_GENERIC),
+    ));
+    generic.target_identity = Some(evidence(
+        now,
+        EvidenceSource::Pnp,
+        identity_for(QUECTEL_GENERIC),
+    ));
+    let binding = AdapterBinding {
+        target: identity_for(QUECTEL_GENERIC),
+        adapter_id: "{dji-rndis-adapter-guid}".to_owned(),
+    };
+    generic.adapter_binding = Some(evidence(
+        now,
+        EvidenceSource::WindowsAdapter,
+        binding.clone(),
+    ));
+    if let Some(value) = generic.bound_public.as_mut() {
+        value.value.binding = binding.clone();
+    }
+    if let Some(value) = generic.bound_dns.as_mut() {
+        value.value.binding = binding.clone();
+    }
+    if let Some(value) = generic.protocol_coverage.as_mut() {
+        value.value.binding = binding.clone();
+    }
+
+    assert_eq!(
+        classify(&generic, now).status,
+        Availability::Limited(LimitedReason::ReadOnlyModule)
+    );
+
+    // A worse data path is still reported honestly: the read-only downgrade only replaces
+    // `Available`, it never masks a definite `Unavailable`.
+    let mut rejected = generic.clone();
+    rejected.cellular_block = Some(evidence(
+        now,
+        EvidenceSource::AtControl,
+        CellularBlock::SimRejected,
+    ));
+    assert_eq!(
+        classify(&rejected, now).status,
+        Availability::Unavailable(UnavailableReason::CellularRejected)
+    );
 }
 
 #[test]

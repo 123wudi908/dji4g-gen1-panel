@@ -40,6 +40,7 @@ fn config_roundtrip_preserves_all_user_fields() {
         onboarding_completed: true,
         sms_archive_enabled: true,
         language: dji4g_application::LanguageCode::ZhCn,
+        theme: dji4g_application::ThemeCode::System,
         autostart: true,
         start_minimized: true,
         active_probe: false,
@@ -134,6 +135,7 @@ fn saving_settings(desired_enabled: bool) -> SettingsSnapshot {
     SettingsSnapshot {
         revision: 7,
         language: LanguageCode::EnUs,
+        theme: dji4g_application::ThemeCode::System,
         autostart: AutostartStatus::Saving {
             desired_enabled,
             previous: Some(AutostartKnownState::Disabled),
@@ -206,4 +208,36 @@ fn mapped_snapshot_survives_a_save_reload_roundtrip_under_root() {
         panic!("expected a loaded config");
     };
     assert_eq!(config, expected);
+}
+
+#[test]
+fn all_themes_reload_and_old_configs_follow_the_system() {
+    use dji4g_application::ThemeCode;
+    let root = temp_root("themes");
+    let store = ConfigStore::new(ConfigPaths::under_root(&root));
+    for theme in [ThemeCode::System, ThemeCode::Light, ThemeCode::Dark] {
+        let config = ConfigV1 {
+            theme,
+            ..ConfigV1::default()
+        };
+        store.save(&config).unwrap();
+        let ConfigLoadOutcome::Loaded { config: loaded } = store.load().unwrap() else {
+            panic!("saved config")
+        };
+        assert_eq!(loaded, config);
+        let encoded = ConfigStore::<StdFileOps, SystemClock>::encode(&config).unwrap();
+        let old = encoded
+            .lines()
+            .filter(|line| !line.starts_with("theme ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            ConfigStore::<StdFileOps, SystemClock>::decode(old.as_bytes())
+                .unwrap()
+                .theme,
+            ThemeCode::System
+        );
+        let bad = old + "\ntheme = \"unknown\"\n";
+        assert!(ConfigStore::<StdFileOps, SystemClock>::decode(bad.as_bytes()).is_err());
+    }
 }

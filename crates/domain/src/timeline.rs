@@ -8,14 +8,19 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::BoundDnsStatus;
+use crate::RegistrationState;
+
 /// One observed transition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimelineEvent {
     pub at: SystemTime,
     pub kind: TimelineEventKind,
-    /// Short human-readable detail; closed-vocabulary text only (no subscriber data).
-    pub detail: String,
+    /// Closed values of the transition, if it carried any. The event carries no wording: the
+    /// presentation layer formats [`TimelineDetail`] against its own catalog, so this crate and
+    /// the reducer below it stay language-free.
+    pub detail: TimelineDetail,
 }
 
 /// Closed set of observed event kinds.
@@ -35,6 +40,27 @@ pub enum TimelineEventKind {
     AdapterLinkChanged,
     /// The bound DNS probe changed verdict.
     DnsChanged,
+}
+
+/// The values one observed transition carries, if any.
+///
+/// Nothing here is display text: the wording of a timeline row belongs to the panel's catalog. A
+/// variant must agree with its event's [`TimelineEventKind`] — `Registration` is only ever
+/// recorded on a `RegistrationChanged` event, and `Dns` only on a `DnsChanged` one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TimelineDetail {
+    /// The transition has no values of its own; the event kind's phrase is the row text.
+    Kind,
+    /// Cellular registration moved from one closed state to another.
+    Registration {
+        from: RegistrationState,
+        to: RegistrationState,
+    },
+    /// The bound DNS verdict moved from one closed verdict to another.
+    Dns {
+        from: BoundDnsStatus,
+        to: BoundDnsStatus,
+    },
 }
 
 /// Bounded timeline ring held by the application state.
@@ -84,23 +110,36 @@ mod tests {
 
     #[test]
     fn the_ring_is_bounded_and_keeps_the_newest_events() {
+        const STATES: [RegistrationState; 6] = [
+            RegistrationState::RegisteredHome,
+            RegistrationState::RegisteredRoaming,
+            RegistrationState::Searching,
+            RegistrationState::Denied,
+            RegistrationState::NotRegistered,
+            RegistrationState::Unknown,
+        ];
         let mut timeline = Timeline::new();
         for index in 0..(TIMELINE_CAPACITY + 5) {
             timeline.push(TimelineEvent {
-                at: SystemTime::UNIX_EPOCH,
-                kind: TimelineEventKind::CellChanged,
-                detail: format!("cell {index}"),
+                at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(index as u64),
+                kind: TimelineEventKind::RegistrationChanged,
+                detail: TimelineDetail::Registration {
+                    from: RegistrationState::Searching,
+                    to: STATES[index % STATES.len()],
+                },
             });
         }
         assert_eq!(timeline.events().len(), TIMELINE_CAPACITY);
-        let newest = format!("cell {}", TIMELINE_CAPACITY + 4);
         assert_eq!(
-            timeline.events().last().map(|event| event.detail.as_str()),
-            Some(newest.as_str())
+            timeline.events().last().map(|event| event.at),
+            Some(
+                SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs((TIMELINE_CAPACITY + 4) as u64)
+            )
         );
         assert_eq!(
-            timeline.events().first().map(|event| event.detail.as_str()),
-            Some("cell 5")
+            timeline.events().first().map(|event| event.at),
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5))
         );
     }
 }

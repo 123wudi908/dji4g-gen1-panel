@@ -25,6 +25,15 @@ use dji4g_domain::DeviceEpoch;
 
 use crate::{ActorError, AtSessionActor, DjiDevice, PlatformError};
 
+/// CMGL/CMGR can change read state; check the profile before opening a serial session.
+pub(crate) fn require_sms_device(device: &DjiDevice) -> Result<(), PlatformError> {
+    match device.profile() {
+        Some(profile) if profile.allows_controlled_actions() => Ok(()),
+        Some(_) => Err(platform_error("sms:read_only_module")),
+        None => Err(platform_error("sms:unsupported")),
+    }
+}
+
 pub(crate) fn verify_sim_response(
     response: &AtResponse,
     expected: [u8; 8],
@@ -97,6 +106,7 @@ pub fn sms_query_pdu_mode(
 /// Switch the module to PDU mode (`AT+CMGF=0`; per 3GPP TS 27.005 §3.2.2, 0 is PDU and 1 is
 /// text). Session setting; user consent is a UI concern.
 pub fn sms_set_pdu_mode(device: &DjiDevice, epoch: DeviceEpoch) -> Result<(), PlatformError> {
+    require_sms_device(device)?;
     with_session(device, epoch, set_pdu_mode)
 }
 
@@ -117,10 +127,11 @@ pub fn sms_list(device: &DjiDevice, epoch: DeviceEpoch) -> Result<SmsListing, Pl
 /// Legacy entry point without a frozen SIM identity. Refuses before opening the serial port;
 /// callers must use [`sms_read_verified`] so a single read cannot bypass history SIM isolation.
 pub fn sms_read(
-    _device: &DjiDevice,
+    device: &DjiDevice,
     _epoch: DeviceEpoch,
     _index: u32,
 ) -> Result<SmsRecord, PlatformError> {
+    require_sms_device(device)?;
     Err(platform_error("sms:sim_identity_required"))
 }
 
@@ -133,6 +144,7 @@ pub fn sms_read_verified(
     expected_sim: Option<[u8; 8]>,
     index: u32,
 ) -> Result<SmsRecord, PlatformError> {
+    require_sms_device(device)?;
     let expected_sim = expected_sim.ok_or(platform_error("sms:sim_identity_required"))?;
     with_session(device, epoch, |actor| read(actor, index, expected_sim))
 }
@@ -140,6 +152,7 @@ pub fn sms_read_verified(
 /// Delete one stored message (`AT+CMGD=<index>`). The final `OK` is required for success; a
 /// failed delete is never retried.
 pub fn sms_delete(device: &DjiDevice, epoch: DeviceEpoch, index: u32) -> Result<(), PlatformError> {
+    require_sms_device(device)?;
     with_session(device, epoch, |actor| delete(actor, index))
 }
 
@@ -157,6 +170,7 @@ pub fn sms_send(
     recipient: &str,
     text: &str,
 ) -> Result<SmsSendResult, PlatformError> {
+    require_sms_device(device)?;
     with_session(device, epoch, |actor| send(actor, recipient, text))
 }
 

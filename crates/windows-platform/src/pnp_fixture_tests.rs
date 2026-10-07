@@ -3,6 +3,8 @@ use super::{
     select_at_candidate,
 };
 
+use crate::repair::TargetProof;
+
 fn candidate(
     port: &str,
     role: FunctionRole,
@@ -29,6 +31,58 @@ fn root_node(instance_id: &str, container_id: Option<&str>) -> PnpNode {
         ancestry: vec![instance_id.to_owned()],
         container_id: container_id.map(str::to_owned),
         ..PnpNode::default()
+    }
+}
+
+/// The generic Quectel module: root `2C7C:0125` with the usual `MI_02` AT and `MI_04` NET
+/// functions.  It is recognized for read-only inspection only, but the inventory must enumerate it
+/// or nothing downstream can see it at all.
+const GENERIC_ROOT: &str = r"USB\VID_2C7C&PID_0125\SERIAL";
+
+fn generic_root_node(container_id: Option<&str>) -> PnpNode {
+    PnpNode {
+        instance_id: GENERIC_ROOT.to_owned(),
+        hardware_ids: vec![r"USB\VID_2C7C&PID_0125&REV_0001".to_owned()],
+        ancestry: vec![GENERIC_ROOT.to_owned()],
+        container_id: container_id.map(str::to_owned),
+        ..PnpNode::default()
+    }
+}
+
+fn generic_at_node(port: &str, ancestry: &[&str]) -> PnpNode {
+    PnpNode {
+        instance_id: format!(r"USB\VID_2C7C&PID_0125&MI_02\{port}"),
+        hardware_ids: vec![r"USB\VID_2C7C&PID_0125&MI_02".to_owned()],
+        ancestry: ancestry.iter().map(|value| (*value).to_owned()).collect(),
+        port_name: Some(port.to_owned()),
+        com_interface_path: Some(format!(r"\\?\USB#generic#{port}")),
+        role: FunctionRole::DedicatedAt,
+        ..PnpNode::default()
+    }
+}
+
+fn generic_net_node(container_id: Option<&str>, ancestry: &[&str]) -> PnpNode {
+    PnpNode {
+        instance_id: r"USB\VID_2C7C&PID_0125&MI_04\NET".to_owned(),
+        hardware_ids: vec![r"USB\VID_2C7C&PID_0125&MI_04".to_owned()],
+        ancestry: ancestry.iter().map(|value| (*value).to_owned()).collect(),
+        container_id: container_id.map(str::to_owned),
+        net_interface_path: Some(r"\\?\USB#net#{0125}".to_owned()),
+        ..PnpNode::default()
+    }
+}
+
+fn generic_candidate(port: &str, ancestry: &[&str]) -> ComCandidate {
+    ComCandidate {
+        port_name: port.to_owned(),
+        interface_path: format!(r"\\?\USB#generic#{port}"),
+        container_id: Some("{fixture-container}".to_owned()),
+        instance_id: format!(r"USB\VID_2C7C&PID_0125&MI_02\{port}"),
+        hardware_ids: vec![r"USB\VID_2C7C&PID_0125&REV_0001".to_owned()],
+        ancestry: ancestry.iter().map(|value| (*value).to_owned()).collect(),
+        role: FunctionRole::DedicatedAt,
+        verified_modem: false,
+        problem_code: None,
     }
 }
 
@@ -644,4 +698,173 @@ fn one_dedicated_port_is_still_trusted_without_probing() {
         selection,
         AtPortSelection::Classified(_) if selection_provenance(&selection) == PortProvenance::RoleClassified
     ));
+}
+
+// --- read-only generic module (`2C7C:0125`) --------------------------------------------------
+//
+// The inventory must enumerate the generic module exactly like the DJI one — the AT and NET
+// interfaces are what the read-only checks run against — while every write path stays keyed to the
+// write-capable profile (see `DeviceProfile::allows_controlled_actions` and `TargetProof`).
+
+#[test]
+fn generic_module_root_with_at_and_net_interfaces_is_enumerated() {
+    let nodes = vec![
+        generic_root_node(Some("{fixture-container}")),
+        generic_at_node("COM41", &[GENERIC_ROOT]),
+        generic_net_node(Some("{fixture-container}"), &[GENERIC_ROOT]),
+    ];
+
+    let snapshot = correlate_topology(nodes);
+    assert_eq!(
+        snapshot.devices.len(),
+        1,
+        "the generic module must be a target device"
+    );
+    let device = &snapshot.devices[0];
+    assert_eq!(device.root_instance_id(), GENERIC_ROOT);
+    assert_eq!(
+        device.profile(),
+        Some(dji4g_domain::QUECTEL_GENERIC),
+        "the inventory must report the profile it proved, not the DJI one"
+    );
+    assert_eq!(device.com_candidates().len(), 1);
+    assert_eq!(device.net_candidates().len(), 1);
+    assert_eq!(
+        device.select_at_port().unwrap().port_name(),
+        "COM41",
+        "the MI_02 AT function must be discoverable for the read-only checks"
+    );
+}
+
+#[test]
+fn generic_module_identity_is_not_write_eligible() {
+    let profile = dji4g_domain::QUECTEL_GENERIC;
+    assert!(!profile.allows_controlled_actions());
+    assert!(dji4g_domain::DeviceProfile::DJI_GEN1.allows_controlled_actions());
+    assert_eq!(
+        dji4g_domain::DeviceProfile::from_vid_pid(0x2C7C, 0x0125),
+        Some(profile)
+    );
+
+    // The repair executor's target proof is minted from the same profile: the generic module can
+    // never satisfy it.
+    assert!(!TargetProof::for_profile(profile, [0x11; 32]).is_supported());
+    assert!(TargetProof::for_profile(dji4g_domain::DJI_GEN1, [0x11; 32]).is_supported());
+}
+
+#[test]
+fn generic_module_at_selection_survives_dock_ancestry_and_rejects_a_hub_only_ancestry() {
+    let dock = r"USB\VID_2109&PID_2817\HUB";
+    let docked = generic_candidate("COM42", &[dock, GENERIC_ROOT]);
+    assert_eq!(select_at_candidate(&[docked]).unwrap().port_name(), "COM42");
+
+    let hub_only = generic_candidate("COM43", &[dock]);
+    assert_eq!(
+        select_at_candidate(&[hub_only]),
+        Err(PortSelectionError::NoSafePort)
+    );
+}
+
+#[test]
+fn a_generic_root_with_dji_hardware_ids_is_not_a_proven_root() {
+    let mut contradictory = generic_root_node(None);
+    contradictory.hardware_ids = vec![r"USB\VID_2CA3&PID_4006&REV_0318".to_owned()];
+
+    assert!(
+        correlate_topology(vec![contradictory]).devices.is_empty(),
+        "a root must still prove one consistent profile in both its instance id and hardware ids"
+    );
+}
+
+#[test]
+fn unlisted_quectel_pid_is_still_rejected() {
+    let root = r"USB\VID_2C7C&PID_0126\SERIAL";
+    let mut at = generic_candidate("COM44", &[root]);
+    at.instance_id = r"USB\VID_2C7C&PID_0126\OTHER".to_owned();
+    at.hardware_ids = vec![r"USB\VID_2C7C&PID_0126".to_owned()];
+
+    assert_eq!(
+        select_at_candidate(&[at]),
+        Err(PortSelectionError::NoSafePort)
+    );
+}
+
+#[test]
+fn generic_sms_entry_points_refuse_before_any_serial_open() {
+    use dji4g_domain::{
+        DeviceEpoch, SmsDeleteControl, SmsFragmentKey, SmsReadControl, SmsStorageId,
+        SmsTransactionControl,
+    };
+    use std::time::Duration;
+    let inventory = correlate_topology(vec![generic_root_node(None)]);
+    let device = &inventory.devices()[0];
+    let epoch = DeviceEpoch(1);
+    assert_eq!(
+        crate::sms::require_sms_device(device).unwrap_err().code,
+        "sms:read_only_module"
+    );
+    assert_eq!(
+        crate::sms_set_pdu_mode(device, epoch).unwrap_err().code,
+        "sms:read_only_module"
+    );
+    assert_eq!(
+        crate::sms_read_verified(device, epoch, None, 1)
+            .unwrap_err()
+            .code,
+        "sms:read_only_module"
+    );
+    assert_eq!(
+        crate::sms_delete(device, epoch, 1).unwrap_err().code,
+        "sms:read_only_module"
+    );
+    assert_eq!(
+        crate::sms_send(device, epoch, "invalid", "test")
+            .unwrap_err()
+            .code,
+        "sms:read_only_module"
+    );
+    assert_eq!(
+        crate::sms_list_controlled(
+            device,
+            epoch,
+            None,
+            None,
+            SmsReadControl::new(Duration::from_secs(1))
+        )
+        .unwrap_err()
+        .code,
+        "sms:read_only_module"
+    );
+    let send = crate::sms_send_controlled(
+        device,
+        epoch,
+        None,
+        "invalid",
+        "test",
+        SmsTransactionControl::new(Duration::from_secs(1)),
+    );
+    assert_eq!(send.failure.unwrap().code, "sms:read_only_module");
+    let fragment = SmsFragmentKey {
+        device_epoch: 1,
+        sim_epoch: 0,
+        storage: SmsStorageId("SM".into()),
+        index: 1,
+        payload_fingerprint: [0; 32],
+    };
+    let receipt = crate::sms_delete_checked(
+        device,
+        epoch,
+        None,
+        &fragment,
+        SmsDeleteControl::new(Duration::from_secs(1)),
+    );
+    assert_eq!(receipt.code.as_deref(), Some("sms:read_only_module"));
+    let mut unknown = device.clone();
+    unknown.root_instance_id = r"USB\VID_1234&PID_5678\UNKNOWN".into();
+    assert_eq!(
+        crate::sms::require_sms_device(&unknown).unwrap_err().code,
+        "sms:unsupported"
+    );
+    let dji = correlate_topology(vec![root_node(r"USB\VID_2CA3&PID_4006\SERIAL", None)]);
+    crate::sms::require_sms_device(&dji.devices()[0]).unwrap();
 }

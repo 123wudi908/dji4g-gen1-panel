@@ -39,6 +39,37 @@ fn refresh_dhcp_revalidates_and_applies_with_one_native_mutation() {
     assert_eq!(executor.backend().mutation_count(), 1);
 }
 
+/// The recognized read-only generic module can never be the target of a controlled repair: no
+/// plan may be prepared for it and no native write may happen.
+#[test]
+fn recognized_read_only_module_can_never_prepare_or_execute_a_repair() {
+    let generic = TargetProof::for_profile(dji4g_domain::QUECTEL_GENERIC, [0x77; 32]);
+    assert!(!generic.is_supported());
+    let backend = FakeRepairBackend::ready(RepairObservation::fixture(
+        DeviceEpoch(4),
+        11,
+        generic,
+        AdapterProof::fixture([0x22; 32]),
+    ));
+    let executor = WindowsRepairExecutor::new(backend);
+
+    for action in [
+        RepairAction::RefreshDhcp,
+        RepairAction::RestartAdapter,
+        RepairAction::ReenumerateDevice,
+        RepairAction::RestartModule,
+        RepairAction::SetUsbNetProfile {
+            profile: VerifiedUsbNetProfile::DjiNdis,
+        },
+    ] {
+        assert!(
+            matches!(executor.prepare(action), Err(RepairError::Unsupported)),
+            "a read-only module must not accept a repair plan"
+        );
+    }
+    assert_eq!(executor.backend().mutation_count(), 0);
+}
+
 #[test]
 fn stale_before_state_fails_closed_without_dispatch() {
     let mut backend = ready_backend();

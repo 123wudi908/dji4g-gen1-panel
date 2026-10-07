@@ -14,6 +14,9 @@ pub fn sms_delete_checked(
     expected: &SmsFragmentKey,
     control: SmsDeleteControl,
 ) -> SmsDeleteReceipt {
+    if let Err(error) = crate::sms::require_sms_device(device) {
+        return refused(error.code);
+    }
     if expected_sim.is_none() {
         return refused("sms:sim_identity_required");
     }

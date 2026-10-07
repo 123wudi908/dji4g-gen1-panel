@@ -6,6 +6,8 @@
 
 use std::{collections::VecDeque, fmt, sync::Arc};
 
+use crate::localization::{Language, LocalizedText, TextKey};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayCommand {
     Open,
@@ -47,14 +49,20 @@ pub struct TrayLabels {
 }
 
 impl TrayLabels {
+    /// The tray menu in `language`.
+    ///
+    /// The tooltip is the window title, so the two have to agree — in the language the panel starts
+    /// in, which is simplified Chinese:
+    /// `the_window_title_lookup_and_the_tray_tooltip_base_agree` proves it.
     #[must_use]
-    pub fn zh_cn() -> Self {
+    pub fn for_language(language: Language) -> Self {
+        let text = |key| LocalizedText::new(language, key).text;
         Self {
-            open: "打开面板".to_owned(),
-            refresh_now: "立即刷新".to_owned(),
-            hotspot_status: "热点状态".to_owned(),
-            exit: "退出".to_owned(),
-            tooltip: "DJI 一代 4G 面板".to_owned(),
+            open: text(TextKey::TrayOpen),
+            refresh_now: text(TextKey::TrayRefreshNow),
+            hotspot_status: text(TextKey::TrayHotspotStatus),
+            exit: text(TextKey::TrayExit),
+            tooltip: text(TextKey::AppTitle),
         }
     }
 
@@ -506,14 +514,17 @@ mod tests {
             fail_create: true,
             ..MemoryTrayBackend::default()
         };
-        assert!(TrayController::initialize(backend, TrayLabels::zh_cn()).is_err());
+        assert!(
+            TrayController::initialize(backend, TrayLabels::for_language(Language::ZhCn)).is_err()
+        );
     }
 
     #[test]
     fn recreate_and_command_polling_are_bounded() {
         let mut backend = MemoryTrayBackend::default();
         backend.push(TrayCommand::Open);
-        let mut tray = TrayController::initialize(backend, TrayLabels::zh_cn()).unwrap();
+        let mut tray =
+            TrayController::initialize(backend, TrayLabels::for_language(Language::ZhCn)).unwrap();
         assert_eq!(tray.try_recv(), Some(TrayCommand::Open));
         assert_eq!(tray.try_recv(), None);
         tray.recreate().unwrap();
@@ -547,8 +558,11 @@ mod tests {
                 self.heartbeats += 1;
             }
         }
-        let mut tray =
-            TrayController::initialize(Recording::default(), TrayLabels::zh_cn()).unwrap();
+        let mut tray = TrayController::initialize(
+            Recording::default(),
+            TrayLabels::for_language(Language::ZhCn),
+        )
+        .unwrap();
         tray.acknowledge_exit();
         tray.defer_exit_for_local_io();
         tray.defer_exit_for_local_io();

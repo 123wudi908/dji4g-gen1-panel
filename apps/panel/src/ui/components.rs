@@ -2,6 +2,51 @@
 use super::scale;
 use eframe::egui::{self, Color32, Response, RichText, Stroke, Ui};
 
+/// Paint visible glyphs at the button center, independent of the surrounding Grid/layout.
+/// The empty stock button keeps pointer/keyboard behavior, disabled state and focus semantics.
+/// `button` supplies the frame and minimum size; its label must be empty.
+pub(crate) fn centered_button(
+    ui: &mut Ui,
+    text: impl Into<egui::WidgetText>,
+    button: egui::Button<'_>,
+    minimum: egui::Vec2,
+) -> Response {
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        (ui.available_width() - 2.0 * ui.spacing().button_padding.x).max(1.0),
+        egui::TextStyle::Button,
+    );
+    let size = (galley.size() + 2.0 * ui.spacing().button_padding).max(minimum);
+    let response = ui.add(button.min_size(size));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), galley.text())
+    });
+    if ui.is_rect_visible(response.rect) {
+        let bounds = if galley.mesh_bounds.is_positive() {
+            galley.mesh_bounds
+        } else {
+            galley.rect
+        };
+        let position = response.rect.center() - bounds.center().to_vec2();
+        ui.painter().galley(
+            position,
+            galley,
+            ui.style().interact(&response).text_color(),
+        );
+    }
+    response
+}
+
+pub(crate) fn plain_button(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
+    centered_button(
+        ui,
+        text,
+        egui::Button::new(""),
+        egui::vec2(scale::BUTTON_MIN_W, scale::CONTROL_H),
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ButtonKind {
     Filled,
@@ -19,19 +64,22 @@ pub(crate) fn action_button(
     disabled_reason: Option<&str>,
 ) -> Response {
     let enabled = enabled && ui.is_enabled();
+    // Every button in the panel resolves to one of these fills, and every one of them is exactly
+    // `CONTROL_H` tall. That is what keeps a page from growing a row of mismatched buttons.
     let (fill, ink, stroke) = match kind {
-        ButtonKind::Filled => (scale::DOWNLOAD, Color32::WHITE, Stroke::NONE),
-        ButtonKind::Tonal => (Color32::from_rgb(211, 227, 253), scale::INK, Stroke::NONE),
+        ButtonKind::Filled => (scale::accent(), scale::on_accent(), Stroke::NONE),
+        ButtonKind::Tonal => (scale::surface_raised(), scale::ink(), Stroke::NONE),
         ButtonKind::Outlined => (
             Color32::TRANSPARENT,
-            scale::DOWNLOAD,
-            Stroke::new(1.0_f32, scale::SECONDARY),
+            scale::ink(),
+            Stroke::new(1.0_f32, scale::border()),
         ),
-        ButtonKind::Text => (Color32::TRANSPARENT, scale::DOWNLOAD, Stroke::NONE),
+        ButtonKind::Text => (Color32::TRANSPARENT, scale::secondary(), Stroke::NONE),
+        // The one place red is allowed outside a status message: a destructive action.
         ButtonKind::Destructive => (
             Color32::TRANSPARENT,
-            Color32::from_rgb(170, 48, 48),
-            Stroke::new(1.0_f32, Color32::from_rgb(170, 48, 48)),
+            scale::danger(),
+            Stroke::new(1.0_f32, scale::danger()),
         ),
     };
     let (fill, ink, stroke) = if enabled {
@@ -39,36 +87,27 @@ pub(crate) fn action_button(
     } else {
         (
             if matches!(kind, ButtonKind::Filled | ButtonKind::Tonal) {
-                Color32::from_rgb(232, 234, 237)
+                scale::disabled_fill()
             } else {
                 Color32::TRANSPARENT
             },
-            scale::AXIS_LABEL,
+            scale::disabled_ink(),
             if stroke == Stroke::NONE {
                 Stroke::NONE
             } else {
-                Stroke::new(1.0_f32, scale::LINE)
+                Stroke::new(1.0_f32, scale::line())
             },
         )
     };
     let (hover_fill, pressed_fill) = if enabled {
         match kind {
-            ButtonKind::Filled => (
-                Color32::from_rgb(23, 100, 220),
-                Color32::from_rgb(9, 75, 180),
-            ),
-            ButtonKind::Tonal => (
-                Color32::from_rgb(203, 221, 251),
-                Color32::from_rgb(193, 213, 248),
-            ),
-            ButtonKind::Outlined | ButtonKind::Text => (
-                Color32::from_rgb(232, 240, 254),
-                Color32::from_rgb(211, 227, 253),
-            ),
-            ButtonKind::Destructive => (
-                Color32::from_rgb(252, 232, 230),
-                Color32::from_rgb(249, 218, 215),
-            ),
+            // A filled button carries `accent()` and its action ink, so its states step within
+            // that fill; the neutral greys would put the label on a light background on hover.
+            ButtonKind::Filled => (scale::accent_hover(), scale::accent_pressed()),
+            ButtonKind::Tonal | ButtonKind::Outlined | ButtonKind::Text => {
+                (scale::hover(), scale::pressed())
+            }
+            ButtonKind::Destructive => (scale::danger_fill(), scale::danger_fill()),
         }
     } else {
         (fill, fill)
@@ -80,20 +119,25 @@ pub(crate) fn action_button(
             widgets.inactive.weak_bg_fill = fill;
             widgets.hovered.weak_bg_fill = hover_fill;
             widgets.active.weak_bg_fill = pressed_fill;
-            ui.add_enabled(
-                enabled,
-                egui::Button::new(RichText::new(label).color(ink))
-                    .stroke(stroke)
-                    .rounding(16.0)
-                    .min_size(egui::vec2(64.0, 32.0)),
-            )
+            ui.add_enabled_ui(enabled, |ui| {
+                centered_button(
+                    ui,
+                    RichText::new(label).size(scale::BODY).color(ink),
+                    egui::Button::new("")
+                        .stroke(stroke)
+                        .rounding(egui::Rounding::same(scale::RADIUS_CONTROL))
+                        .min_size(egui::vec2(scale::BUTTON_MIN_W, scale::CONTROL_H)),
+                    egui::vec2(scale::BUTTON_MIN_W, scale::CONTROL_H),
+                )
+            })
+            .inner
         })
         .inner;
     if response.has_focus() {
         ui.painter().rect_stroke(
-            response.rect.expand(2.0),
-            18.0,
-            Stroke::new(2.0_f32, scale::DOWNLOAD),
+            response.rect.shrink(1.0),
+            egui::Rounding::same(scale::RADIUS_CONTROL),
+            Stroke::new(2.0_f32, scale::accent()),
         );
     }
     match disabled_reason.filter(|_| !enabled) {
@@ -141,54 +185,78 @@ fn selection<T: Copy + PartialEq>(
     let mut changed = false;
     ui.push_id(id, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = if segmented { 0.0 } else { 8.0 };
+            ui.spacing_mut().item_spacing.x = if segmented { 0.0 } else { 10.0 };
             for (index, item) in items.iter().enumerate() {
                 ui.push_id(index, |ui| {
                     let active = *selected == item.value;
+                    // A segmented control has one border and a soft blue selected segment.
                     let fill = if active && segmented {
-                        Color32::from_rgb(211, 227, 253)
+                        scale::selected()
                     } else {
                         Color32::TRANSPARENT
                     };
-                    let button = egui::Button::new(RichText::new(&item.label).color(if active {
-                        scale::DOWNLOAD
+                    let label_text = RichText::new(&item.label).size(scale::HEADING).color(
+                        if active && segmented {
+                            scale::on_selected()
+                        } else if active {
+                            scale::ink()
+                        } else {
+                            scale::secondary()
+                        },
+                    );
+                    let label_text = if active {
+                        label_text.strong()
                     } else {
-                        scale::SECONDARY
-                    }))
-                    .stroke(if segmented {
-                        Stroke::new(1.0_f32, Color32::from_rgb(116, 119, 117))
-                    } else {
-                        Stroke::NONE
-                    })
-                    .rounding(if segmented {
-                        egui::Rounding {
-                            nw: if index == 0 { 16.0 } else { 0.0 },
-                            sw: if index == 0 { 16.0 } else { 0.0 },
-                            ne: if index + 1 == items.len() { 16.0 } else { 0.0 },
-                            se: if index + 1 == items.len() { 16.0 } else { 0.0 },
-                        }
-                    } else {
-                        egui::Rounding::same(4.0)
-                    })
-                    .min_size(if segmented {
-                        egui::vec2(80.0, 32.0)
-                    } else {
-                        egui::vec2(88.0, 36.0)
-                    });
+                        label_text
+                    };
+                    let button = egui::Button::new(label_text)
+                        .stroke(if segmented {
+                            Stroke::new(1.0_f32, scale::border())
+                        } else {
+                            Stroke::NONE
+                        })
+                        .rounding(if segmented {
+                            egui::Rounding {
+                                nw: if index == 0 {
+                                    scale::RADIUS_CONTROL
+                                } else {
+                                    0.0
+                                },
+                                sw: if index == 0 {
+                                    scale::RADIUS_CONTROL
+                                } else {
+                                    0.0
+                                },
+                                ne: if index + 1 == items.len() {
+                                    scale::RADIUS_CONTROL
+                                } else {
+                                    0.0
+                                },
+                                se: if index + 1 == items.len() {
+                                    scale::RADIUS_CONTROL
+                                } else {
+                                    0.0
+                                },
+                            }
+                        } else {
+                            egui::Rounding::same(scale::RADIUS_CONTROL)
+                        })
+                        .min_size(egui::vec2(scale::SEGMENT_MIN_W, scale::CONTROL_H));
                     let response = ui
                         .scope(|ui| {
                             let widgets = &mut ui.visuals_mut().widgets;
                             widgets.noninteractive.weak_bg_fill = fill;
                             widgets.inactive.weak_bg_fill = fill;
+                            // Selected segments keep their own hover and pressed colors.
                             widgets.hovered.weak_bg_fill = if active && segmented {
-                                Color32::from_rgb(203, 221, 251)
+                                scale::selected_hover()
                             } else {
-                                Color32::from_rgb(232, 240, 254)
+                                scale::hover()
                             };
                             widgets.active.weak_bg_fill = if active && segmented {
-                                Color32::from_rgb(193, 213, 248)
+                                scale::selected_pressed()
                             } else {
-                                Color32::from_rgb(211, 227, 253)
+                                scale::pressed()
                             };
                             ui.add(button)
                         })
@@ -201,20 +269,21 @@ fn selection<T: Copy + PartialEq>(
                             &item.label,
                         )
                     });
+                    // An underline tab marks the current page; a segmented block marks itself.
                     if active && !segmented {
                         ui.painter().line_segment(
                             [
-                                response.rect.left_bottom() + egui::vec2(12.0, -1.0),
-                                response.rect.right_bottom() + egui::vec2(-12.0, -1.0),
+                                response.rect.left_bottom() + egui::vec2(8.0, -1.0),
+                                response.rect.right_bottom() + egui::vec2(-8.0, -1.0),
                             ],
-                            Stroke::new(3.0_f32, scale::DOWNLOAD),
+                            Stroke::new(2.0_f32, scale::accent()),
                         );
                     }
                     if response.has_focus() {
                         ui.painter().rect_stroke(
-                            response.rect.shrink(2.0),
-                            4.0,
-                            Stroke::new(2.0_f32, scale::DOWNLOAD),
+                            response.rect.shrink(1.0),
+                            egui::Rounding::same(scale::RADIUS_CONTROL),
+                            Stroke::new(2.0_f32, scale::accent()),
                         );
                     }
                     if response.clicked() && !active {
@@ -229,13 +298,32 @@ fn selection<T: Copy + PartialEq>(
 }
 
 /// A content-measured footer: the explanation cannot be covered by a fixed-height action row.
-pub(crate) fn entry_footer(ui: &mut Ui, label: &str) -> Response {
+pub(crate) fn entry_footer(
+    ui: &mut Ui,
+    label: &str,
+    language: crate::localization::Language,
+) -> Response {
     let explanation = |ui: &mut Ui| {
-        ui.label(RichText::new("可以直接进入，稍后继续检查。").color(scale::SECONDARY));
         ui.label(
-            RichText::new("进入后不再自动显示；可在设置中重新打开。")
-                .size(scale::META)
-                .color(scale::SECONDARY),
+            RichText::new(
+                crate::localization::LocalizedText::new(
+                    language,
+                    crate::localization::TextKey::EntrySkipHint,
+                )
+                .text,
+            )
+            .color(scale::secondary()),
+        );
+        ui.label(
+            RichText::new(
+                crate::localization::LocalizedText::new(
+                    language,
+                    crate::localization::TextKey::EntryHiddenHint,
+                )
+                .text,
+            )
+            .size(scale::META)
+            .color(scale::secondary()),
         );
     };
     if ui.available_width() >= 520.0 {
@@ -266,7 +354,7 @@ pub(crate) fn switch(ui: &mut Ui, value: &mut bool, label: &str, enabled: bool) 
         egui::Button::new("")
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE)
-            .min_size(egui::vec2(44.0, 32.0)),
+            .min_size(egui::vec2(40.0, scale::CONTROL_H)),
     );
     if response.clicked() {
         *value = !*value;
@@ -275,93 +363,121 @@ pub(crate) fn switch(ui: &mut Ui, value: &mut bool, label: &str, enabled: bool) 
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *value, label)
     });
-    let rect = egui::Rect::from_center_size(response.rect.center(), egui::vec2(40.0, 24.0));
+    let rect = egui::Rect::from_center_size(response.rect.center(), egui::vec2(36.0, 20.0));
     let track = if !enabled {
-        Color32::from_rgb(224, 227, 231)
+        scale::disabled_fill()
     } else if *value {
-        scale::DOWNLOAD
+        // An enabled switch uses the primary action color.
+        scale::accent()
     } else {
-        Color32::from_rgb(225, 227, 225)
+        scale::surface_raised()
     };
     ui.painter().rect(
         rect,
-        12.0,
+        10.0,
         track,
         if *value {
             Stroke::NONE
         } else {
             Stroke::new(
-                1.5_f32,
-                scale::SECONDARY.gamma_multiply(if enabled { 1.0 } else { 0.4 }),
+                1.0_f32,
+                scale::border().gamma_multiply(if enabled { 1.0 } else { 0.4 }),
             )
         },
     );
     let position = ui
         .ctx()
         .animate_bool(response.id.with("switch-position"), *value);
-    let x = egui::lerp((rect.left() + 12.0)..=(rect.right() - 12.0), position);
+    let x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), position);
     ui.painter().circle_filled(
         egui::pos2(x, rect.center().y),
-        egui::lerp(6.0..=9.0, position),
+        7.0,
         if !enabled {
-            scale::AXIS_LABEL.gamma_multiply(0.5)
+            scale::faint().gamma_multiply(0.5)
         } else if *value {
-            Color32::WHITE
+            scale::on_accent()
         } else {
-            scale::SECONDARY
+            scale::secondary()
         },
     );
     if response.has_focus() {
         ui.painter().rect_stroke(
-            response.rect.expand(2.0),
-            14.0,
-            Stroke::new(2.0_f32, scale::DOWNLOAD),
+            response.rect.shrink(1.0),
+            egui::Rounding::same(scale::RADIUS_CONTROL),
+            Stroke::new(2.0_f32, scale::accent()),
         );
     }
     response.on_hover_text(label)
 }
 
+/// The single page title: one 15pt line, optionally followed by a quiet description.
 pub(crate) fn page_heading(ui: &mut Ui, title: &str, description: &str) {
-    ui.label(RichText::new(title).size(scale::PAGE).color(scale::INK));
+    ui.label(
+        RichText::new(title)
+            .size(scale::TITLE)
+            .strong()
+            .color(scale::ink()),
+    );
     if !description.is_empty() {
         ui.label(
             RichText::new(description)
-                .size(14.0)
-                .color(scale::SECONDARY),
+                .size(scale::META)
+                .color(scale::faint()),
         );
     }
-    ui.add_space(4.0);
+    ui.add_space(2.0);
 }
 
-/// Use a restrained indicator that keeps loading rows aligned with 14-point body text.
+/// A restrained indicator that keeps loading rows aligned with body text.
 pub(crate) fn loading_spinner(ui: &mut Ui) -> Response {
-    ui.add(egui::Spinner::new().size(16.0).color(scale::DOWNLOAD))
+    ui.add(
+        egui::Spinner::new()
+            .size(scale::BODY)
+            .color(scale::secondary()),
+    )
 }
 
+/// A quiet underlined link with the same accent used by focus and tab indicators.
+pub(crate) fn link(ui: &mut Ui, label: &str, url: &str) -> Response {
+    ui.add(egui::Hyperlink::from_label_and_url(
+        RichText::new(label)
+            .size(scale::META)
+            .underline()
+            .color(scale::accent()),
+        url,
+    ))
+}
+
+/// A compact status line. Green marks correct/available, red marks wrong/failed, and the
+/// in-between tones stay on the plain sunken surface so they never compete with a real verdict.
+/// The verdict and its reason share one wrapped line, which keeps the banner to a single row.
 pub(crate) fn status_banner(ui: &mut Ui, title: &str, detail: &str, tone: super::StatusTone) {
-    let fill = match tone {
-        super::StatusTone::Positive => Color32::from_rgb(232, 245, 233),
-        super::StatusTone::Negative => Color32::from_rgb(252, 232, 230),
-        super::StatusTone::Caution => Color32::from_rgb(254, 247, 224),
-        _ => Color32::from_rgb(232, 240, 254),
-    };
+    let fill = tone.fill().unwrap_or_else(scale::surface_sunken);
     egui::Frame::none()
         .fill(fill)
-        .rounding(12.0)
-        .inner_margin(12.0)
+        .rounding(egui::Rounding::same(scale::RADIUS_CONTROL))
+        .inner_margin(egui::Margin::symmetric(scale::BLOCK_PAD, 6.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 4.0;
             ui.horizontal_wrapped(|ui| {
                 let glyph = match tone {
                     super::StatusTone::Positive => "\u{f0be}",
-                    super::StatusTone::Negative | super::StatusTone::Caution => "\u{f8b6}",
+                    super::StatusTone::Negative => "\u{f8b6}",
                     _ => "\u{e88e}",
                 };
-                ui.label(super::icons::text(ui.ctx(), glyph, 20.0).color(tone.color()));
-                ui.label(RichText::new(title).size(16.0).strong().color(tone.color()));
+                ui.label(super::icons::text(ui.ctx(), glyph, scale::BODY).color(tone.color()));
+                ui.label(
+                    RichText::new(title)
+                        .size(scale::BODY)
+                        .strong()
+                        .color(tone.color()),
+                );
+                ui.label(
+                    RichText::new(detail)
+                        .size(scale::META)
+                        .color(scale::secondary()),
+                );
             });
-            ui.label(RichText::new(detail).color(scale::SECONDARY));
         });
 }
 
@@ -369,25 +485,86 @@ pub(crate) fn status_banner(ui: &mut Ui, title: &str, detail: &str, tone: super:
 mod tests {
     use super::*;
     #[test]
+    fn button_glyphs_are_centered_in_top_aligned_rows_and_vertical_cells() {
+        for label in ["复制地址", "顯示", "Copy address"] {
+            for horizontal in [false, true] {
+                let ctx = egui::Context::default();
+                super::super::apply_style(&ctx);
+                crate::font::install_chinese_font(&ctx).expect("Windows CJK font");
+                let mut button_rect = egui::Rect::NOTHING;
+                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let layout = if horizontal {
+                            egui::Layout::left_to_right(egui::Align::Min)
+                        } else {
+                            egui::Layout::top_down(egui::Align::Min)
+                        };
+                        ui.with_layout(layout, |ui| {
+                            button_rect = centered_button(
+                                ui,
+                                label,
+                                egui::Button::new("").min_size(egui::vec2(110.0, scale::CONTROL_H)),
+                                egui::vec2(110.0, scale::CONTROL_H),
+                            )
+                            .rect;
+                        });
+                    });
+                });
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => Some(text),
+                        _ => None,
+                    })
+                    .expect("visible button text");
+                let glyph_rect = text.galley.mesh_bounds.translate(text.pos.to_vec2());
+                let delta = glyph_rect.center() - button_rect.center();
+                assert!(
+                    delta.x.abs() <= 0.6 && delta.y.abs() <= 0.6,
+                    "{label} horizontal={horizontal}: glyph offset {delta:?}"
+                );
+                assert!(button_rect.height() <= scale::CONTROL_H + 1.0);
+            }
+        }
+    }
+
+    #[test]
     fn tabs_switch_only_after_a_click_and_disabled_actions_do_not_fire() {
         let ctx = egui::Context::default();
-        super::super::style_root(&ctx);
+        super::super::apply_style(&ctx);
         let mut selected = false;
         let mut fired = 0;
         let mut transitions = 0;
-        for tick in 0..3 {
-            let events = if tick == 0 {
-                Vec::new()
-            } else {
+        // Drive the click at the tab's own rectangle instead of a hardcoded point: the control
+        // height and the label widths are tokens, so a fixed coordinate silently stops hitting the
+        // widget the moment the design changes.
+        let mut tab_rect = egui::Rect::NOTHING;
+        for tick in 0..4 {
+            let events = if tick == 2 {
+                let centre = tab_rect.center();
                 vec![
-                    egui::Event::PointerMoved(egui::pos2(180.0, 30.0)),
+                    egui::Event::PointerMoved(centre),
                     egui::Event::PointerButton {
-                        pos: egui::pos2(180.0, 30.0),
+                        pos: centre,
                         button: egui::PointerButton::Primary,
-                        pressed: tick == 1,
+                        pressed: true,
                         modifiers: egui::Modifiers::NONE,
                     },
                 ]
+            } else if tick == 3 {
+                let centre = tab_rect.center();
+                vec![
+                    egui::Event::PointerMoved(centre),
+                    egui::Event::PointerButton {
+                        pos: centre,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                Vec::new()
             };
             let _ = ctx.run(
                 egui::RawInput {
@@ -400,6 +577,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
+                        let before = selected;
                         if page_tabs(
                             ui,
                             egui::Id::new("click-tabs"),
@@ -411,6 +589,12 @@ mod tests {
                         ) {
                             transitions += 1;
                         }
+                        let _ = before;
+                        // Remember where the first tab landed so the next pass can click it.
+                        tab_rect = ui
+                            .ctx()
+                            .read_response(egui::Id::new("click-tabs").with(0))
+                            .map_or(tab_rect, |response| response.rect);
                         if action_button(
                             ui,
                             "不可执行",
@@ -438,7 +622,7 @@ mod tests {
     fn keyboard_activation_emits_one_click_and_keeps_focus() {
         for primary in [false, true] {
             let ctx = egui::Context::default();
-            super::super::style_root(&ctx);
+            super::super::apply_style(&ctx);
             let mut id = None;
             let mut clicks = 0;
             for tick in 0..3 {
@@ -487,7 +671,7 @@ mod tests {
     #[test]
     fn disabled_primary_does_not_activate_from_keyboard() {
         let ctx = egui::Context::default();
-        super::super::style_root(&ctx);
+        super::super::apply_style(&ctx);
         let mut id = None;
         for tick in 0..3 {
             if let Some(id) = id {
@@ -527,7 +711,7 @@ mod tests {
     fn footer_and_navigation_fit_small_content_widths() {
         for width in [260.0, 480.0, 800.0] {
             let ctx = egui::Context::default();
-            super::super::style_root(&ctx);
+            super::super::apply_style(&ctx);
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -538,8 +722,12 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        let response = entry_footer(ui, "进入面板");
-                        assert!(response.rect.height() >= 36.0);
+                        let response =
+                            entry_footer(ui, "进入面板", crate::localization::Language::ZhCn);
+                        assert!(
+                            response.rect.height() >= scale::CONTROL_H,
+                            "the entry action must be a full-height control"
+                        );
                         assert!(ui.clip_rect().contains_rect(response.rect));
                         let mut choice = false;
                         assert!(!page_tabs(

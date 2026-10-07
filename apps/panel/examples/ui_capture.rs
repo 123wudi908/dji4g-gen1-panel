@@ -84,7 +84,8 @@ mod capture {
 
         fn page(self) -> Page {
             match self {
-                Self::Overview | Self::Wireless => Page::Overview,
+                Self::Overview => Page::Overview,
+                Self::Wireless => Page::Wireless,
                 Self::Diagnostics => Page::Diagnostics,
                 Self::Repairs => Page::Repairs,
                 Self::Settings => Page::Settings,
@@ -200,7 +201,8 @@ mod capture {
             "draft-replace" | "sms-queue-error" => vec![Screen::SmsCompose],
             "single-query" | "single-query-detail" => vec![Screen::ToolsPreset],
             "wireless" => vec![Screen::Wireless],
-            "overview" => vec![Screen::Overview],
+            "overview" | "overview-rich" | "overview-rich-temperature" => vec![Screen::Overview],
+            "generic-module" => vec![Screen::Overview, Screen::Repairs],
             mode if mode.starts_with("rate-") => vec![Screen::Overview],
             mode if mode.starts_with("module-") => vec![Screen::Overview],
             "host-normal-tun"
@@ -253,6 +255,8 @@ mod capture {
         review_base: SystemTime,
         /// The simulated optional-probe record the overview correlates its rows against.
         probe: Arc<std::sync::Mutex<dji4g_panel::feature_probe::FeatureProbeState>>,
+        /// A ramp to pin for this run, or `None` to follow the operating system.
+        theme: Option<egui::ThemePreference>,
     }
 
     impl Capture {
@@ -395,6 +399,11 @@ mod capture {
                     ..dji4g_panel::feature_probe::FeatureProbeState::default()
                 }
             };
+            let probe = if self.mode.starts_with("overview-rich") {
+                rich_probe(&snapshot)
+            } else {
+                probe
+            };
             if let Ok(mut slot) = self.probe.lock() {
                 *slot = probe;
             }
@@ -458,6 +467,11 @@ mod capture {
         }
 
         fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+            // Pin the ramp when the run asked for one, so a pass can cover the light theme even
+            // though the capture machine's system preference is dark.
+            if let Some(preference) = self.theme {
+                dji4g_panel::ui::set_review_theme(ctx, preference);
+            }
             if self.page >= self.screens.len() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -542,6 +556,9 @@ mod capture {
             egui::TopBottomPanel::top("simulated-review").show(ctx, |ui| {
                 ui.label("界面验收 · 模拟数据 · 不连接设备 / 不发送短信");
             });
+            if self.mode.starts_with("overview-rich") {
+                simulation_banner(ctx);
+            }
             self.app.render(ctx, frame);
             self.ticks += 1;
             let settle_ticks = if matches!(
@@ -849,10 +866,113 @@ mod capture {
     }
 
     /// Hardware-free scenario deltas, all applied to invented snapshots.
+    ///
+    /// The mode fixture runs first and several modes replace the snapshot outright; the language is
+    /// therefore applied *after* it, so `UI_CAPTURE_LANG` survives every mode — including
+    /// `driver-*`, `history-*` and `host-*`, which used to return before it was set. A screenshot of
+    /// an English page that still shows Chinese is a screenshot of the wrong build.
+    fn rich_probe(
+        snapshot: &dji4g_application::ControllerSnapshot,
+    ) -> dji4g_panel::feature_probe::FeatureProbeState {
+        let cellular = snapshot.app.cellular.as_ref();
+        dji4g_panel::feature_probe::FeatureProbeState {
+            epoch: snapshot
+                .app
+                .device
+                .as_ref()
+                .map_or(dji4g_domain::DeviceEpoch(0), |device| device.epoch),
+            numbers: cellular.and_then(|c| c.numbers.clone()),
+            sim_identity: cellular.and_then(|c| c.sim_identity.clone()),
+            serving_cell: cellular.and_then(|c| c.serving_cell.clone()),
+            numbers_status: dji4g_domain::FeatureStatus::Supported,
+            iccid_status: dji4g_domain::FeatureStatus::Supported,
+            serving_cell_status: dji4g_domain::FeatureStatus::Supported,
+            temperature_celsius: Some(52),
+            temperature_sensors: [52, 44, 46]
+                .into_iter()
+                .map(|celsius| dji4g_at_protocol::SensorTemperature {
+                    name: None,
+                    celsius,
+                })
+                .collect(),
+            temperature_raw: Some("+QTEMP: 52,44,46".into()),
+            ..dji4g_panel::feature_probe::FeatureProbeState::default()
+        }
+    }
+
+    fn simulation_banner(ctx: &egui::Context) {
+        egui::TopBottomPanel::top("simulation-banner").show(ctx, |ui| {
+            ui.label(egui::RichText::new("模拟数据 / Simulated data · UI review").size(12.0));
+        });
+    }
+
     fn apply_extra_fixture(snapshot: &mut dji4g_application::ControllerSnapshot, mode: &str) {
+        apply_mode_fixture(snapshot, mode);
+        snapshot.settings.language = review_language();
+    }
+
+    fn apply_mode_fixture(snapshot: &mut dji4g_application::ControllerSnapshot, mode: &str) {
         use dji4g_application::*;
         use dji4g_domain::*;
         let now = SystemTime::now();
+        if mode.starts_with("overview-rich") {
+            // Invented layout fixture, never a device observation.
+            let mut app = (*snapshot.app).clone();
+            if let Some(cellular) = app.cellular.as_mut() {
+                cellular.serving_cell = dji4g_at_protocol::parse_serving_cell_line(
+                    r#"+QENG: "servingcell","NOCONN","LTE","FDD",460,01,AA63B07,469,100,1,5,5,B344,-92,-7,-65,16,0"#,
+                );
+                cellular.sim_identity = Some(dji4g_domain::SimIdentity {
+                    iccid_masked: "8986…6651".into(),
+                    fingerprint: [3; 8],
+                });
+                cellular.numbers = Some(dji4g_domain::NumberLookup::Reported(vec![
+                    dji4g_domain::PhoneNumber::new("+8613800022501", 145),
+                ]));
+                cellular.temperature_celsius = Some(52);
+            }
+            if let Some(network) = app.network.as_mut() {
+                network.addresses = vec![
+                    "2408:845d:b02:89dc:ffff:ffff:ffff:5f02".into(),
+                    "2408:845d:b02:89dc:ffff:ffff:ffff:1c02".into(),
+                    "192.168.225.30".into(),
+                    "fe80::1234:5678:9abc:def0".into(),
+                ];
+                network.system_default_route = dji4g_domain::DefaultRouteOwner::VpnOrTun;
+            }
+            snapshot.app = Arc::new(app);
+            snapshot.rates_sampled_at = Some(SystemTime::now());
+            snapshot.adapter_metrics = Some(AdapterMetrics {
+                link_rx_bits_per_second: 426_000_000,
+                link_tx_bits_per_second: 426_000_000,
+                ..AdapterMetrics::default()
+            });
+            return;
+        }
+        if mode.starts_with("generic-module") {
+            // The read-only generic module (`2C7C:0125`): the overview names it instead of the DJI
+            // module and reports the read-only limitation, and the repairs page shows the
+            // driver-install reason instead of an install action nobody may press.
+            let mut app = (*snapshot.app).clone();
+            if let Some(device) = app.device.as_mut() {
+                device.identity = dji4g_domain::StableDeviceIdentity {
+                    container_id: device.identity.container_id.clone(),
+                    device_instance_id: r"USB\VID_2C7C&PID_0125\5&1A2B3C4D&0&1".to_owned(),
+                    vid: QUECTEL_GENERIC.vid,
+                    pid: QUECTEL_GENERIC.pid,
+                };
+            }
+            app.availability = Availability::Limited(LimitedReason::ReadOnlyModule);
+            snapshot.app = Arc::new(app);
+            let refusal = FailureCode::new(ErrorCode::Unsupported, {
+                let code = "app:read_only_module";
+                StableCode::try_from_static(code).expect("static stable code")
+            });
+            for entry in snapshot.action_readiness.iter_mut() {
+                entry.ready = Err(refusal.clone());
+            }
+            return;
+        }
         if mode.starts_with("module-") {
             use dji4g_application::{
                 AdapterNetworkDetails, AdapterObservationDto, AdapterStateDto, DefaultRouteDto,
@@ -1279,6 +1399,22 @@ mod capture {
             snapshot.device_tools.task = Some(task);
             snapshot.serial_work_busy = true;
         }
+        // Language is applied by `apply_extra_fixture` after this fixture, so an early return here
+        // cannot leave a capture in the wrong language.
+    }
+
+    /// The language a capture renders in, from `UI_CAPTURE_LANG` (`zh-CN`, `zh-TW` or `en-US`).
+    /// Simplified Chinese is the default, because that is what the panel ships with.
+    fn review_language() -> dji4g_application::LanguageCode {
+        use dji4g_application::LanguageCode;
+        match std::env::var("UI_CAPTURE_LANG")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "zh-TW" => LanguageCode::ZhTw,
+            "en-US" => LanguageCode::EnUs,
+            _ => LanguageCode::ZhCn,
+        }
     }
 
     fn driver_outcome(
@@ -1381,6 +1517,21 @@ mod capture {
 
     // No window, GPU context, OS input, screenshot API or device access. Export the real
     // egui draw meshes for the optional CPU rasterizer in packaging/scripts/render-ui-mesh.py.
+    /// A ramp to pin for this run, read from `UI_CAPTURE_THEME` (`light` or `dark`).
+    ///
+    /// Without this every pass rendered whichever ramp the capture machine's operating system
+    /// reported, so the light theme was never covered even though that is what the panel actually
+    /// runs in.
+    fn review_theme() -> Option<egui::ThemePreference> {
+        std::env::var("UI_CAPTURE_THEME").ok().and_then(|value| {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "light" => Some(egui::ThemePreference::Light),
+                "dark" => Some(egui::ThemePreference::Dark),
+                _ => None,
+            }
+        })
+    }
+
     fn capture_headless(
         width: f32,
         height: f32,
@@ -1391,6 +1542,11 @@ mod capture {
     ) {
         for screen in screens {
             let ctx = egui::Context::default();
+            // Pin the ramp before the visuals are installed: `initialize_visuals` resolves the
+            // stored preference, so a pin applied afterwards would arrive one style too late.
+            if let Some(preference) = review_theme() {
+                dji4g_panel::ui::set_review_theme(&ctx, preference);
+            }
             dji4g_panel::ui::initialize_visuals(&ctx);
             ctx.set_pixels_per_point(scale);
             let mut snapshot = demo_snapshot(DemoScenario::Available, SystemTime::now());
@@ -1449,14 +1605,32 @@ mod capture {
                 snapshot.sms_inbox = inbox;
             }
             apply_extra_fixture(&mut snapshot, mode);
+            let rich = mode
+                .starts_with("overview-rich")
+                .then(|| rich_probe(&snapshot));
             let mut app = PanelApp::from_snapshot(Arc::new(snapshot), Arc::new(Noop));
+            if let Some(probe) = rich {
+                app.set_review_feature_probe(probe);
+                let mut rates = dji4g_panel::ui::RateHistory::new();
+                let mut temperatures = dji4g_panel::ui::TemperatureHistory::new();
+                let base = SystemTime::now() - Duration::from_secs(59);
+                for i in 0..60 {
+                    rates.push((
+                        base + Duration::from_secs(i),
+                        Some(if i == 56 { 775_300 } else { 36_100 }),
+                        Some(if i == 54 { 244_800 } else { 24_700 }),
+                    ));
+                    temperatures.push((base + Duration::from_secs(i), Some(48 + (i / 15) as i16)));
+                }
+                app.set_review_histories(rates, temperatures);
+            }
             screen.apply(&mut app);
             if mode == "module-consent" {
                 ctx.data_mut(|d| {
                     d.insert_temp(egui::Id::new("module-network-probe-consent"), true)
                 });
             }
-            if mode == "module-temperature" {
+            if mode == "module-temperature" || mode == "overview-rich-temperature" {
                 ctx.data_mut(|d| d.insert_temp(egui::Id::new("overview-chart-tab"), 1_u8));
             }
             if mode == "draft-replace" {
@@ -1535,6 +1709,9 @@ mod capture {
                                     );
                                 });
                         } else {
+                            if mode.starts_with("overview-rich") {
+                                simulation_banner(ctx);
+                            }
                             app.render_ui(ctx);
                         }
                     },
@@ -1668,6 +1845,7 @@ mod capture {
                     review_base: SystemTime::now() - Duration::from_secs(660),
                     overview_cycles: 0,
                     probe,
+                    theme: review_theme(),
                 }))
             }),
         )

@@ -14,7 +14,7 @@ use dji4g_application::{
 use dji4g_windows_platform::{
     ActivationRequest, AutostartControl, AutostartObservedState, PlatformError, SingleInstance,
 };
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
 use crate::config::{ConfigError, ConfigStore, ConfigV1};
 use crate::diagnostics_export::ExportError;
@@ -26,10 +26,15 @@ use crate::tray::{
     TrayBackend, TrayCommand, TrayController, TrayError, WindowState, off_ui_command,
 };
 use crate::ui::{
-    StatusTone, availability_reason_with_diagnostics, availability_vm, device_tools, diagnostics,
-    overview, repairs, scale, settings, sms, wrapped_label,
+    StatusTone, availability_reason_with_diagnostics, device_tools, diagnostics, overview, repairs,
+    scale, settings, sms, wrapped_label,
 };
 use dji4g_domain::{ActionKind, Availability, DisruptionLevel, RiskLevel};
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Page {
@@ -38,17 +43,20 @@ pub enum Page {
     Repairs,
     Sms,
     DeviceTools,
+    /// The wireless side: read-only radio observations plus the Windows hotspot the module feeds.
+    Wireless,
     Settings,
 }
 
 /// The ordered navigation tabs. Kept as one closed list so the strip and its tests can never
 /// disagree about which pages exist.
-pub(crate) const NAV_ITEMS: [(Page, TextKey); 6] = [
+pub(crate) const NAV_ITEMS: [(Page, TextKey); 7] = [
     (Page::Overview, TextKey::NavOverview),
     (Page::Sms, TextKey::NavSms),
     (Page::DeviceTools, TextKey::NavDeviceTools),
     (Page::Diagnostics, TextKey::NavDiagnostics),
     (Page::Repairs, TextKey::NavRepairs),
+    (Page::Wireless, TextKey::NavWireless),
     (Page::Settings, TextKey::NavSettings),
 ];
 
@@ -291,8 +299,8 @@ pub fn map_autostart_state(value: AutostartObservedState) -> AutostartKnownState
     }
 }
 
-/// Logical size of the full panel window.
-pub const PANEL_WINDOW_SIZE: [f32; 2] = [1100.0, 760.0];
+/// Logical size of the full panel window. Sized so the compact controls leave real content room.
+pub const PANEL_WINDOW_SIZE: [f32; 2] = [1100.0, 720.0];
 
 /// Smallest full-panel window.
 pub const PANEL_MIN_SIZE: [f32; 2] = [800.0, 600.0];
@@ -362,8 +370,13 @@ pub struct ToastState {
 /// The exact title `main.rs` passes to `eframe::run_native`, i.e. the panel window's real title.
 /// The window is located by this title (process-verified) once at startup so the tray worker can
 /// natively restore/show/foreground it when 「打开面板」 is selected while the window is hidden —
-/// a hidden window runs no frames, so the UI thread can never re-show itself. The zh-CN tray
-/// tooltip base is the same string; the unit tests pin the two together.
+/// a hidden window runs no frames, so the UI thread can never re-show itself.
+///
+/// It is deliberately **not** localized, and that is the only user-visible string in this module
+/// that stays in simplified Chinese in every language. It is a process identity rather than prose:
+/// a second launch looks the window up by this exact string, and the title cannot follow a language
+/// change made from inside the running panel without that lookup breaking. The tray's hover text and
+/// the About dialog both use the localized [`crate::localization::TextKey::AppTitle`] instead.
 pub const PANEL_WINDOW_TITLE: &str = "DJI 一代 4G 面板";
 
 /// Locate the panel's real viewport window (raw `HWND` value) at startup. Runs in the eframe
@@ -394,7 +407,6 @@ pub struct PanelApp {
     /// UI-local device-tools terminal state (expert unlock, drafts, history visibility). Never
     /// persisted; the page resets it whenever the device or SIM context changes.
     device_tools: device_tools::DeviceToolsState,
-    wireless_view: bool,
     wireless_history: crate::ui::wireless::WirelessHistory,
     toast: Option<ToastState>,
     font_warning: Option<LocalizedText>,
@@ -516,8 +528,10 @@ impl PanelApp {
                 true
             }
             Err(_) => {
-                self.archive_ui.error =
-                    Some("保存历史开关失败，本次更改未保存。请检查用户目录权限后重试。".into());
+                self.archive_ui.error = Some(t(
+                    self.language,
+                    crate::localization::TextKey::ArchiveSaveFailed,
+                ));
                 false
             }
         }
@@ -529,8 +543,14 @@ impl PanelApp {
             egui::Id::new("sms-source-tabs"),
             &mut self.archive_view,
             &[
-                crate::ui::components::TabItem::new(false, "模块短信"),
-                crate::ui::components::TabItem::new(true, "本地历史"),
+                crate::ui::components::TabItem::new(
+                    false,
+                    t(self.language, crate::localization::TextKey::SmsViewModule),
+                ),
+                crate::ui::components::TabItem::new(
+                    true,
+                    t(self.language, crate::localization::TextKey::SmsViewArchive),
+                ),
             ],
         );
         ui.add_space(6.0);
@@ -546,8 +566,12 @@ impl PanelApp {
             return;
         }
         use crate::ui::sms_archive::ArchiveAction;
-        let action =
-            crate::ui::sms_archive::render(ui, self.archive.as_ref(), &mut self.archive_ui);
+        let action = crate::ui::sms_archive::render(
+            ui,
+            self.language,
+            self.archive.as_ref(),
+            &mut self.archive_ui,
+        );
         match action {
             Some(ArchiveAction::SetEnabled(enabled)) => {
                 if self.save_archive_preference(enabled) {
@@ -571,11 +595,20 @@ impl PanelApp {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos();
-                    let path = directory.join(format!("短信历史-{stamp}.txt"));
-                    archive.export_text(path.clone());
+                    let stamp = stamp.to_string();
+                    let name = crate::localization::format_positional(
+                        self.language,
+                        crate::localization::TextKey::ArchiveExportName,
+                        &[&stamp],
+                    );
+                    let path = directory.join(name);
+                    archive.export_text(path.clone(), self.language);
                     self.archive_ui.export_path = Some(path);
                 } else {
-                    self.archive_ui.error = Some("未导出：用户导出目录不可用。".into());
+                    self.archive_ui.error = Some(t(
+                        self.language,
+                        crate::localization::TextKey::ArchiveNoExportDir,
+                    ));
                 }
             }
             None => {}
@@ -618,6 +651,7 @@ impl PanelApp {
             .unwrap_or_else(|| self.loaded_config.clone());
         // Keep current non-registry settings even when autostart cannot be observed yet.
         config.language = self.snapshot.settings.language;
+        config.theme = self.snapshot.settings.theme;
         config.start_minimized = self.snapshot.settings.start_minimized;
         config.active_probe = self.snapshot.settings.active_probe;
         config.log_level = self.snapshot.settings.log_level;
@@ -633,9 +667,10 @@ impl PanelApp {
             self.toast = Some(ToastState {
                 text: LocalizedText {
                     key: TextKey::ErrorInternal,
-                    text: format!(
-                        "已进入面板，但引导完成状态保存失败（{}）；下次启动可能再次显示。",
-                        error.stable_code()
+                    text: crate::localization::format_positional(
+                        self.language,
+                        crate::localization::TextKey::OnboardingSaveFailed,
+                        &[error.stable_code()],
                     ),
                 },
                 expires_at: SystemTime::now() + Duration::from_secs(12),
@@ -658,8 +693,8 @@ impl PanelApp {
                 Some(warning)
             }
         };
-        crate::ui::style_root(&cc.egui_ctx);
         let snapshot = inputs.snapshot_rx.borrow();
+        crate::ui::apply_settings_theme(&cc.egui_ctx, snapshot.settings.theme);
         let language = language_from_code(snapshot.settings.language);
         let persisted_revision = snapshot.settings.revision;
         let command_error = Arc::new(Mutex::new(None));
@@ -684,7 +719,6 @@ impl PanelApp {
             page: Page::Overview,
             sms_compose: sms::SmsComposeState::default(),
             device_tools: device_tools::DeviceToolsState::default(),
-            wireless_view: false,
             wireless_history: crate::ui::wireless::WirelessHistory::default(),
             toast: None,
             font_warning,
@@ -748,7 +782,6 @@ impl PanelApp {
             page: Page::Overview,
             sms_compose: sms::SmsComposeState::default(),
             device_tools: device_tools::DeviceToolsState::default(),
-            wireless_view: false,
             wireless_history: crate::ui::wireless::WirelessHistory::default(),
             toast: None,
             font_warning: None,
@@ -943,7 +976,7 @@ impl PanelApp {
     }
     #[cfg(debug_assertions)]
     pub fn set_review_wireless(&mut self) {
-        self.wireless_view = true;
+        self.page = Page::Wireless;
         self.wireless_history.review_fixture();
     }
     /// Aim the SMS page at one inbox/outgoing tab and one selection. `selected` is the module
@@ -1411,7 +1444,23 @@ impl PanelApp {
     }
 
     /// Render the same UI without requiring a native window; callers supply their own input.
+    #[cfg(debug_assertions)]
+    pub fn set_review_histories(
+        &mut self,
+        rates: crate::ui::RateHistory,
+        temperatures: crate::ui::TemperatureHistory,
+    ) {
+        self.rate_history = rates;
+        self.temperature_history = temperatures;
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_review_feature_probe(&mut self, probe: crate::feature_probe::FeatureProbeState) {
+        self.feature_probe = Some(Arc::new(Mutex::new(probe)));
+    }
+
     pub fn render_ui(&mut self, ctx: &egui::Context) {
+        crate::ui::apply_settings_theme(ctx, self.snapshot.settings.theme);
         self.sms_compose.observe_snapshot(&self.snapshot);
         self.support_report.poll();
         if let Some(archive) = &mut self.archive {
@@ -1429,9 +1478,15 @@ impl PanelApp {
                     tray.defer_exit_for_local_io();
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("正在完成本地短信历史操作");
+                    ui.heading(t(
+                        self.language,
+                        crate::localization::TextKey::ArchiveBusyTitle,
+                    ));
                     crate::ui::components::loading_spinner(ui);
-                    ui.label("保存、清空或导出结束后将自动退出，请稍候。");
+                    ui.label(t(
+                        self.language,
+                        crate::localization::TextKey::ArchiveBusyBody,
+                    ));
                 });
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
@@ -1443,6 +1498,7 @@ impl PanelApp {
             match crate::ui::onboarding::render(
                 ctx,
                 &self.snapshot,
+                self.language,
                 SystemTime::now(),
                 self.onboarding.driver_fixture,
                 self.driver_setup_outcome,
@@ -1463,8 +1519,14 @@ impl PanelApp {
                 crate::ui::onboarding::OnboardingAction::OpenWindowsUpdate => {
                     if dji4g_windows_platform::driver_setup::open_windows_update().is_err() {
                         dji4g_windows_platform::show_message_box(
-                            "无法打开 Windows 更新",
-                            "请从 Windows 设置打开“Windows 更新”，检查可选驱动更新。当前尚未安装任何驱动。",
+                            &t(
+                                self.language,
+                                crate::localization::TextKey::WindowsUpdateFailedTitle,
+                            ),
+                            &t(
+                                self.language,
+                                crate::localization::TextKey::WindowsUpdateFailedBody,
+                            ),
                         );
                     }
                 }
@@ -1477,124 +1539,29 @@ impl PanelApp {
         let snapshot = Arc::clone(&self.snapshot);
         self.wireless_history.observe(&snapshot);
         let probe_view = self.current_probe_view(&snapshot);
-        let availability =
-            availability_vm(&snapshot.app, &snapshot.diagnostics, now, self.language);
+        // The availability verdict is rendered by the page that owns it — the overview carries the
+        // banner — rather than as a chip pinned into the sidebar.
         // Set by the diagnostics page's UI-side command sink when the export button is used;
         // the export itself runs after layout so it can mutate the toast.
         let export_requested = Arc::new(AtomicBool::new(false));
         let mut driver_install_requested = false;
 
-        egui::TopBottomPanel::top("panel-top")
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(240, 244, 249))
-                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    crate::ui::shell::brand(ui);
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(&availability.title.text)
-                            .size(14.0)
-                            .color(availability.tone.color()),
-                    );
-                    if availability.is_loading {
-                        crate::ui::components::loading_spinner(ui);
-                    }
-                    if crate::ui::components::action_button(
-                        ui,
-                        "刷新",
-                        crate::ui::components::ButtonKind::Outlined,
-                        true,
-                        None,
-                    )
-                    .clicked()
-                    {
-                        self.send(UiCommand::Refresh);
-                    }
-                    ui.menu_button("更多", |ui| {
-                        if ui
-                            .add_enabled(
-                                !self.support_report.busy(),
-                                egui::Button::new("导出详细日志"),
-                            )
-                            .on_hover_text("收集 USB、驱动、串口、网络与检测阶段，不包含短信正文。")
-                            .clicked()
-                        {
-                            self.support_report
-                                .request(self.exports_dir.clone(), Arc::clone(&snapshot));
-                            ui.close_menu();
-                        }
-                    });
-                });
-            });
-        egui::TopBottomPanel::bottom("panel-footer")
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(240, 244, 249))
-                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
-            )
-            .show(ctx, |ui| {
-                if !self.support_report.status.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        if self.support_report.busy() {
-                            crate::ui::components::loading_spinner(ui);
-                        }
-                        if self.support_report.path.is_some() && !self.support_report.busy() {
-                            ui.label("详细日志已导出")
-                                .on_hover_text(&self.support_report.status);
-                        } else {
-                            ui.label(&self.support_report.status);
-                        }
-                        if let Some(path) = &self.support_report.path {
-                            if ui.button("打开所在文件夹").clicked() {
-                                if let Err(error) = crate::support_report::open_report_folder(path)
-                                {
-                                    self.support_report.status = format!(
-                                        "打开目录失败：{error}；日志已保存，可复制路径打开"
-                                    );
-                                }
-                            }
-                            if ui.button("复制日志路径").clicked() {
-                                ui.output_mut(|output| {
-                                    output.copied_text = path.display().to_string()
-                                });
-                            }
-                        }
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(crate::ui::meta_text(availability.freshness.text.clone()));
-                    if snapshot
-                        .sms_send
-                        .as_ref()
-                        .is_some_and(|send| send.phase != dji4g_application::SmsSendPhase::Finished)
-                    {
-                        ui.label(crate::ui::meta_text("短信发送进行中"));
-                    }
-                    if let Some(operation) = &snapshot.operation {
-                        let text = match &operation.state {
-                            OperationState::Running { phase } => {
-                                crate::ui::operation_phase_text(*phase, None, self.language)
-                            }
-                            OperationState::Finished { .. } => {
-                                crate::ui::operation_result_text(operation, self.language)
-                            }
-                        };
-                        ui.label(crate::ui::meta_text(text.text));
-                    }
-                });
-            });
+        // There is no top bar. It held nothing but 刷新 and 更多, so it was a mostly empty strip
+        // across the whole window; those two controls now live with the navigation, where the rest
+        // of the panel's global controls already are.
+        // The freshness stamp used to live in a permanent footer strip too. It is redundant now:
+        // the sidebar verdict already shows the live state, and the diagnostics page carries the
+        // exact observation time, so the content area keeps its whole height.
         let narrow = ctx.screen_rect().width() < 700.0;
         let menu_id = egui::Id::new("navigation-drawer-open");
         if narrow {
+            // Below the sidebar's breakpoint the navigation becomes a button in a strip and a dialog
+            // over the page. It is the same modal as every other decision in the panel, so the last
+            // piece of default egui window chrome is gone.
             egui::TopBottomPanel::top("compact-navigation").show(ctx, |ui| {
                 if crate::ui::components::action_button(
                     ui,
-                    "菜单",
+                    &t(self.language, crate::localization::TextKey::MenuButton),
                     crate::ui::components::ButtonKind::Tonal,
                     true,
                     None,
@@ -1610,19 +1577,17 @@ impl PanelApp {
             let open = ctx.data(|d| d.get_temp::<bool>(menu_id).unwrap_or(false));
             if open {
                 let previous = self.page;
-                egui::Window::new("导航")
-                    .id(menu_id.with("window"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .fixed_pos(egui::pos2(12.0, 72.0))
-                    .default_width(220.0)
-                    .show(ctx, |ui| {
-                        crate::ui::shell::navigation(ui, &mut self.page, self.language);
-                        if ui.button("收起菜单").clicked() {
-                            ctx.data_mut(|d| d.insert_temp(menu_id, false));
-                        }
-                    });
-                if self.page != previous {
+                let nav_title = t(self.language, crate::localization::TextKey::NavDialogTitle);
+                let nav_close = t(self.language, crate::localization::TextKey::NavDialogClose);
+                let outcome = crate::ui::modal::show(
+                    ctx,
+                    // 260pt is the modal's own floor: a navigation list reads better as a narrow
+                    // column than as a full-width card.
+                    &crate::ui::modal::Dialog::new("navigation-drawer", &nav_title).width(260.0),
+                    |ui| crate::ui::shell::navigation(ui, &mut self.page, self.language),
+                    &[crate::ui::modal::DialogAction::cancel(&nav_close)],
+                );
+                if self.page != previous || outcome.dismissed() {
                     ctx.data_mut(|d| d.insert_temp(menu_id, false));
                 }
             }
@@ -1633,27 +1598,106 @@ impl PanelApp {
                 .exact_width(crate::ui::shell::sidebar_width(ctx.screen_rect().width()))
                 .frame(
                     egui::Frame::none()
-                        .fill(Color32::from_rgb(240, 244, 249))
+                        .fill(scale::surface_alt())
                         .inner_margin(8.0),
                 )
                 .show(ctx, |ui| {
-                    crate::ui::shell::navigation(ui, &mut self.page, self.language)
+                    crate::ui::shell::navigation(ui, &mut self.page, self.language);
                 });
         }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::WHITE)
-                    .rounding(16.0)
-                    .outer_margin(egui::Margin::symmetric(12.0, 0.0))
+                    .fill(scale::surface_page())
+                    .rounding(egui::Rounding::same(scale::RADIUS_CONTAINER))
+                    .outer_margin(egui::Margin::symmetric(8.0, 0.0))
                     .inner_margin(if ctx.screen_rect().width() < 1000.0 {
-                        16.0
+                        12.0
                     } else {
-                        20.0
+                        16.0
                     }),
             )
             .show(ctx, |ui| {
-                ui.set_max_width(ui.available_width().min(1200.0));
+                ui.set_max_width(ui.available_width().min(scale::CONTENT_MAX_W));
+                // The overview is the landing page and the only one that shows the whole system at a
+                // glance, so it is the only page that carries the panel-wide actions. Every other
+                // page owns the controls for its own subject and must not repeat 刷新 next to them.
+                //
+                // Its title sits on the same line as those actions, and the pair stays outside the
+                // page's scroll area: the overview is a dashboard, so what it is and what it can do
+                // stay put while its numbers scroll.
+                if self.page == Page::Overview {
+                    let compact_header = ui.available_width() < 480.0;
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(t(
+                                    self.language,
+                                    crate::localization::TextKey::NavOverview,
+                                ))
+                                .size(scale::TITLE)
+                                .strong()
+                                .color(scale::ink()),
+                            );
+                            if !compact_header {
+                                ui.label(
+                                    RichText::new(t(self.language, TextKey::OverviewPageIntro))
+                                        .size(scale::META)
+                                        .color(scale::faint()),
+                                );
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.menu_button(
+                                t(self.language, crate::localization::TextKey::MoreMenu),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !self.support_report.busy(),
+                                            egui::Button::new(t(
+                                                self.language,
+                                                crate::localization::TextKey::ExportDetailedLog,
+                                            )),
+                                        )
+                                        .on_hover_text(t(
+                                            self.language,
+                                            crate::localization::TextKey::ExportDetailedLogHint,
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.support_report.request(
+                                            self.language,
+                                            self.exports_dir.clone(),
+                                            Arc::clone(&snapshot),
+                                        );
+                                        ui.close_menu();
+                                    }
+                                },
+                            );
+                            if crate::ui::components::action_button(
+                                ui,
+                                &t(self.language, crate::localization::TextKey::ButtonRefresh),
+                                crate::ui::components::ButtonKind::Outlined,
+                                true,
+                                None,
+                            )
+                            .clicked()
+                            {
+                                self.send(UiCommand::Refresh);
+                            }
+                            crate::ui::icons::github_project(ui, self.language);
+                        });
+                    });
+                    if compact_header {
+                        wrapped_label(
+                            ui,
+                            RichText::new(t(self.language, TextKey::OverviewPageIntro))
+                                .size(scale::META)
+                                .color(scale::faint()),
+                        );
+                    }
+                    ui.add_space(scale::SECTION_GAP);
+                }
                 if let Some(warning) = &self.font_warning {
                     wrapped_label(
                         ui,
@@ -1676,66 +1720,46 @@ impl PanelApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.page {
                             Page::Overview => {
-                                if crate::ui::module_network_check::render_compact(
-                                    ui,
-                                    &snapshot,
-                                    now,
-                                    self.language,
-                                    self,
-                                ) {
-                                    self.page = Page::Repairs;
-                                }
-                                if let Some(destination) = overview::render_summary(
+                                // The overview only reports. Every check, retry, switch and repair
+                                // it used to offer now lives on the page that owns the subject —
+                                // 诊断 for the checks, 修复 for the setup guide, 无线 for the
+                                // hotspot — so nothing here can change the machine's state.
+                                overview::render_summary(
                                     ui,
                                     &snapshot,
                                     self.language,
                                     probe_view.as_ref(),
-                                ) {
-                                    self.page = destination;
-                                }
-                                if crate::ui::network_assistance::render_brief(
+                                );
+                                ui.add_space(scale::SECTION_GAP);
+                                overview::render(
                                     ui,
                                     &snapshot,
-                                    now,
                                     self.language,
-                                ) {
-                                    self.page = Page::Diagnostics;
-                                }
-                                crate::ui::components::page_tabs(
-                                    ui,
-                                    egui::Id::new("overview-view-tabs"),
-                                    &mut self.wireless_view,
-                                    &[
-                                        crate::ui::components::TabItem::new(false, "连接概况"),
-                                        crate::ui::components::TabItem::new(true, "无线观测"),
-                                    ],
+                                    &self.rate_history,
+                                    &self.temperature_history,
+                                    probe_view.as_ref(),
                                 );
-                                ui.add_space(10.0);
-                                if self.wireless_view {
-                                    crate::ui::wireless::render(
-                                        ui,
-                                        &snapshot,
-                                        &self.wireless_history,
-                                    );
-                                } else {
-                                    if let Some(destination) = overview::render(
-                                        ui,
-                                        &snapshot,
-                                        self.language,
-                                        self,
-                                        &self.rate_history,
-                                        &self.temperature_history,
-                                        probe_view.as_ref(),
-                                    ) {
-                                        self.page = destination;
-                                    }
-                                }
+                            }
+                            Page::Wireless => {
+                                crate::ui::wireless::render_page(
+                                    ui,
+                                    &snapshot,
+                                    &self.wireless_history,
+                                    self.language,
+                                    self,
+                                );
                             }
                             Page::Diagnostics => {
                                 crate::ui::components::page_heading(
                                     ui,
-                                    "网络诊断",
-                                    "分别检查模块通路与电脑网络，按证据定位问题",
+                                    &t(
+                                        self.language,
+                                        crate::localization::TextKey::DiagnosticsPageTitle,
+                                    ),
+                                    &t(
+                                        self.language,
+                                        crate::localization::TextKey::DiagnosticsPageIntro,
+                                    ),
                                 );
                                 if crate::ui::module_network_check::render(
                                     ui,
@@ -1778,22 +1802,53 @@ impl PanelApp {
                                 let output = settings::render(ui, &snapshot, self.language);
                                 for command in output.commands {
                                     self.send(command);
+                                    ctx.request_repaint_after(Duration::from_millis(20));
                                 }
                                 ui.separator();
                                 ui.horizontal_wrapped(|ui| {
-                                    if ui.button("重新查看首次使用引导").clicked() {
+                                    if ui
+                                        .button(t(
+                                            self.language,
+                                            crate::localization::TextKey::SettingsReopenOnboarding,
+                                        ))
+                                        .clicked()
+                                    {
                                         self.open_onboarding();
                                     }
-                                    if ui.button("使用说明").clicked() {
-                                        show_help_dialog();
+                                    if ui
+                                        .button(t(
+                                            self.language,
+                                            crate::localization::TextKey::HelpDialogTitle,
+                                        ))
+                                        .clicked()
+                                    {
+                                        show_help_dialog(self.language);
                                     }
-                                    if ui.button("关于本应用").clicked() {
-                                        show_about_dialog();
+                                    if ui
+                                        .button(t(
+                                            self.language,
+                                            crate::localization::TextKey::AboutDialogTitle,
+                                        ))
+                                        .clicked()
+                                    {
+                                        show_about_dialog(self.language);
                                     }
-                                    if ui.button("重启面板").clicked() {
+                                    if ui
+                                        .button(t(
+                                            self.language,
+                                            crate::localization::TextKey::RestartPanelTitle,
+                                        ))
+                                        .clicked()
+                                    {
                                         self.start_panel_restart(ctx);
                                     }
-                                    if ui.button("退出应用").clicked() {
+                                    if ui
+                                        .button(t(
+                                            self.language,
+                                            crate::localization::TextKey::ExitApp,
+                                        ))
+                                        .clicked()
+                                    {
                                         self.window.explicit_exit = true;
                                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                         if let Some(tray) = self.tray.as_mut() {
@@ -1822,8 +1877,12 @@ impl PanelApp {
                 egui::Area::new("panel-toast".into())
                     .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
                     .show(ctx, |ui| {
-                        ui.visuals_mut().override_text_color = Some(Color32::WHITE);
-                        egui::Frame::dark_canvas(ui.style())
+                        // A toast is the same solid treatment as a primary button, so it reads as
+                        // part of the panel instead of an inverted canvas block.
+                        ui.visuals_mut().override_text_color = Some(scale::on_selected());
+                        egui::Frame::none()
+                            .fill(scale::selected())
+                            .rounding(egui::Rounding::same(scale::RADIUS_CONTROL))
                             .inner_margin(egui::Margin::symmetric(
                                 scale::SECTION_MARGIN[0],
                                 scale::SECTION_MARGIN[1],
@@ -1831,7 +1890,9 @@ impl PanelApp {
                             .show(ui, |ui| {
                                 wrapped_label(
                                     ui,
-                                    RichText::new(toast.text.text.clone()).size(scale::BODY),
+                                    RichText::new(toast.text.text.clone())
+                                        .size(scale::BODY)
+                                        .color(scale::on_selected()),
                                 );
                             });
                     });
@@ -1873,15 +1934,21 @@ impl PanelApp {
     fn start_panel_restart(&mut self, ctx: &egui::Context) {
         if self.serial_work_busy() {
             dji4g_windows_platform::show_message_box(
-                "请等待当前任务完成",
-                "正在发送短信、执行修复或运行设备工具。完成或取消后再重启面板，避免中断当前任务。",
+                &t(self.language, crate::localization::TextKey::BusyDialogTitle),
+                &t(self.language, crate::localization::TextKey::RestartBusyBody),
             );
             return;
         }
         if !dji4g_windows_platform::confirm_message_box(
             None,
-            "重启面板",
-            "面板将关闭并立即重新启动。\n设备会在重启后重新识别；正在填写但未发送的短信草稿会丢失。\n\n现在重启？",
+            &t(
+                self.language,
+                crate::localization::TextKey::RestartPanelTitle,
+            ),
+            &t(
+                self.language,
+                crate::localization::TextKey::RestartConfirmBody,
+            ),
         ) {
             return;
         }
@@ -1902,10 +1969,20 @@ impl PanelApp {
                     tray.acknowledge_exit();
                 }
             }
-            Err(error) => dji4g_windows_platform::show_message_box(
-                "无法重启面板",
-                &format!("面板保持运行，未重启。\n{error}\n可先退出，再手动打开程序。"),
-            ),
+            Err(error) => {
+                let detail = error.to_string();
+                dji4g_windows_platform::show_message_box(
+                    &t(
+                        self.language,
+                        crate::localization::TextKey::RestartFailedTitle,
+                    ),
+                    &crate::localization::format_positional(
+                        self.language,
+                        crate::localization::TextKey::RestartFailedBody,
+                        &[&detail],
+                    ),
+                )
+            }
         }
     }
 
@@ -1913,15 +1990,36 @@ impl PanelApp {
         if self.support_report.busy() || crate::ui::driver_setup::installation_busy(&self.snapshot)
         {
             dji4g_windows_platform::show_message_box(
-                "请等待当前任务完成",
-                "正在导出日志、发送短信或执行/确认修复。完成后再安装驱动，避免中断当前任务。",
+                &t(self.language, crate::localization::TextKey::BusyDialogTitle),
+                &t(self.language, crate::localization::TextKey::InstallBusyBody),
+            );
+            return;
+        }
+        // The bundled package only binds the DJI 一代 VID/PID; a recognized read-only module is
+        // refused here as well as in the page, so no entry point can promise it a driver.
+        if !crate::ui::driver_setup::controller_may_install_driver(&self.snapshot) {
+            dji4g_windows_platform::show_message_box(
+                &t(
+                    self.language,
+                    crate::localization::TextKey::InstallDriverTitle,
+                ),
+                &t(
+                    self.language,
+                    crate::localization::TextKey::ReadOnlyModuleReason,
+                ),
             );
             return;
         }
         if !dji4g_windows_platform::confirm_message_box(
             None,
-            "安装模块驱动",
-            "面板将自动退出，随后显示 Windows 管理员授权，请选择“是”。\n仅安装硬件匹配的缺失驱动，正常接口不会强制重装。\n\n完成或取消后会返回普通权限的面板，显示结果和下一步；如提示重启，请先重启电脑。\n\n现在继续？",
+            &t(
+                self.language,
+                crate::localization::TextKey::InstallDriverTitle,
+            ),
+            &t(
+                self.language,
+                crate::localization::TextKey::InstallDriverBody,
+            ),
         ) {
             return;
         }
@@ -1938,10 +2036,20 @@ impl PanelApp {
                     tray.acknowledge_exit();
                 }
             }
-            Err(error) => dji4g_windows_platform::show_message_box(
-                "无法启动安装器",
-                &format!("面板保持运行，尚未安装驱动。\n{error}\n请导出详细日志。"),
-            ),
+            Err(error) => {
+                let detail = error.to_string();
+                dji4g_windows_platform::show_message_box(
+                    &t(
+                        self.language,
+                        crate::localization::TextKey::InstallFailedTitle,
+                    ),
+                    &crate::localization::format_positional(
+                        self.language,
+                        crate::localization::TextKey::InstallFailedBody,
+                        &[&detail],
+                    ),
+                )
+            }
         }
     }
 
@@ -2043,7 +2151,10 @@ impl PanelApp {
             return;
         };
         if matches!(command, UiCommand::PrepareNetworkRepair { .. }) {
-            message.push_str("\n\n完成后将只读复检一次，向固定端点发送少量公网与 DNS 请求；长期探测设置不变。失败或结果未知不会自动再次修复。");
+            message.push_str(&t(
+                self.language,
+                crate::localization::TextKey::ConfirmProbeNote,
+            ));
         }
         // Send the prepare first: the controller handles it within one poll interval (~20 ms),
         // typically while the user is still reading the box that opens below.
@@ -2117,12 +2228,14 @@ impl PanelCommandSink for PanelApp {
 
 impl eframe::App for PanelApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Rounded central panels do not paint their outer margins or corner cut-outs.
-        // Use an opaque app surface rather than eframe's translucent dark default.
-        Color32::from_rgb(240, 244, 249).to_normalized_gamma_f32()
+        // Rounded central panels do not paint their outer margins or corner cut-outs, so the
+        // canvas behind them is an opaque token rather than eframe's translucent dark default.
+        crate::ui::scale::surface_page().to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Re-apply the tokens once per pass: this is what makes an OS light/dark switch, or a
+        // change made on the settings page, take effect without restarting the panel.
         self.poll_shell_events(ctx);
         self.receive_latest_nonblocking(ctx);
         self.handle_close_request(ctx);
@@ -2278,9 +2391,17 @@ pub fn hotspot_status_message(
     (title, body)
 }
 
-fn show_about_dialog() {
+fn about_window_title(language: Language) -> String {
+    crate::localization::format_positional(
+        language,
+        TextKey::AboutWindowTitle,
+        &[&t(language, TextKey::AppTitle)],
+    )
+}
+
+fn show_about_dialog(language: Language) {
     dji4g_windows_platform::show_message_box(
-        "关于 DJI 一代 4G 面板",
+        &about_window_title(language),
         &format!(
             "DJI 一代 4G 面板 v{}
 
@@ -2292,9 +2413,9 @@ fn show_about_dialog() {
     );
 }
 
-fn show_help_dialog() {
+fn show_help_dialog(language: Language) {
     dji4g_windows_platform::show_message_box(
-        "使用说明",
+        &t(language, crate::localization::TextKey::HelpDialogTitle),
         "概览：模块当前能否上网的结论与原因。
 诊断：设备、蜂窝、网卡的分层证据与探测结果。
 修复：需要逐项确认的受控写操作。
@@ -2305,10 +2426,7 @@ fn show_help_dialog() {
 }
 
 fn language_from_code(value: LanguageCode) -> Language {
-    match value {
-        LanguageCode::ZhCn => Language::ZhCn,
-        LanguageCode::EnUs => Language::ZhCn,
-    }
+    crate::localization::language_of(value)
 }
 
 #[cfg(test)]
@@ -2317,6 +2435,15 @@ mod tests {
     use crate::tray::TrayLabels;
     use dji4g_application::ReducerState;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn about_title_formats_the_application_name_in_every_language() {
+        for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+            let title = about_window_title(language);
+            assert!(!title.contains("{}"));
+            assert!(title.contains(&t(language, TextKey::AppTitle)));
+        }
+    }
 
     /// The worker-side action hook and the slot through which tests observe its installation.
     type ActionHook = Arc<dyn Fn(TrayCommand) + Send + Sync>;
@@ -2400,14 +2527,23 @@ mod tests {
     }
 
     #[test]
-    fn native_canvas_is_opaque_material_surface() {
+    fn native_canvas_is_opaque_and_follows_the_active_ramp() {
         let app = panel();
+        // The canvas behind the rounded sheet must be the alt surface of the active theme, never
+        // eframe's translucent dark default (which showed as black bars on the real window).
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
-            assert_eq!(
-                eframe::App::clear_color(&app, &visuals),
-                Color32::from_rgb(240, 244, 249).to_normalized_gamma_f32()
-            );
+            let color = eframe::App::clear_color(&app, &visuals);
+            assert_eq!(color[3], 1.0, "the canvas must be fully opaque");
         }
+        let context = egui::Context::default();
+        crate::ui::style_root(&context, egui::ThemePreference::Light);
+        let light = eframe::App::clear_color(&app, &egui::Visuals::light());
+        crate::ui::style_root(&context, egui::ThemePreference::Dark);
+        let dark = eframe::App::clear_color(&app, &egui::Visuals::dark());
+        assert!(
+            dark[0] < light[0],
+            "the dark canvas must be darker than the light one"
+        );
     }
 
     fn panel() -> PanelApp {
@@ -2525,7 +2661,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
             ),
-            TrayLabels::zh_cn(),
+            TrayLabels::for_language(Language::ZhCn),
         )
         .expect("the recording backend always creates");
         app.attach_tray(tray);
@@ -2549,7 +2685,7 @@ mod tests {
                 Arc::clone(&hwnd_slot),
                 Arc::clone(&hook_slot),
             ),
-            TrayLabels::zh_cn(),
+            TrayLabels::for_language(Language::ZhCn),
         )
         .expect("the recording backend always creates");
         app.attach_tray(tray);
@@ -2922,7 +3058,10 @@ mod tests {
         // The startup lookup finds the real window by the exact title main.rs passes to
         // `eframe::run_native`; the zh-CN tray labels carry the same string. Pinning the two
         // together makes a rename trip this test instead of silently killing 「打开面板」.
-        assert_eq!(PANEL_WINDOW_TITLE, TrayLabels::zh_cn().tooltip);
+        assert_eq!(
+            PANEL_WINDOW_TITLE,
+            TrayLabels::for_language(Language::ZhCn).tooltip
+        );
     }
 
     #[test]

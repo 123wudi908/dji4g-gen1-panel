@@ -13,6 +13,11 @@ use super::{field_label, meta_text, scale, section_frame, section_heading, wrapp
 use crate::app::PanelCommandSink;
 use crate::localization::{Language, LocalizedText, TextKey};
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepairActionVm {
     pub action: ActionKind,
@@ -141,15 +146,22 @@ pub(crate) fn render(
     sink: &dyn PanelCommandSink,
 ) -> bool {
     let vm = repairs_vm(snapshot, now, language);
-    super::components::page_heading(ui, &vm.title.text, "先检查原因，再确认需要执行的操作");
+    super::components::page_heading(
+        ui,
+        &vm.title.text,
+        &t(language, crate::localization::TextKey::RepairsIntro),
+    );
     wrapped_label(
         ui,
         RichText::new(vm.notice.text.clone())
             .size(scale::RATE_AUX)
-            .color(scale::SECONDARY),
+            .color(scale::secondary()),
     );
     wrapped_label(ui, meta_text(vm.driver_notice.text.clone()));
     let install_requested = super::driver_setup::render(ui, snapshot, now, language);
+    // The setup checklist follows the driver card it belongs to. It used to sit on the overview,
+    // where it was the only thing on a read-only page that asked the user to do something.
+    super::driver_setup::render_guide(ui, snapshot, now, language);
     let (usb_actions, other_actions): (Vec<_>, Vec<_>) =
         vm.actions.into_iter().partition(|action| {
             matches!(
@@ -158,21 +170,35 @@ pub(crate) fn render(
             )
         });
     section_frame(ui, |ui| {
-        ui.label(section_heading("电脑网卡模式"));
-        ui.hyperlink_to("查看大疆官方使用说明", "https://dl.djicdn.com/downloads/DJI_Mavic_3/DJI_Cellular_Dongle_LTE_USB_Modem_User_Guide_v1.0.pdf");
-        wrapped_label(
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::RepairsAdapterModeHeading,
+        )));
+        super::components::link(
             ui,
-            "部分一代模块保留原厂固件即可用作电脑网卡。先检查驱动和当前网络状态；已经能上网时无需切换。",
+            &t(language, crate::localization::TextKey::RepairsDjiGuideLink),
+            "https://dl.djicdn.com/downloads/DJI_Mavic_3/DJI_Cellular_Dongle_LTE_USB_Modem_User_Guide_v1.0.pdf",
         );
         wrapped_label(
             ui,
-            meta_text(
-                "下方操作只切换 USB 网络配置，不刷写固件。DJI NDIS 配置需要匹配的 Windows 驱动；ECM 配置的兼容性取决于系统与驱动。",
+            t(
+                language,
+                crate::localization::TextKey::RepairsAdapterModeNote,
             ),
         );
         wrapped_label(
             ui,
-            meta_text("此操作只保存 USB 配置；需手动重启模块后验证模式。重启会中断连接。"),
+            meta_text(t(
+                language,
+                crate::localization::TextKey::RepairsUsbSwitchNote,
+            )),
+        );
+        wrapped_label(
+            ui,
+            meta_text(t(
+                language,
+                crate::localization::TextKey::RepairsUsbOnlyNote,
+            )),
         );
         for action in usb_actions {
             render_action_button(ui, action, language, sink);
@@ -185,7 +211,10 @@ pub(crate) fn render(
         .into_iter()
         .partition(|action| !is_interrupting(&action.action));
     section_frame(ui, |ui| {
-        ui.label(section_heading("低风险与网络恢复"));
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::RepairsLowRiskHeading,
+        )));
         ui.vertical(|ui| {
             // Even gaps in both axes so a wrapped group still reads as an aligned block.
             ui.spacing_mut().item_spacing =
@@ -196,7 +225,10 @@ pub(crate) fn render(
         });
     });
     section_frame(ui, |ui| {
-        ui.label(section_heading("会中断连接"));
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::RepairsInterruptsConnection,
+        )));
         for action in &interrupting {
             if matches!(action.action, ActionKind::EditApn { .. }) {
                 let _ = render_apn_editor(ui, action.clone(), language, sink);
@@ -231,7 +263,7 @@ fn is_interrupting(action: &ActionKind) -> bool {
 fn render_action_button(
     ui: &mut Ui,
     action: RepairActionVm,
-    _language: Language,
+    language: Language,
     sink: &dyn PanelCommandSink,
 ) {
     let button = ui
@@ -245,7 +277,7 @@ fn render_action_button(
             });
             super::components::action_button(
                 ui,
-                "查看方案",
+                &t(language, crate::localization::TextKey::RepairsViewPlan),
                 super::components::ButtonKind::Outlined,
                 action.enabled,
                 action.disabled_reason.as_ref().map(|r| r.text.as_str()),
@@ -277,13 +309,19 @@ fn render_apn_editor(
         .data(|data| data.get_temp::<String>(apn_id))
         .unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        ui.label(field_label("PDP 上下文"));
+        ui.label(field_label(t(
+            language,
+            crate::localization::TextKey::FieldPdpContext,
+        )));
         ui.add(egui::DragValue::new(&mut cid).range(1..=16));
-        ui.label(field_label("新 APN"));
+        ui.label(field_label(t(
+            language,
+            crate::localization::TextKey::FieldNewApn,
+        )));
         // Height matches the neighbouring buttons so the input row does not read as shorter
         // than the controls beside it; the row wraps, so the width cannot overflow.
         ui.add_sized(
-            [160.0, 26.0],
+            [160.0, scale::CONTROL_H],
             egui::TextEdit::singleline(&mut value).password(true),
         );
     });

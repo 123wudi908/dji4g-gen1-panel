@@ -9,57 +9,91 @@ use dji4g_domain::{ModuleNetworkVerdict as Verdict, NetworkEvidenceState as Evid
 use eframe::egui::{self, RichText};
 use std::time::SystemTime;
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 #[must_use]
-pub fn conclusion(check: &ModuleNetworkCheckSnapshot) -> (StatusTone, &'static str) {
+pub fn conclusion(check: &ModuleNetworkCheckSnapshot, language: Language) -> (StatusTone, String) {
     match check.phase {
-        Phase::Queued => (StatusTone::Progress, "已排队，等待当前任务结束后检查"),
-        Phase::Running => (StatusTone::Progress, "正在检查模块网络…"),
-        Phase::Stale => (StatusTone::Neutral, "结果已过期或设备已变化，请重新检查"),
+        Phase::Queued => (
+            StatusTone::Progress,
+            t(language, crate::localization::TextKey::MNCQueued),
+        ),
+        Phase::Running => (
+            StatusTone::Progress,
+            t(language, crate::localization::TextKey::MNCChecking),
+        ),
+        Phase::Stale => (
+            StatusTone::Neutral,
+            t(language, crate::localization::TextKey::MNCStale),
+        ),
         Phase::Finished => match check.verdict {
             Verdict::Usable => (
                 StatusTone::Positive,
-                "模块网络可用：本次公网与 DNS 验证通过",
+                t(language, crate::localization::TextKey::MNCAvailable),
             ),
-            Verdict::DeviceMissing => {
-                (StatusTone::Caution, "未识别到模块，请检查数据线和 USB 接口")
-            }
-            Verdict::AdapterIssue => (StatusTone::Caution, "模块网卡检查未通过，请查看具体证据"),
-            Verdict::AddressRouteIssue => (StatusTone::Caution, "已识别网卡，但缺少可用地址或路由"),
+            Verdict::DeviceMissing => (
+                StatusTone::Caution,
+                t(language, crate::localization::TextKey::MNCNoDevice),
+            ),
+            Verdict::AdapterIssue => (
+                StatusTone::Caution,
+                t(language, crate::localization::TextKey::MNCAdapterFailed),
+            ),
+            Verdict::AddressRouteIssue => (
+                StatusTone::Caution,
+                t(language, crate::localization::TextKey::MNCAdapterNoAddress),
+            ),
             Verdict::LinkDown => (
                 StatusTone::Caution,
-                "模块网卡链路未连接，请检查 USB 连接与设备状态",
+                t(language, crate::localization::TextKey::MNCAdapterLinkDown),
             ),
             Verdict::BoundRouteIssue => (
                 StatusTone::Caution,
-                "模块绑定路由查询未通过，请查看地址与路由配置",
+                t(language, crate::localization::TextKey::MNCBoundRouteFailed),
             ),
             Verdict::PublicProbeFailed => (
                 StatusTone::Caution,
-                "模块公网测试未通过，请查看蜂窝与公网证据",
+                t(language, crate::localization::TextKey::MNCBoundPublicFailed),
             ),
-            Verdict::DnsIssue => (StatusTone::Caution, "模块公网可达，但 DNS 解析未通过"),
+            Verdict::DnsIssue => (
+                StatusTone::Caution,
+                t(language, crate::localization::TextKey::MNCBoundDnsFailed),
+            ),
             Verdict::Inconclusive => (
                 StatusTone::Neutral,
-                "尚不能判断模块能否上网，请查看未完成的检查",
+                t(language, crate::localization::TextKey::MNCInconclusive),
             ),
         },
     }
 }
-fn evidence_label(state: Evidence) -> &'static str {
+fn evidence_label(state: Evidence, language: Language) -> String {
     match state {
-        Evidence::NotRun => "未执行",
-        Evidence::Running => "检查中",
-        Evidence::Passed => "通过",
-        Evidence::Failed => "未通过",
-        Evidence::Unavailable => "无法获取",
-        Evidence::Stale => "已过期",
+        Evidence::NotRun => t(
+            language,
+            crate::localization::TextKey::MNCEvidenceUnexecuted,
+        ),
+        Evidence::Running => t(language, crate::localization::TextKey::MNCEvidenceRunning),
+        Evidence::Passed => t(language, crate::localization::TextKey::MNCEvidencePassed),
+        Evidence::Failed => t(language, crate::localization::TextKey::MNCEvidenceFailed),
+        Evidence::Unavailable => t(
+            language,
+            crate::localization::TextKey::MNCEvidenceUnavailable,
+        ),
+        Evidence::Stale => t(language, crate::localization::TextKey::MNCEvidenceExpired),
     }
 }
-fn repair_label(kind: NetworkRepairKind) -> &'static str {
+fn repair_label(kind: NetworkRepairKind, language: Language) -> String {
     match kind {
-        NetworkRepairKind::RenewDhcp => "更新模块网卡 DHCP 租约",
-        NetworkRepairKind::RestartAdapter => "重启模块网卡",
-        NetworkRepairKind::AutomaticDns => "恢复自动 DNS",
+        NetworkRepairKind::RenewDhcp => t(language, crate::localization::TextKey::MNCDhcpLease),
+        NetworkRepairKind::RestartAdapter => {
+            t(language, crate::localization::TextKey::MNCRestartAdapter)
+        }
+        NetworkRepairKind::AutomaticDns => {
+            t(language, crate::localization::TextKey::MNCAutomaticDns)
+        }
     }
 }
 
@@ -71,18 +105,7 @@ pub fn render(
     language: Language,
     sink: &dyn PanelCommandSink,
 ) -> bool {
-    render_impl(ui, snapshot, now, language, sink, false)
-}
-
-/// Overview presentation of the same check, consent and repair state.
-pub(crate) fn render_compact(
-    ui: &mut egui::Ui,
-    snapshot: &ControllerSnapshot,
-    now: SystemTime,
-    language: Language,
-    sink: &dyn PanelCommandSink,
-) -> bool {
-    render_impl(ui, snapshot, now, language, sink, true)
+    render_impl(ui, snapshot, now, language, sink)
 }
 
 fn render_impl(
@@ -91,7 +114,6 @@ fn render_impl(
     now: SystemTime,
     language: Language,
     sink: &dyn PanelCommandSink,
-    compact: bool,
 ) -> bool {
     let mut guidance = false;
     let confirm_id = egui::Id::new("module-network-probe-consent");
@@ -106,25 +128,26 @@ fn render_impl(
         .module_network_check
         .as_ref()
         .is_some_and(|c| c.active());
-    let frame = if compact {
-        egui::Frame::none()
-    } else {
-        egui::Frame::none()
-            .fill(egui::Color32::WHITE)
-            .rounding(12.0)
-            .inner_margin(12.0)
-    };
+    let frame = egui::Frame::none()
+        .fill(super::scale::surface())
+        .rounding(12.0)
+        .inner_margin(12.0);
     frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 8.0;
         ui.horizontal_wrapped(|ui| {
-            if compact { ui.heading("概览"); } else { ui.label(super::section_heading("模块网络检查")); }
+            ui.label(super::section_heading(t(
+                language,
+                crate::localization::TextKey::MNCHeading,
+            )));
+            let run_action = t(language, crate::localization::TextKey::MNCRunAction);
+            let running_reason = t(language, crate::localization::TextKey::MNCRunningReason);
             if super::components::action_button(
                 ui,
-                "检查模块网络",
+                &run_action,
                 super::components::ButtonKind::Filled,
                 !active,
-                Some("本轮检查尚未结束"),
+                Some(&running_reason),
             )
             .clicked()
             {
@@ -143,168 +166,273 @@ fn render_impl(
             }
         });
         let mut details = |ui: &mut egui::Ui| {
-        if let Some(check) = snapshot.module_network_check.as_ref() {
-            if !compact {
-                let (tone, text) = conclusion(check);
+            if let Some(check) = snapshot.module_network_check.as_ref() {
+                let (tone, text) = conclusion(check, language);
                 super::wrapped_label(
                     ui,
                     RichText::new(format!("{} {text}", tone.marker())).color(tone.color()),
                 );
-            }
-            if let Some(outcome) = &check.operation_outcome {
-                super::wrapped_label(
-                    ui,
-                    format!(
-                        "操作结果：{}",
-                        super::operation_outcome_text(outcome, language).text
-                    ),
-                );
-                ui.label("下方为操作后的只读复检；不会自动重复修复。");
-            }
-            if check.phase == Phase::Running {
-                let current = if check.evidence.device != Evidence::Passed {
-                    "识别 USB 模块"
-                } else if check.adapter.is_none() {
-                    "读取串口、蜂窝与模块网卡"
-                } else {
-                    "查询模块绑定路由，验证公网、DNS 与电脑出口"
-                };
-                super::wrapped_label(ui, format!("当前步骤：{current}"));
-            }
-            for repair in check.recommended_repairs() {
-                let gate = super::action_availability::repair_action_availability(
-                    snapshot,
-                    repair.readiness_key(),
-                    now,
-                    language,
-                );
-                let enabled = check.fresh(
-                    snapshot
-                        .app
-                        .device
-                        .as_ref()
-                        .map_or(dji4g_domain::DeviceEpoch(0), |d| d.epoch),
-                    now,
-                ) && gate.enabled;
-                if ui
-                    .add_enabled(
-                        enabled,
-                        egui::Button::new(repair_label(repair)).min_size(egui::vec2(0.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    sink.prepare_network_repair_now(check.request_id, repair);
-                }
-                if !enabled {
+                if let Some(outcome) = &check.operation_outcome {
                     super::wrapped_label(
                         ui,
-                        super::meta_text(
-                            gate.reason
-                                .map(|r| r.text)
-                                .unwrap_or_else(|| "检查结果已过期，请重新检查".into()),
+                        crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::MNCOperationResult,
+                            &[&super::operation_outcome_text(outcome, language).text],
                         ),
                     );
+                    ui.label(t(
+                        language,
+                        crate::localization::TextKey::MNCReadOnlyReverify,
+                    ));
                 }
-            }
-            if check.phase == Phase::Finished
-                && matches!(check.verdict, Verdict::AdapterIssue | Verdict::Inconclusive)
-                && check.evidence.device == Evidence::Passed
-                && check.adapter.is_none()
-            {
-                super::wrapped_label(
-                    ui,
-                    "模块已识别，但尚未核实网卡接口。驱动、USB 网络模式或读取失败都可能有关。",
-                );
-                if ui
-                    .add(
-                        egui::Button::new("查看驱动与接口检查步骤").min_size(egui::vec2(0.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    guidance = true;
-                }
-            }
-            if check.verdict == Verdict::PublicProbeFailed {
-                super::wrapped_label(
-                    ui,
-                    "请确认 SIM 卡可用、蜂窝注册与套餐状态。一次超时不能说明驱动损坏。",
-                );
-            }
-            if check.phase == Phase::Finished && check.evidence.public == Evidence::NotRun {
-                super::wrapped_label(
-                    ui,
-                    "本次未验证公网连接。点击检查并允许一次联网探测，长期设置保持不变。",
-                );
-            }
-            if let Some(probe) = check.probe.as_ref() {
-                for route in &probe.route_choices {
-                    let description = match route.owner {
-                        Some(DefaultRouteDto::TargetAdapter) => "选择模块网卡",
-                        Some(DefaultRouteDto::VpnOrTun) => "选择代理或 VPN；这本身不是故障",
-                        Some(_) => "选择其他网卡（例如 Wi-Fi / 有线）；这本身不是故障",
-                        None => "无法确认出口",
+                if check.phase == Phase::Running {
+                    let current = if check.evidence.device != Evidence::Passed {
+                        t(language, crate::localization::TextKey::MNCStepUsb)
+                    } else if check.adapter.is_none() {
+                        t(language, crate::localization::TextKey::MNCStepPorts)
+                    } else {
+                        t(language, crate::localization::TextKey::MNCStepRoute)
                     };
                     super::wrapped_label(
                         ui,
-                        super::meta_text(format!(
-                            "{:?} 对本次测试目标的路径：{description}。",
-                            route.family
-                        )),
+                        crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::MNCStepCurrent,
+                            &[&current],
+                        ),
                     );
                 }
-            }
-            let evidence = |ui: &mut egui::Ui| {
-                for (name, state) in [("USB 模块", check.evidence.device), ("网卡读取", check.evidence.adapter), ("链路", check.evidence.link),
-                    ("地址与路由", check.evidence.address_route),
-                    ("模块绑定路由查询", check.evidence.bound_route), ("模块公网", check.evidence.public), ("模块 DNS", check.evidence.dns)] {
-                    ui.label(format!("{name}：{}", evidence_label(if check.phase == Phase::Stale { Evidence::Stale } else { state })));
-                }
-                if let Some(adapter) = check.adapter.as_ref() {
-                    if let Some(details) = adapter.details.as_ref() {
-                        ui.label(format!("链路：{}；IPv4 DHCP：{}", if details.link_up { "已连接" } else { "未连接" }, if details.dhcp_v4 { "启用" } else { "未启用" }));
+                for repair in check.recommended_repairs() {
+                    let gate = super::action_availability::repair_action_availability(
+                        snapshot,
+                        repair.readiness_key(),
+                        now,
+                        language,
+                    );
+                    let enabled = check.fresh(
+                        snapshot
+                            .app
+                            .device
+                            .as_ref()
+                            .map_or(dji4g_domain::DeviceEpoch(0), |d| d.epoch),
+                        now,
+                    ) && gate.enabled;
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(repair_label(repair, language))
+                                .min_size(egui::vec2(0.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        sink.prepare_network_repair_now(check.request_id, repair);
                     }
-                    ui.label(format!("可用协议：IPv4 {} / IPv6 {}", adapter.ipv4, adapter.ipv6));
-                    if adapter.details.as_ref().is_some_and(|d| !d.dhcp_v4) { super::wrapped_label(ui, "检测到非 DHCP 配置，不会自动覆盖静态地址。请确认原有网络设置。"); }
+                    if !enabled {
+                        super::wrapped_label(
+                            ui,
+                            super::meta_text(gate.reason.map(|r| r.text).unwrap_or_else(|| {
+                                t(language, crate::localization::TextKey::MNCResultExpired)
+                            })),
+                        );
+                    }
                 }
-                for id in [dji4g_application::DiagnosticCheckId::AtControl, dji4g_application::DiagnosticCheckId::Cellular] {
-                    let state = &check.diagnostics.get(id).state;
-                    super::wrapped_label(ui, format!("{}：{}", if id == dji4g_application::DiagnosticCheckId::AtControl { "串口通信" } else { "SIM 与蜂窝" }, crate::localization::LocalizedText::new(language, crate::localization::diagnostic_state(state)).text));
+                if check.phase == Phase::Finished
+                    && matches!(check.verdict, Verdict::AdapterIssue | Verdict::Inconclusive)
+                    && check.evidence.device == Evidence::Passed
+                    && check.adapter.is_none()
+                {
+                    super::wrapped_label(
+                        ui,
+                        t(language, crate::localization::TextKey::MNCDeviceNoAdapter),
+                    );
+                    if ui
+                        .add(
+                            egui::Button::new(t(
+                                language,
+                                crate::localization::TextKey::MNCViewSteps,
+                            ))
+                            .min_size(egui::vec2(0.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        guidance = true;
+                    }
                 }
-                super::wrapped_label(ui, super::meta_text("绑定路由查询只证明找到了匹配路由，不证明网关可达。公网探测绑定模块网卡；电脑路径只代表本次固定测试目标，不能代表所有应用。未执行、无法获取和过期均不等于故障。"));
-            };
-            if compact {
+                if check.verdict == Verdict::PublicProbeFailed {
+                    super::wrapped_label(ui, t(language, crate::localization::TextKey::MNCSimHint));
+                }
+                if check.phase == Phase::Finished && check.evidence.public == Evidence::NotRun {
+                    super::wrapped_label(
+                        ui,
+                        t(language, crate::localization::TextKey::MNCNoPublicProbe),
+                    );
+                }
+                if let Some(probe) = check.probe.as_ref() {
+                    for route in &probe.route_choices {
+                        let description = match route.owner {
+                            Some(DefaultRouteDto::TargetAdapter) => {
+                                t(language, crate::localization::TextKey::MNCEgressAdapter)
+                            }
+                            Some(DefaultRouteDto::VpnOrTun) => {
+                                t(language, crate::localization::TextKey::MNCEgressProxy)
+                            }
+                            Some(_) => t(language, crate::localization::TextKey::MNCEgressOther),
+                            None => t(language, crate::localization::TextKey::MNCEgressUnknown),
+                        };
+                        super::wrapped_label(
+                            ui,
+                            super::meta_text(crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::MNCEgressPath,
+                                &[&format!("{:?}", route.family), &description],
+                            )),
+                        );
+                    }
+                }
+                let evidence = |ui: &mut egui::Ui| {
+                    // The evidence rows are supporting detail that used to hide behind a disclosure
+                    // triangle, so they sit in the quiet evidence tier now that they are always shown.
+                    for (name, state) in [
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeUsb),
+                            check.evidence.device,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeAdapterRead),
+                            check.evidence.adapter,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeLink),
+                            check.evidence.link,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeAddressRoute),
+                            check.evidence.address_route,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeBoundRoute),
+                            check.evidence.bound_route,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeBoundPublic),
+                            check.evidence.public,
+                        ),
+                        (
+                            t(language, crate::localization::TextKey::MNCProbeBoundDns),
+                            check.evidence.dns,
+                        ),
+                    ] {
+                        ui.label(super::detail_text(format!(
+                            "{name}：{}",
+                            evidence_label(
+                                if check.phase == Phase::Stale {
+                                    Evidence::Stale
+                                } else {
+                                    state
+                                },
+                                language,
+                            )
+                        )));
+                    }
+                    if let Some(adapter) = check.adapter.as_ref() {
+                        if let Some(details) = adapter.details.as_ref() {
+                            let link = if details.link_up {
+                                t(language, crate::localization::TextKey::MNCConnected)
+                            } else {
+                                t(language, crate::localization::TextKey::MNCDisconnected)
+                            };
+                            let dhcp = if details.dhcp_v4 {
+                                t(language, crate::localization::TextKey::MNCEnabled)
+                            } else {
+                                t(language, crate::localization::TextKey::MNCDisabled)
+                            };
+                            ui.label(super::detail_text(crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::MNCAdapterLinkLine,
+                                &[&link, &dhcp],
+                            )));
+                        }
+                        ui.label(super::detail_text(crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::MNCProtocolLine,
+                            &[&adapter.ipv4.to_string(), &adapter.ipv6.to_string()],
+                        )));
+                        if adapter.details.as_ref().is_some_and(|d| !d.dhcp_v4) {
+                            super::wrapped_label(
+                                ui,
+                                super::detail_text(t(
+                                    language,
+                                    crate::localization::TextKey::MNCStaticAddressNote,
+                                )),
+                            );
+                        }
+                    }
+                    for id in [
+                        dji4g_application::DiagnosticCheckId::AtControl,
+                        dji4g_application::DiagnosticCheckId::Cellular,
+                    ] {
+                        let state = &check.diagnostics.get(id).state;
+                        super::wrapped_label(
+                            ui,
+                            super::detail_text(format!(
+                                "{}：{}",
+                                if id == dji4g_application::DiagnosticCheckId::AtControl {
+                                    t(language, crate::localization::TextKey::MNCAtControl)
+                                } else {
+                                    t(language, crate::localization::TextKey::MNCSimCellular)
+                                },
+                                crate::localization::LocalizedText::new(
+                                    language,
+                                    crate::localization::diagnostic_state(state)
+                                )
+                                .text
+                            )),
+                        );
+                    }
+                    super::wrapped_label(
+                        ui,
+                        super::meta_text(t(
+                            language,
+                            crate::localization::TextKey::MNCBoundRouteNote,
+                        )),
+                    );
+                };
+                // The evidence list used to hide behind a disclosure triangle on the full page; every
+                // block of this check is now always visible, so it carries a plain heading instead.
+                ui.label(super::section_heading(t(
+                    language,
+                    crate::localization::TextKey::MNCEvidenceHeading,
+                )));
                 evidence(ui);
             } else {
-                egui::CollapsingHeader::new("查看本轮证据与处理说明").id_salt("module-network-evidence").show(ui, evidence);
+                super::wrapped_label(ui, t(language, crate::localization::TextKey::MNCIntro));
             }
-        } else {
-            super::wrapped_label(
-                ui,
-                "单独检查模块网卡能否上网，并说明电脑对测试目标选择的出口。",
-            );
-        }
         };
-        if compact {
-            if let Some(check) = snapshot.module_network_check.as_ref() {
-                let (tone, text) = conclusion(check);
-                super::wrapped_label(ui, RichText::new(format!("{} {text}", tone.marker())).color(tone.color()));
-                egui::CollapsingHeader::new("本轮证据与处理步骤").id_salt("overview-check-details").default_open(false).show(ui, &mut details);
-            }
-        } else { details(ui); }
+        details(ui);
         if consent {
             super::wrapped_label(
                 ui,
-                "后台联网探测已关闭。本次检查将向内置固定验证端点发送少量请求（公网与 DNS），不会修改长期设置。",
+                t(language, crate::localization::TextKey::MNCProbeConsent),
             );
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add(egui::Button::new("取消").min_size(egui::vec2(0.0, 32.0)))
+                    .add(
+                        egui::Button::new(t(
+                            language,
+                            crate::localization::TextKey::MNCProbeCancel,
+                        ))
+                        .min_size(egui::vec2(0.0, 32.0)),
+                    )
                     .clicked()
                 {
                     consent = false;
                 }
                 if ui
-                    .add(egui::Button::new("仅检查本地信息").min_size(egui::vec2(0.0, 32.0)))
+                    .add(
+                        egui::Button::new(t(language, crate::localization::TextKey::MNCLocalOnly))
+                            .min_size(egui::vec2(0.0, 32.0)),
+                    )
                     .clicked()
                 {
                     error = sink
@@ -317,7 +445,10 @@ fn render_impl(
                     }
                 }
                 if ui
-                    .add(egui::Button::new("允许本次联网检查").min_size(egui::vec2(0.0, 32.0)))
+                    .add(
+                        egui::Button::new(t(language, crate::localization::TextKey::MNCAllowProbe))
+                            .min_size(egui::vec2(0.0, 32.0)),
+                    )
                     .clicked()
                 {
                     error = sink
@@ -334,7 +465,8 @@ fn render_impl(
         if error {
             super::wrapped_label(
                 ui,
-                RichText::new("检查请求未提交，请稍后重试。").color(StatusTone::Caution.color()),
+                RichText::new(t(language, crate::localization::TextKey::MNCSubmitError))
+                    .color(StatusTone::Caution.color()),
             );
         }
     });
@@ -352,12 +484,28 @@ mod tests {
     fn queued_and_stale_never_display_saved_success_as_current() {
         let mut check = ModuleNetworkCheckSnapshot::queued(1, dji4g_domain::DeviceEpoch(1), false);
         check.verdict = Verdict::Usable;
-        assert!(conclusion(&check).1.contains("排队"));
+        assert!(
+            conclusion(&check, crate::localization::Language::ZhCn)
+                .1
+                .contains("排队")
+        );
         check.phase = Phase::Stale;
-        assert!(conclusion(&check).1.contains("过期"));
+        assert!(
+            conclusion(&check, crate::localization::Language::ZhCn)
+                .1
+                .contains("过期")
+        );
         check.phase = Phase::Finished;
         check.verdict = Verdict::DnsIssue;
-        assert!(conclusion(&check).1.contains("公网可达"));
-        assert!(conclusion(&check).1.contains("DNS"));
+        assert!(
+            conclusion(&check, crate::localization::Language::ZhCn)
+                .1
+                .contains("公网可达")
+        );
+        assert!(
+            conclusion(&check, crate::localization::Language::ZhCn)
+                .1
+                .contains("DNS")
+        );
     }
 }

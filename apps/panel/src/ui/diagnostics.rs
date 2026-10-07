@@ -2,7 +2,7 @@
 
 use dji4g_application::{ControllerSnapshot, DiagnosticCheckId, UiCommand};
 use dji4g_domain::{BoundDnsStatus, BoundPublicStatus, DefaultRouteOwner};
-use eframe::egui::{self, RichText, Ui};
+use eframe::egui::{RichText, Ui};
 
 use super::{
     DiagnosticStateVm, DisplayValue, carrier_display_name, diagnostic_state_vm, scale,
@@ -10,6 +10,11 @@ use super::{
 };
 use crate::app::UiCommandSink;
 use crate::localization::{Language, LocalizedText, TextKey, default_route_owner, diagnostic_id};
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticRowVm {
@@ -55,11 +60,23 @@ fn detail_for(
     let cellular = app.cellular.as_ref();
     match id {
         DiagnosticCheckId::UsbDevice => app.device.as_ref().map_or_else(
-            || Some(DisplayValue::new("未获取")),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
             |device| {
-                let problem = device
-                    .problem_code
-                    .map_or_else(|| "无问题代码".into(), |code| format!("问题代码 {code}"));
+                let problem = device.problem_code.map_or_else(
+                    || t(language, crate::localization::TextKey::DiagNoProblemCode),
+                    |code| {
+                        crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::DiagProblemCode,
+                            &[&code.to_string()],
+                        )
+                    },
+                );
                 Some(DisplayValue::new(problem))
             },
         ),
@@ -67,60 +84,124 @@ fn detail_for(
             .device
             .as_ref()
             .and_then(|device| {
-                device
-                    .at_port
-                    .as_ref()
-                    .map(|port| DisplayValue::new(format!("端口 {port}")))
+                device.at_port.as_ref().map(|port| {
+                    DisplayValue::new(crate::localization::format_positional(
+                        language,
+                        crate::localization::TextKey::DiagPort,
+                        &[&port.to_string()],
+                    ))
+                })
             })
-            .or_else(|| Some(DisplayValue::new("未获取"))),
+            .or_else(|| {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            }),
         DiagnosticCheckId::Cellular => cellular.map_or_else(
-            || Some(DisplayValue::new("未获取")),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
             |cellular| {
                 let carrier = cellular
                     .carrier
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("运营商未获取");
+                    .map_or_else(
+                        || t(language, crate::localization::TextKey::DiagCarrierNotRead),
+                        str::to_owned,
+                    );
                 let rat = cellular
                     .radio_access_technology
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("制式未获取");
+                    .map_or_else(
+                        || t(language, crate::localization::TextKey::DiagRatNotRead),
+                        str::to_owned,
+                    );
                 Some(DisplayValue::new(format!(
                     "{} · {rat}",
-                    carrier_display_name(carrier)
+                    carrier_display_name(&carrier, language)
                 )))
             },
         ),
         DiagnosticCheckId::WindowsAdapter => network.map_or_else(
-            || Some(DisplayValue::new("未获取")),
-            |network| Some(DisplayValue::copyable(preview_values(&network.addresses))),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
+            |network| {
+                Some(DisplayValue::copyable(preview_values(
+                    &network.addresses,
+                    language,
+                )))
+            },
         ),
         DiagnosticCheckId::BoundRoute => network.map_or_else(
-            || Some(DisplayValue::new("未获取")),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
             |network| {
-                Some(DisplayValue::new(format!(
-                    "仅查询匹配路由，不证明网关可达；配置网关：{}",
-                    preview_values(&network.gateways)
+                let gateways = preview_values(&network.gateways, language);
+                Some(DisplayValue::new(crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::DiagRouteProbeNote,
+                    &[&gateways],
                 )))
             },
         ),
         DiagnosticCheckId::BoundPublic => network.map_or_else(
-            || Some(DisplayValue::new("未获取")),
-            |network| Some(DisplayValue::new(bound_public_detail(network.bound_public))),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
+            |network| {
+                Some(DisplayValue::new(bound_public_detail(
+                    network.bound_public,
+                    language,
+                )))
+            },
         ),
         DiagnosticCheckId::BoundDns => network.map_or_else(
-            || Some(DisplayValue::new("未获取")),
-            |network| Some(DisplayValue::new(bound_dns_detail(network.bound_dns))),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
+            |network| {
+                Some(DisplayValue::new(bound_dns_detail(
+                    network.bound_dns,
+                    language,
+                )))
+            },
         ),
         DiagnosticCheckId::SystemRoute => network.map_or_else(
-            || Some(DisplayValue::new("未获取")),
+            || {
+                Some(DisplayValue::new(t(
+                    language,
+                    crate::localization::TextKey::ValueNotAvailable,
+                )))
+            },
             |network| {
                 let mut text =
                     LocalizedText::new(language, default_route_owner(network.system_default_route))
                         .text;
                 if matches!(network.system_default_route, DefaultRouteOwner::VpnOrTun) {
-                    text.push_str("；VPN 或代理可能正常使用此接口，模块通路另行验证");
+                    text.push_str(&t(
+                        language,
+                        crate::localization::TextKey::DiagProxyInterfaceNote,
+                    ));
                 }
                 Some(DisplayValue::new(text))
             },
@@ -131,9 +212,9 @@ fn detail_for(
     }
 }
 
-fn preview_values(values: &[String]) -> String {
+fn preview_values(values: &[String], language: Language) -> String {
     if values.is_empty() {
-        return "未获取".into();
+        return t(language, crate::localization::TextKey::ValueNotAvailable);
     }
     let output = values
         .iter()
@@ -142,27 +223,37 @@ fn preview_values(values: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("、");
     if values.len() > 2 {
-        format!("{output}（另有 {} 项）", values.len() - 2)
+        let more = (values.len() - 2).to_string();
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ValuePreviewMore,
+            &[&output, &more],
+        )
     } else {
         output
     }
 }
 
-fn bound_public_detail(value: BoundPublicStatus) -> String {
+fn bound_public_detail(value: BoundPublicStatus, language: Language) -> String {
     match value {
-        BoundPublicStatus::Succeeded => "已通过".into(),
-        BoundPublicStatus::Incomplete => "尚未完成".into(),
+        BoundPublicStatus::Succeeded => t(language, crate::localization::TextKey::CheckPassed),
+        BoundPublicStatus::Incomplete => t(language, crate::localization::TextKey::DiagIncomplete),
         BoundPublicStatus::Failed { consecutive_cycles } => {
-            format!("未通过（连续 {consecutive_cycles} 次）")
+            let count = consecutive_cycles.to_string();
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::DiagFailedRepeatedly,
+                &[&count],
+            )
         }
     }
 }
 
-fn bound_dns_detail(value: BoundDnsStatus) -> String {
+fn bound_dns_detail(value: BoundDnsStatus, language: Language) -> String {
     match value {
-        BoundDnsStatus::Succeeded => "已通过".into(),
-        BoundDnsStatus::Failed => "解析失败".into(),
-        BoundDnsStatus::Incomplete => "尚未完成".into(),
+        BoundDnsStatus::Succeeded => t(language, crate::localization::TextKey::CheckPassed),
+        BoundDnsStatus::Failed => t(language, crate::localization::TextKey::DiagResolutionFailed),
+        BoundDnsStatus::Incomplete => t(language, crate::localization::TextKey::DiagIncomplete),
     }
 }
 
@@ -177,50 +268,62 @@ pub(crate) fn render(
         ui,
         RichText::new(vm.intro.text.clone())
             .size(scale::RATE_AUX)
-            .color(scale::SECONDARY),
+            .color(scale::secondary()),
     );
     ui.add_space(8.0);
-    ui.horizontal_wrapped(|ui| {
-        // Refresh is the primary action on this page, so it carries the bold weight.
-        if ui
-            .button(RichText::new(TextKey::ButtonRefresh.to_string(language)).strong())
-            .clicked()
-        {
-            let _ = sink.try_send(UiCommand::Refresh);
-        }
-        if ui
-            .button(TextKey::ButtonExportDiagnostics.to_string(language))
-            .clicked()
-        {
-            let _ = sink.try_send(UiCommand::ExportDiagnostics);
-        }
-    });
+    // The page's own action only. 刷新 is the panel-wide action and lives with the overview, next
+    // to 更多; repeating it here put two identical 刷新 buttons on one screen.
+    let mut export_requested = false;
+    let export_label = TextKey::ButtonExportDiagnostics.to_string(language);
+    if super::components::action_button(
+        ui,
+        &export_label,
+        super::components::ButtonKind::Outlined,
+        true,
+        None,
+    )
+    .clicked()
+    {
+        export_requested = true;
+    }
+    if export_requested {
+        let _ = sink.try_send(UiCommand::ExportDiagnostics);
+    }
     ui.add_space(16.0);
     super::network_assistance::render(ui, snapshot, std::time::SystemTime::now(), language, sink);
     ui.add_space(12.0);
     super::section_frame(ui, |ui| {
-        for row in &vm.rows {
-            egui::CollapsingHeader::new(
-                RichText::new(format!(
-                    "{}    {} {}",
-                    row.label.text,
-                    row.state.tone.marker(),
-                    row.state.label.text
-                ))
-                .color(row.state.tone.color()),
-            )
-            .id_salt(format!("diagnostic-{:?}", row.id))
-            .show(ui, |ui| {
-                if let Some(detail) = &row.state.detail {
-                    wrapped_label(ui, super::detail_text(&detail.text));
-                }
-                if let Some(detail) = &row.detail {
-                    wrapped_label(ui, super::detail_text(&detail.text));
-                }
-            });
+        // Nine always-visible checks in two columns: a full-width single column left most of the
+        // card empty, and the pairs read as a scan-friendly grid at desktop width.
+        let half = vm.rows.len().div_ceil(2);
+        let (left, right) = vm.rows.split_at(half);
+        super::two_columns(ui, |ui| render_rows(ui, left), |ui| render_rows(ui, right));
+    });
+}
+
+/// One column of checks. Every check is an always-visible row: the tone-coloured line is the row's
+/// heading and its evidence is never hidden behind a disclosure triangle.
+fn render_rows(ui: &mut Ui, rows: &[DiagnosticRowVm]) {
+    for (index, row) in rows.iter().enumerate() {
+        ui.label(
+            super::section_heading(format!(
+                "{}    {} {}",
+                row.label.text,
+                row.state.tone.marker(),
+                row.state.label.text
+            ))
+            .color(row.state.tone.color()),
+        );
+        if let Some(detail) = &row.state.detail {
+            wrapped_label(ui, super::detail_text(&detail.text));
+        }
+        if let Some(detail) = &row.detail {
+            wrapped_label(ui, super::detail_text(&detail.text));
+        }
+        if index + 1 < rows.len() {
             ui.separator();
         }
-    });
+    }
 }
 
 trait LocalizedKeyText {

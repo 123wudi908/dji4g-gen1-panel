@@ -1,16 +1,22 @@
 //! Current-user DPAPI for the opt-in SMS archive. Never falls back to plaintext.
+//!
+//! Every error is a stable ASCII code from the `archive:` namespace. This crate sits below the
+//! panel and holds no wording: the codes travel to the archive status line, which the panel
+//! resolves through its catalog (`localization::stable_code_text`).
 
+/// Encrypt `plaintext` for the current user. Errors are stable `archive:crypto_*` codes.
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
     crypt(plaintext, true)
 }
 
+/// Decrypt `ciphertext` for the current user. Errors are stable `archive:crypto_*` codes.
 pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, &'static str> {
     crypt(ciphertext, false)
 }
 
 #[cfg(not(windows))]
 fn crypt(_input: &[u8], _protect: bool) -> Result<Vec<u8>, &'static str> {
-    Err("此系统不支持 Windows 用户加密，未写入短信")
+    Err("archive:crypto_unsupported")
 }
 
 #[cfg(windows)]
@@ -21,7 +27,7 @@ fn crypt(input: &[u8], protect: bool) -> Result<Vec<u8>, &'static str> {
             CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
         },
     };
-    let size = u32::try_from(input.len()).map_err(|_| "短信档案超过加密大小限制")?;
+    let size = u32::try_from(input.len()).map_err(|_| "archive:crypto_too_large")?;
     let source = CRYPT_INTEGER_BLOB {
         cbData: size,
         pbData: input.as_ptr().cast_mut(),
@@ -57,9 +63,9 @@ fn crypt(input: &[u8], protect: bool) -> Result<Vec<u8>, &'static str> {
     };
     if ok == 0 {
         return Err(if protect {
-            "Windows 用户加密失败，未写入短信"
+            "archive:crypto_failed"
         } else {
-            "无法解密本地短信档案：用户不匹配或文件损坏；原文件已保留"
+            "archive:crypto_decrypt_failed"
         });
     }
     // SAFETY: DPAPI returns cbData initialized bytes allocated by LocalAlloc on success.

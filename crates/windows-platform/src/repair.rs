@@ -143,9 +143,13 @@ impl TargetProof {
         self.identity_hash
     }
 
+    /// Whether this proven target may be repaired at all.
+    ///
+    /// A recognized read-only module (the generic `2C7C:0125`) can never be the target of a
+    /// repair: only a write-capable profile (`DJI_GEN1`) passes.
     #[must_use]
     pub const fn is_supported(&self) -> bool {
-        self.profile.matches(DJI_GEN1.vid, DJI_GEN1.pid)
+        self.profile.allows_controlled_actions()
     }
 }
 
@@ -935,7 +939,11 @@ fn validate_plan_observation(
 }
 
 fn verify_after(observation: &RepairObservation, action: &RepairAction) -> bool {
-    if !observation.target.is_supported() || observation.target.profile() != DJI_GEN1 {
+    // The after-state of a repair is only meaningful for a write-capable target; a recognized
+    // read-only module can never verify as repaired.
+    if !observation.target.is_supported()
+        || !observation.target.profile().allows_controlled_actions()
+    {
         return false;
     }
     match action {
@@ -1612,7 +1620,13 @@ mod native {
             .as_ref()
             .map(|adapter| hotspot_observation(&adapter.identity))
             .unwrap_or((None, false));
-        let target = TargetProof::dji_gen1(target_hash);
+        // The proof carries the profile the inventory actually proved.  A recognized read-only
+        // module therefore mints a proof that `TargetProof::is_supported` rejects, instead of being
+        // handed a fabricated write-capable one; the DJI path keeps minting `dji_gen1`.
+        let Some(profile) = device.profile() else {
+            return Err(RepairError::Unsupported);
+        };
+        let target = TargetProof::for_profile(profile, target_hash);
         let adapter_proof = AdapterProof::fixture(
             adapter
                 .as_ref()

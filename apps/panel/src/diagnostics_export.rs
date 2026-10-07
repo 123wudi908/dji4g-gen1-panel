@@ -30,6 +30,11 @@ use crate::localization::{
 };
 use crate::logging::redact_sensitive;
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 /// Fixed marker replacing the Windows container and device-instance identifiers. A short hash
 /// was considered and rejected: even a prefix of a stable hardware identifier narrows the
 /// search space, and support does not need it to correlate one exported report.
@@ -174,24 +179,47 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
     let not_available = || text(TextKey::ValueNotAvailable);
 
     let mut report = String::new();
-    report.push_str("DJI 一代 4G 面板 · 诊断信息导出\n");
-    report.push_str(&format!("生成时间（UTC）：{}\n", utc_timestamp(now)));
-    report.push_str(&format!(
-        "隐私说明：{}\n",
-        text(TextKey::DiagnosticsExportRedactionNotice)
+    report.push_str(&t(language, crate::localization::TextKey::ExportTitle));
+    report.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::ExportGeneratedAt,
+        &[&utc_timestamp(now)],
     ));
+    report.push('\n');
+    report.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::ExportPrivacy,
+        &[&text(TextKey::DiagnosticsExportRedactionNotice)],
+    ));
+    report.push('\n');
 
-    report.push_str("\n【概览】\n");
-    report.push_str(&format!("当前判定：{}\n", availability.title.text));
+    report.push_str(&t(
+        language,
+        crate::localization::TextKey::ExportSectionOverview,
+    ));
+    report.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::ExportVerdict,
+        &[&availability.title.text],
+    ));
+    report.push('\n');
     report.push_str(&format!("{}\n", availability.reason.text));
-    report.push_str(&format!("证据状态：{}\n", availability.freshness.text));
+    report.push_str(&crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::ExportEvidenceState,
+        &[&availability.freshness.text],
+    ));
+    report.push('\n');
     report.push_str(&format!(
         "{}：{}\n",
         text(TextKey::FieldHotspot),
         crate::ui::hotspot_vm(app.hotspot, language).status.text
     ));
 
-    report.push_str("\n【设备】\n");
+    report.push_str(&t(
+        language,
+        crate::localization::TextKey::ExportSectionDevice,
+    ));
     match app.device.as_ref() {
         Some(device) => {
             report.push_str(&format!(
@@ -200,7 +228,12 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
                 device.identity.vid,
                 device.identity.pid
             ));
-            report.push_str(&format!("容器 / 设备实例标识：{REDACTED_DEVICE_ID}\n"));
+            report.push_str(&crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ExportDeviceId,
+                &[REDACTED_DEVICE_ID],
+            ));
+            report.push('\n');
             report.push_str(&format!(
                 "{}：{}\n",
                 text(TextKey::FieldProblemCode),
@@ -221,7 +254,10 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
         )),
     }
 
-    report.push_str("\n【蜂窝网络】\n");
+    report.push_str(&t(
+        language,
+        crate::localization::TextKey::ExportSectionCellular,
+    ));
     match app.cellular.as_ref() {
         Some(cellular) => {
             report.push_str(&format!(
@@ -286,7 +322,10 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
         )),
     }
 
-    report.push_str("\n【Windows 网络】\n");
+    report.push_str(&t(
+        language,
+        crate::localization::TextKey::ExportSectionNetwork,
+    ));
     match app.network.as_ref() {
         Some(network) => {
             report.push_str(&format!(
@@ -338,21 +377,31 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
         )),
     }
 
-    report.push_str("\n【短信】\n");
+    report.push_str(&t(language, crate::localization::TextKey::ExportSectionSms));
     if let Some(send) = &snapshot.sms_send {
-        report.push_str(&format!(
-            "发送请求：{}；阶段：{:?}；结果：{:?}\n",
-            send.request_id, send.phase, send.result
+        report.push_str(&crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::ExportSendRequest,
+            &[
+                &send.request_id.to_string(),
+                &format!("{:?}", send.phase),
+                &format!("{:?}", send.result),
+            ],
         ));
+        report.push('\n');
         if let Some(detail) = &send.failure {
-            report.push_str(&format!(
-                "发送错误：{}；CMS：{:?}；CME：{:?}；系统错误：{:?}；可能已提交：{}\n",
-                detail.code,
-                detail.cms_code,
-                detail.cme_code,
-                detail.os_code,
-                detail.submission_possible
+            report.push_str(&crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ExportSendError,
+                &[
+                    &detail.code,
+                    &format!("{:?}", detail.cms_code),
+                    &format!("{:?}", detail.cme_code),
+                    &format!("{:?}", detail.os_code),
+                    &detail.submission_possible.to_string(),
+                ],
             ));
+            report.push('\n');
         }
     }
     // Aggregate counts only: message bodies and senders live in the application store and are
@@ -391,7 +440,10 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
         report.push_str(&format!("{}\n", text(TextKey::SmsIncompleteWarning)));
     }
 
-    report.push_str("\n【连接证据】\n模块绑定路由查询只证明找到了匹配路由，不证明网关可达。\n");
+    report.push_str(&t(
+        language,
+        crate::localization::TextKey::ExportSectionEvidence,
+    ));
     for id in DiagnosticCheckId::ORDERED {
         let check = snapshot.diagnostics.get(id);
         report.push_str(&format!(
@@ -421,11 +473,15 @@ fn check_state_text(state: &DiagnosticCheckState, language: Language) -> String 
             LocalizedText::new(language, unexecuted_reason(*reason)).text
         ),
         DiagnosticCheckState::Failed { code } | DiagnosticCheckState::Unavailable { code } => {
-            format!("{label}（代码 {}）", code.stable().as_str())
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::ExportLabelWithCode,
+                &[&label, code.stable().as_str()],
+            )
         }
         DiagnosticCheckState::Running { .. }
         | DiagnosticCheckState::Passed
-        | DiagnosticCheckState::Expired => label,
+        | DiagnosticCheckState::Expired => label.to_owned(),
     }
 }
 

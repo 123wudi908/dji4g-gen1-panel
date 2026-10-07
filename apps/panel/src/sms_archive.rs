@@ -18,6 +18,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::localization::{Language, TextKey, format_positional, template};
+
 pub const MAX_ARCHIVED_MESSAGES: usize = 5_000;
 pub const RETENTION_DAYS: u64 = 90;
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -132,7 +134,9 @@ impl Cipher for UserCipher {
 enum Command {
     Capture(Vec<ArchivedSms>),
     Clear,
-    Export(PathBuf),
+    /// The export carries the interface language, because its header and record block are prose the
+    /// user reads in the file afterwards; the worker itself has no language.
+    Export(PathBuf, Language),
     Maintain,
 }
 struct Update {
@@ -192,9 +196,7 @@ impl ArchiveService {
                 // especially Clear behind an in-flight Capture. Drain until senders are gone.
                 let _ = updates.send(Update {
                     rows: (!failed).then(|| store.rows.clone()),
-                    status: loaded
-                        .err()
-                        .unwrap_or("本地历史已就绪；仅保留最近 90 天、最多 5000 条"),
+                    status: loaded.err().unwrap_or("archive:ready"),
                     failed,
                     completes_request: true,
                 });
@@ -208,24 +210,22 @@ impl ArchiveService {
                     let completes_request = !matches!(command, Command::Maintain);
                     let result = match command {
                         Command::Capture(rows) if !failed => store.capture(rows, clock()),
-                        Command::Capture(_) => {
-                            Err("档案读取或保存失败，已暂停采集；请检查或清空本地历史")
-                        }
+                        Command::Capture(_) => Err("archive:paused_capture"),
                         Command::Clear => store.clear(),
                         Command::Maintain => match store.maintain(clock()) {
                             Ok(false) => continue,
                             Ok(true) => Ok(()),
                             Err(error) => Err(error),
                         },
-                        Command::Export(path) => {
+                        Command::Export(path, language) => {
                             let result = if failed {
-                                Err("档案读取或保存失败，已暂停导出；请先处理档案错误")
+                                Err("archive:paused_export")
                             } else {
-                                store.export_at(&path, clock())
+                                store.export_at(&path, clock(), language)
                             };
                             let _ = updates.send(Update {
                                 rows: Some(store.rows.clone()),
-                                status: result.err().unwrap_or("已导出明文 TXT，请妥善保管该文件"),
+                                status: result.err().unwrap_or("archive:exported"),
                                 failed,
                                 completes_request: true,
                             });
@@ -237,9 +237,7 @@ impl ArchiveService {
                         rows: Some(store.rows.clone()),
                         failed,
                         completes_request,
-                        status: result
-                            .err()
-                            .unwrap_or("本地历史已更新；仅保留最近 90 天、最多 5000 条"),
+                        status: result.err().unwrap_or("archive:updated"),
                     });
                 }
             });
@@ -255,9 +253,9 @@ impl ArchiveService {
             ready: failed,
             failed,
             status: if failed {
-                "无法启动短信档案后台任务"
+                "archive:worker_failed"
             } else {
-                "正在读取本地历史…"
+                "archive:reading"
             },
             last_revision: None,
         }
@@ -285,7 +283,7 @@ impl ArchiveService {
                     self.pending = 0;
                     self.ready = true;
                     self.failed = true;
-                    self.status = "短信档案后台任务已停止";
+                    self.status = "archive:worker_stopped";
                     return;
                 }
             }
@@ -323,7 +321,7 @@ impl ArchiveService {
             pending: 0,
             ready: true,
             failed: false,
-            status: "模拟历史，仅用于界面验收，没有读取或保存真实短信",
+            status: "archive:demo_status",
             last_revision: None,
             rows: if loaded {
                 (1..=3)
@@ -331,8 +329,7 @@ impl ArchiveService {
                         id: [n; 32],
                         context: [n; 32],
                         sender: format!("+861380000000{n}"),
-                        body: "【模拟短信】这是一条本地历史示例，仅用于检查阅读、筛选和导出提示。"
-                            .into(),
+                        body: "archive:demo_body".into(),
                         reported_timestamp: Some("2026-09-22 12:00:00".into()),
                         captured_unix_secs: now_secs(),
                         incomplete: false,
@@ -353,7 +350,7 @@ impl ArchiveService {
             return;
         }
         let Some(context) = context_hash(snapshot) else {
-            self.status = "未取得稳定设备和 SIM 身份，本次不写入本地历史";
+            self.status = "archive:no_identity";
             return;
         };
         let device_epoch = snapshot.app.device.as_ref().map(|device| device.epoch.0);
@@ -381,9 +378,10 @@ impl ArchiveService {
         self.queue(Command::Clear);
     }
     /// Explicit user-selected export only; output is unencrypted UTF-8 TXT. Existing paths
-    /// are never overwritten, including the encrypted archive itself.
-    pub fn export_text(&mut self, path: PathBuf) {
-        self.queue(Command::Export(path));
+    /// are never overwritten, including the encrypted archive itself. The prose inside the file is
+    /// written in the interface language the user exported from.
+    pub fn export_text(&mut self, path: PathBuf, language: Language) {
+        self.queue(Command::Export(path, language));
     }
     fn queue(&mut self, command: Command) -> bool {
         match self.tx.try_send(command) {
@@ -392,12 +390,12 @@ impl ArchiveService {
                 true
             }
             Err(mpsc::TrySendError::Full(_)) => {
-                self.status = "本地历史正在处理，请稍后重试";
+                self.status = "archive:busy";
                 false
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.failed = true;
-                self.status = "短信档案后台任务已停止";
+                self.status = "archive:worker_stopped";
                 false
             }
         }
@@ -493,27 +491,31 @@ impl ArchiveStore {
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(_) => return Err("无法打开本地短信档案；原文件已保留"),
+            Err(_) => return Err("archive:open_failed"),
         };
-        if file.metadata().map_err(|_| "无法检查档案大小")?.len() > MAX_FILE_BYTES {
-            return Err("本地短信档案超过 32 MiB，未加载或覆盖");
+        if file
+            .metadata()
+            .map_err(|_| "archive:size_check_failed")?
+            .len()
+            > MAX_FILE_BYTES
+        {
+            return Err("archive:too_large");
         }
         let mut bytes = Vec::new();
         (&mut file)
             .take(MAX_FILE_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| "读取短信档案失败")?;
+            .map_err(|_| "archive:read_failed")?;
         if bytes.len() as u64 > MAX_FILE_BYTES || !bytes.starts_with(MAGIC) {
-            return Err("短信档案格式无效；原文件已保留");
+            return Err("archive:invalid_format");
         }
         let plain = self.cipher.unprotect(&bytes[MAGIC.len()..])?;
         if plain.len() as u64 > MAX_FILE_BYTES {
-            return Err("解密后的短信档案超过大小限制");
+            return Err("archive:decrypted_too_large");
         }
-        let rows: Vec<FileRow> =
-            serde_json::from_slice(&plain).map_err(|_| "短信档案内容损坏；原文件已保留")?;
+        let rows: Vec<FileRow> = serde_json::from_slice(&plain).map_err(|_| "archive:corrupt")?;
         if rows.len() > MAX_ARCHIVED_MESSAGES {
-            return Err("短信档案记录数超过上限；原文件已保留");
+            return Err("archive:too_many_records");
         }
         self.rows = rows.into_iter().map(Into::into).collect();
         if self.purge(now) {
@@ -556,15 +558,15 @@ impl ArchiveStore {
     }
     fn save(&self) -> Result<(), &'static str> {
         let plain = serde_json::to_vec(&self.rows.iter().map(FileRow::from).collect::<Vec<_>>())
-            .map_err(|_| "无法编码短信档案")?;
+            .map_err(|_| "archive:encode_failed")?;
         if plain.len() as u64 > MAX_FILE_BYTES {
-            return Err("短信档案已达大小上限，本次未保存");
+            return Err("archive:size_cap_save");
         }
         let encrypted = self.cipher.protect(&plain)?;
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&encrypted);
         if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err("加密档案已达大小上限，本次未保存");
+            return Err("archive:size_cap_encrypt");
         }
         atomic_write(&self.path, &bytes)
     }
@@ -572,7 +574,7 @@ impl ArchiveStore {
         match fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("无法清空本地短信档案；未删除现有记录"),
+            Err(_) => return Err("archive:clear_failed"),
         }
         self.rows.clear();
         Ok(())
@@ -590,42 +592,52 @@ impl ArchiveStore {
     }
     #[cfg(test)]
     fn export(&mut self, path: &Path) -> Result<(), &'static str> {
-        self.export_at(path, now_secs())
+        // Service tests pin the language; only the panel passes a real one.
+        self.export_at(path, now_secs(), Language::ZhCn)
     }
-    fn export_at(&mut self, path: &Path, now: u64) -> Result<(), &'static str> {
+    fn export_at(&mut self, path: &Path, now: u64, language: Language) -> Result<(), &'static str> {
         // Retention applies even with capture disabled and before plaintext leaves the archive.
         self.maintain(now)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent).map_err(|_| "无法创建导出目录，请选择可写位置")?;
+            fs::create_dir_all(parent).map_err(|_| "archive:export_dir_failed")?;
         }
         // create_new also protects the canonical archive and aliases to any existing file.
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
-            .map_err(|_| "无法导出：请选择可写位置和一个不存在的新文件名")?;
+            .map_err(|_| "archive:export_create_failed")?;
         let result = (|| -> std::io::Result<()> {
-            writeln!(
-                file,
-                "DJI 4G 本地短信历史（明文导出）\n采集时间为 Unix UTC 秒；原报时间保留模块原文。\n"
-            )?;
+            writeln!(file, "{}", template(language, TextKey::ExportSmsHeader))?;
             for row in &self.rows {
+                let context = row.context_label();
+                let captured = row.captured_unix_secs.to_string();
+                let reported = row
+                    .reported_timestamp()
+                    .unwrap_or_else(|| template(language, TextKey::ValueUnknown));
+                let incomplete = if row.incomplete {
+                    template(language, TextKey::ExportSmsIncomplete)
+                } else {
+                    ""
+                };
                 writeln!(
                     file,
-                    "设备/SIM 分区：{}\n发件人：{}\n原报时间：{}\n采集时间：{}\n内容{}：\n{}\n--------",
-                    row.context_label(),
-                    row.sender(),
-                    row.reported_timestamp().unwrap_or("未知"),
-                    row.captured_unix_secs,
-                    if row.incomplete {
-                        "（分片不完整）"
-                    } else {
-                        ""
-                    },
-                    row.body()
+                    "{}",
+                    format_positional(
+                        language,
+                        TextKey::ExportSmsRecord,
+                        &[
+                            &context,
+                            row.sender(),
+                            reported,
+                            &captured,
+                            incomplete,
+                            row.body(),
+                        ],
+                    )
                 )?;
             }
             file.sync_all()
@@ -633,19 +645,19 @@ impl ArchiveStore {
         drop(file);
         if result.is_err() {
             let _ = fs::remove_file(path);
-            return Err("导出写入失败，未保留不完整文件");
+            return Err("archive:export_write_failed");
         }
         Ok(())
     }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
-    let parent = path.parent().ok_or("短信档案路径无效")?;
-    fs::create_dir_all(parent).map_err(|_| "无法创建短信档案目录")?;
+    let parent = path.parent().ok_or("archive:invalid_path")?;
+    fs::create_dir_all(parent).map_err(|_| "archive:create_dir_failed")?;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
-        .ok_or("短信档案路径无效")?
+        .ok_or("archive:invalid_path")?
         .to_string_lossy();
     let temp = parent.join(format!(
         ".{name}.{}.{}.tmp",
@@ -656,12 +668,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
         .write(true)
         .create_new(true)
         .open(&temp)
-        .map_err(|_| "无法创建加密档案临时文件")?;
+        .map_err(|_| "archive:temp_file_failed")?;
     let write = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    let result = write.map_err(|_| "写入加密档案失败").and_then(|()| {
+    let result = write.map_err(|_| "archive:write_failed").and_then(|()| {
         dji4g_windows_platform::atomic_replace_file(&temp, path)
-            .map_err(|_| "替换加密档案失败；原文件已保留")
+            .map_err(|_| "archive:replace_failed")
     });
     if result.is_err() {
         let _ = fs::remove_file(temp);
@@ -912,7 +924,8 @@ mod tests {
             .unwrap()
             .sim_identity = None;
         service.observe(&snapshot);
-        assert!(service.status().contains("身份"));
+        // The service reports stable codes now; the missing-identity case is `archive:no_identity`.
+        assert_eq!(service.status(), "archive:no_identity");
         assert!(!temp.path().exists());
         snapshot = self::snapshot();
         snapshot.sms_messages[0].message.sim_epoch = 0;
@@ -1110,6 +1123,32 @@ mod tests {
         assert!(String::from_utf8_lossy(&original).contains("SECRET"));
         assert!(store.export(&output).is_err());
         assert_eq!(fs::read(&output).unwrap(), original);
+    }
+
+    #[test]
+    fn exported_plaintext_prose_follows_the_exporting_language() {
+        let temp = Temp::new();
+        let mut store = temp.store();
+        let now = now_secs();
+        store
+            .capture(vec![archived_row([1; 32], &message(1, 1), now)], now)
+            .unwrap();
+        store.rows[0].reported_timestamp = None;
+        store.rows[0].incomplete = true;
+        let export = temp.0.join("localized.txt");
+        store.export_at(&export, now, Language::EnUs).unwrap();
+        let written = fs::read_to_string(&export).unwrap();
+        assert!(written.contains("DJI 4G local message history (plain-text export)"));
+        assert!(written.contains("Device/SIM partition: "));
+        assert!(written.contains("Sender: "));
+        assert!(written.contains("Reported time: Unknown"));
+        assert!(written.contains("Captured time: "));
+        assert!(written.contains("Body (fragments incomplete):"));
+        assert!(written.contains("synthetic SECRET body"));
+        // Nothing in the exported file may stay in the authored Chinese.
+        assert!(!written.contains("未知"), "{written}");
+        assert!(!written.contains("分片不完整"), "{written}");
+        assert!(!written.contains("发件人"), "{written}");
     }
 
     #[test]

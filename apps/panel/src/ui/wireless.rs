@@ -1,9 +1,18 @@
 //! Read-only radio observations. Only completed AT samples enter the bounded history.
-use super::{meta_text, scale, section_frame, section_heading, wrapped_label};
-use dji4g_application::{ControllerSnapshot, DiagnosticCheckId, DiagnosticCheckState};
-use dji4g_domain::{DeviceEpoch, ServingCell};
-use eframe::egui::{self, Color32, RichText, Ui};
+use super::{
+    HotspotAction, hotspot_vm, meta_text, scale, section_frame, section_heading, wrapped_label,
+};
+use crate::app::PanelCommandSink;
+use crate::localization::{Language, LocalizedText, TextKey};
+use dji4g_application::{ControllerSnapshot, DiagnosticCheckId, DiagnosticCheckState, UiCommand};
+use dji4g_domain::{ActionKind, DeviceEpoch, ServingCell};
+use eframe::egui::{self, RichText, Ui};
 use std::{collections::VecDeque, time::SystemTime};
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Clone)]
 struct Sample {
@@ -124,45 +133,128 @@ fn cell_identity(cell: &ServingCell) -> String {
 fn value<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "—".into())
 }
-fn measurement(value: Option<i16>, unit: &str) -> String {
+fn measurement(value: Option<i16>, unit: &str, language: Language) -> String {
     value
         .map(|v| format!("{v} {unit}"))
-        .unwrap_or_else(|| "未报告".into())
+        .unwrap_or_else(|| t(language, crate::localization::TextKey::ValueNotReported))
 }
-fn summary(cell: &ServingCell) -> String {
-    format!(
-        "无线观测（模块 AT+QENG 报告）\n{}\n制式 {} / {}\nRSRP {}\nRSRQ {}\nRSSI {}\nSINR 原始值 {}（单位未确认）\n上行带宽 {} MHz / 下行带宽 {} MHz\nTAC {}",
-        cell_identity(cell),
-        cell.rat.as_deref().unwrap_or("—"),
-        cell.duplex.as_deref().unwrap_or("—"),
-        measurement(cell.rsrp_dbm, "dBm"),
-        measurement(cell.rsrq_db, "dB"),
-        measurement(cell.rssi_dbm, "dBm"),
-        value(cell.sinr_raw),
-        value(cell.ul_mhz),
-        value(cell.dl_mhz),
-        cell.tac
-            .map(|v| format!("{v:04X}"))
-            .unwrap_or_else(|| "—".into())
+fn summary(cell: &ServingCell, language: Language) -> String {
+    let identity = cell_identity(cell);
+    let rat = cell.rat.clone().unwrap_or_else(|| "—".into());
+    let duplex = cell.duplex.clone().unwrap_or_else(|| "—".into());
+    let rsrp = measurement(cell.rsrp_dbm, "dBm", language);
+    let rsrq = measurement(cell.rsrq_db, "dB", language);
+    let rssi = measurement(cell.rssi_dbm, "dBm", language);
+    let sinr = value(cell.sinr_raw);
+    let ul = value(cell.ul_mhz);
+    let dl = value(cell.dl_mhz);
+    let tac = cell
+        .tac
+        .map(|v| format!("{v:04X}"))
+        .unwrap_or_else(|| "—".into());
+    crate::localization::format_positional(
+        language,
+        crate::localization::TextKey::WirelessSummary,
+        &[
+            &identity, &rat, &duplex, &rsrp, &rsrq, &rssi, &sinr, &ul, &dl, &tac,
+        ],
     )
 }
 fn metric(ui: &mut Ui, name: &str, value: String, note: &str) {
     egui::Frame::none()
-        .fill(Color32::from_rgb(0xf5, 0xf7, 0xfc))
+        .fill(scale::surface_sunken())
         .rounding(10.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(meta_text(name));
-            ui.label(RichText::new(value).size(21.0).strong().color(scale::INK));
+            ui.label(RichText::new(value).size(21.0).strong().color(scale::ink()));
             ui.label(meta_text(note));
         });
 }
-pub(crate) fn render(ui: &mut Ui, snapshot: &ControllerSnapshot, history: &WirelessHistory) {
-    ui.heading("无线观测");
-    ui.label(meta_text(
-        "查看真实无线参数，观察摆放位置、遮挡与小区变化带来的差异",
-    ));
+/// The 无线 page: the radio observations, plus the one operation that belongs to the wireless side
+/// of the panel — the Windows hotspot the module feeds.
+pub(crate) fn render_page(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    history: &WirelessHistory,
+    language: Language,
+    sink: &dyn PanelCommandSink,
+) {
+    super::components::page_heading(
+        ui,
+        crate::localization::template(language, crate::localization::TextKey::NavWireless),
+        &t(language, crate::localization::TextKey::WirelessIntro),
+    );
+    render(ui, snapshot, history, language);
+    ui.add_space(scale::BLOCK_GAP);
+    render_hotspot(ui, snapshot, language, sink);
+}
+
+/// The hotspot card. It lives here rather than on the overview because switching the hotspot on or
+/// off is an operation: the overview reads, the pages act.
+fn render_hotspot(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    language: Language,
+    sink: &dyn PanelCommandSink,
+) {
+    let vm = hotspot_vm(snapshot.app.as_ref().hotspot, language);
+    section_frame(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(section_heading(
+                LocalizedText::new(language, TextKey::FieldHotspot).text,
+            ));
+            ui.colored_label(vm.tone.color(), &vm.status.text);
+        });
+        if !matches!(vm.reason.key, TextKey::ValueNotApplicable) {
+            wrapped_label(ui, meta_text(vm.reason.text.clone()));
+        }
+        if let Some(action) = vm.action {
+            // A failed hotspot offers 重试, which is a plain refresh (re-observe the hotspot state
+            // and the rest of the evidence) — not a repair plan: `ActionKind::Refresh` is
+            // deliberately not a confirmable action, so it must go through the refresh signal.
+            if action == HotspotAction::Retry {
+                if ui
+                    .add_enabled(
+                        !vm.busy,
+                        egui::Button::new(LocalizedText::new(language, TextKey::ButtonRetry).text),
+                    )
+                    .clicked()
+                {
+                    let _ = sink.try_send(UiCommand::Refresh);
+                }
+                return;
+            }
+            let (label, command) = match action {
+                HotspotAction::Enable => (
+                    LocalizedText::new(language, TextKey::ActionEnableHotspot).text,
+                    ActionKind::ToggleHotspot { enabled: true },
+                ),
+                HotspotAction::Disable => (
+                    LocalizedText::new(language, TextKey::ActionDisableHotspot).text,
+                    ActionKind::ToggleHotspot { enabled: false },
+                ),
+                HotspotAction::Retry => unreachable!("handled above"),
+            };
+            if ui.add_enabled(!vm.busy, egui::Button::new(label)).clicked() {
+                sink.prepare_action_now(command);
+            }
+        } else if vm.busy {
+            wrapped_label(
+                ui,
+                meta_text(LocalizedText::new(language, TextKey::StatusLoading).text),
+            );
+        }
+    });
+}
+
+pub(crate) fn render(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    history: &WirelessHistory,
+    language: Language,
+) {
     let cell = history.samples.back().and_then(|s| s.cell.as_ref());
     let check = snapshot
         .diagnostics
@@ -174,15 +266,27 @@ pub(crate) fn render(ui: &mut Ui, snapshot: &ControllerSnapshot, history: &Wirel
     });
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("当前服务小区"));
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::WirelessServingCell,
+            )));
             ui.label(meta_text(if fresh {
-                "最近一次 AT 查询已完成"
+                t(language, crate::localization::TextKey::WirelessSampleFresh)
             } else {
-                "等待有效采样 / 已有数据仅供回看"
+                t(
+                    language,
+                    crate::localization::TextKey::WirelessSampleWaiting,
+                )
             }));
             if let Some(cell) = cell {
-                if ui.button("复制无线摘要").clicked() {
-                    ui.ctx().copy_text(summary(cell));
+                if ui
+                    .button(t(
+                        language,
+                        crate::localization::TextKey::WirelessCopySummary,
+                    ))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(summary(cell, language));
                 }
             }
         });
@@ -190,14 +294,19 @@ pub(crate) fn render(ui: &mut Ui, snapshot: &ControllerSnapshot, history: &Wirel
             ui.add_space(8.0);
             wrapped_label(
                 ui,
-                "暂未获取服务小区数据。连接模块后随后台监测自动采样；短信发送期间暂停。未报告的字段保持为空。",
+                t(language, crate::localization::TextKey::WirelessNoCell),
             );
             return;
         };
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
+            let band = value(cell.band);
             for item in [
-                format!("频段 B{}", value(cell.band)),
+                crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::WirelessBand,
+                    &[&band],
+                ),
                 format!(
                     "{} / {}",
                     cell.rat.as_deref().unwrap_or("—"),
@@ -206,16 +315,32 @@ pub(crate) fn render(ui: &mut Ui, snapshot: &ControllerSnapshot, history: &Wirel
                 format!("PCI {}", value(cell.pci)),
                 format!("EARFCN {}", value(cell.earfcn)),
             ] {
-                ui.label(RichText::new(item).color(scale::DOWNLOAD).strong());
+                ui.label(RichText::new(item).color(scale::ink()).strong());
                 ui.add_space(10.0);
             }
         });
         ui.add_space(10.0);
         let fields = [
-            ("RSRP", measurement(cell.rsrp_dbm, "dBm"), "参考信号功率"),
-            ("RSRQ", measurement(cell.rsrq_db, "dB"), "参考信号质量"),
-            ("RSSI", measurement(cell.rssi_dbm, "dBm"), "接收总功率"),
-            ("SINR · 原始值", value(cell.sinr_raw), "单位尚未确认"),
+            (
+                "RSRP",
+                measurement(cell.rsrp_dbm, "dBm", language),
+                t(language, crate::localization::TextKey::WirelessRsrpNote),
+            ),
+            (
+                "RSRQ",
+                measurement(cell.rsrq_db, "dB", language),
+                t(language, crate::localization::TextKey::WirelessRsrqNote),
+            ),
+            (
+                "RSSI",
+                measurement(cell.rssi_dbm, "dBm", language),
+                t(language, crate::localization::TextKey::WirelessRssiNote),
+            ),
+            (
+                &t(language, crate::localization::TextKey::WirelessSinrNote),
+                value(cell.sinr_raw),
+                t(language, crate::localization::TextKey::WirelessSinrUnit),
+            ),
         ];
         let columns = if ui.available_width() >= 680.0 { 4 } else { 2 };
         for chunk in fields.chunks(columns) {
@@ -226,62 +351,104 @@ pub(crate) fn render(ui: &mut Ui, snapshot: &ControllerSnapshot, history: &Wirel
             });
             ui.add_space(8.0);
         }
-        egui::CollapsingHeader::new("小区与带宽详情").show(ui, |ui| {
+        // Always open: sections are cards, not accordions.
+        ui.label(section_heading(t(
+            language,
+            crate::localization::TextKey::WirelessCellDetails,
+        )));
+        {
             wrapped_label(ui, cell_identity(cell));
-            ui.label(format!(
-                "上行带宽 {} MHz  ·  下行带宽 {} MHz",
-                value(cell.ul_mhz),
-                value(cell.dl_mhz)
+            let ul = value(cell.ul_mhz);
+            let dl = value(cell.dl_mhz);
+            ui.label(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::WirelessBandwidthLine,
+                &[&ul, &dl],
             ));
-            ui.label(format!(
-                "TAC {}  ·  模块状态 {}",
-                cell.tac
-                    .map(|v| format!("{v:04X}"))
-                    .unwrap_or_else(|| "—".into()),
-                cell.state.as_deref().unwrap_or("未报告")
+            let tac = cell
+                .tac
+                .map(|v| format!("{v:04X}"))
+                .unwrap_or_else(|| "—".into());
+            let state = cell
+                .state
+                .clone()
+                .unwrap_or_else(|| t(language, crate::localization::TextKey::ValueNotReported));
+            ui.label(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::WirelessTacLine,
+                &[&tac, &state],
             ));
-            ui.label(meta_text(
-                "NOCONN 表示注册后空闲；不单独据此判定网络断开。信号数值不能代替实际吞吐测试。",
-            ));
-        });
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::WirelessNoconnNote,
+            )));
+        }
     });
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("信号变化 · RSRP"));
-            ui.label(meta_text(format!(
-                "最近 {} / 120 次采样",
-                history.samples.len()
+            ui.label(section_heading(t(
+                language,
+                crate::localization::TextKey::WirelessSignalHeading,
+            )));
+            let samples = history.samples.len().to_string();
+            ui.label(meta_text(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::WirelessSampleCount,
+                &[&samples],
             )));
         });
-        signal_chart(ui, history);
-        ui.label(meta_text("按 AT 采样顺序显示；缺失值断开曲线，未收到新回执时不重复造点。设备或 SIM 更换后重新记录。"));
+        signal_chart(ui, history, language);
+        ui.label(meta_text(t(
+            language,
+            crate::localization::TextKey::WirelessSignalNote,
+        )));
     });
     section_frame(ui, |ui| {
-        ui.label(section_heading(format!(
-            "小区变化记录 · {}",
-            history.changes.len()
+        let changes = history.changes.len().to_string();
+        ui.label(section_heading(crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::WirelessChangeHeading,
+            &[&changes],
         )));
-        ui.label(meta_text(
-            "仅记录观测到的小区标识变化，不将它直接解释为切换失败或断线。最近保留 20 条。",
-        ));
+        ui.label(meta_text(t(
+            language,
+            crate::localization::TextKey::WirelessChangeNote,
+        )));
         if history.changes.is_empty() {
-            ui.label("当前会话尚未观测到小区变化。");
+            ui.label(t(language, crate::localization::TextKey::WirelessNoChange));
         }
         for change in history.changes.iter().rev() {
             ui.separator();
-            ui.label(meta_text(format!(
-                "{} 秒前",
-                SystemTime::now()
-                    .duration_since(change.at)
-                    .unwrap_or_default()
-                    .as_secs()
+            let seconds = SystemTime::now()
+                .duration_since(change.at)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string();
+            ui.label(meta_text(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::WirelessSecondsAgo,
+                &[&seconds],
             )));
-            wrapped_label(ui, format!("原小区：{}", change.before));
-            wrapped_label(ui, format!("新小区：{}", change.after));
+            wrapped_label(
+                ui,
+                crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::WirelessPreviousCell,
+                    &[&change.before],
+                ),
+            );
+            wrapped_label(
+                ui,
+                crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::WirelessNewCell,
+                    &[&change.after],
+                ),
+            );
         }
     });
 }
-fn signal_chart(ui: &mut Ui, history: &WirelessHistory) {
+fn signal_chart(ui: &mut Ui, history: &WirelessHistory, language: Language) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 170.0),
         egui::Sense::hover(),
@@ -292,14 +459,14 @@ fn signal_chart(ui: &mut Ui, history: &WirelessHistory) {
         let y = plot.bottom() - ((dbm + 140) as f32 / 96.0) * plot.height();
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            egui::Stroke::new(1.0_f32, scale::GRID),
+            egui::Stroke::new(1.0_f32, scale::line()),
         );
         painter.text(
             egui::pos2(plot.left() - 8.0, y),
             egui::Align2::RIGHT_CENTER,
             dbm.to_string(),
             egui::FontId::proportional(11.0),
-            scale::SECONDARY,
+            scale::secondary(),
         );
     }
     let mut previous = None;
@@ -328,9 +495,9 @@ fn signal_chart(ui: &mut Ui, history: &WirelessHistory) {
         painter.text(
             plot.center(),
             egui::Align2::CENTER_CENTER,
-            "等待有效 RSRP 采样",
+            t(language, crate::localization::TextKey::WirelessWaitingRsrp),
             egui::FontId::proportional(14.0),
-            scale::SECONDARY,
+            scale::secondary(),
         );
     }
     painter.text(
@@ -338,7 +505,7 @@ fn signal_chart(ui: &mut Ui, history: &WirelessHistory) {
         egui::Align2::RIGHT_TOP,
         "dBm",
         egui::FontId::proportional(11.0),
-        scale::SECONDARY,
+        scale::secondary(),
     );
 }
 
@@ -383,6 +550,6 @@ mod tests {
         assert_eq!(h.changes.len(), 20);
         let mut c = cell(1);
         c.sinr_raw = Some(15);
-        assert!(summary(&c).contains("SINR 原始值 15（单位未确认）"));
+        assert!(summary(&c, Language::ZhCn).contains("SINR 原始值 15（单位未确认）"));
     }
 }

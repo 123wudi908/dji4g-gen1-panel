@@ -1,28 +1,53 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 //! A single-file per-user installer containing the entire reviewed offline payload.
+use dji4g_panel::localization::Language;
 use std::{
     fs,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// One catalog string in the language this page was rendered with.
+fn t(
+    language: dji4g_panel::localization::Language,
+    key: dji4g_panel::localization::TextKey,
+) -> String {
+    dji4g_panel::localization::LocalizedText::new(language, key).text
+}
 include!(concat!(env!("OUT_DIR"), "/offline_bundle.rs"));
 const INSTALL: &str = include_str!("../../../../packaging/scripts/install-offline-app.ps1");
 
 fn main() {
-    if let Err(error) = run() {
-        dji4g_windows_platform::show_message_box("安装未完成", &error);
+    let language = dji4g_panel::localization::configured_language();
+    if let Err(error) = run(language) {
+        dji4g_windows_platform::show_message_box(
+            &t(
+                language,
+                dji4g_panel::localization::TextKey::SetupFailedTitle,
+            ),
+            &error,
+        );
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
+fn run(language: Language) -> Result<(), String> {
     if PAYLOAD.is_empty() {
-        return Err("此构建未包含安装资源，请使用完整安装包。".into());
+        return Err(t(
+            language,
+            dji4g_panel::localization::TextKey::SetupNoPayload,
+        ));
     }
     if !dji4g_windows_platform::confirm_message_box(
         None,
-        "安装大疆 4G 面板",
-        "将为当前用户安装程序、离线驱动资源，并创建桌面快捷方式。\n\n安装程序本身不会修改系统驱动，完成后可选择安装驱动。\n\n是否继续？",
+        &t(
+            language,
+            dji4g_panel::localization::TextKey::SetupConfirmTitle,
+        ),
+        &t(
+            language,
+            dji4g_panel::localization::TextKey::SetupConfirmBody,
+        ),
     ) {
         return Ok(());
     }
@@ -60,17 +85,20 @@ fn run() -> Result<(), String> {
     let installed = String::from_utf8(result.stdout).map_err(|e| e.to_string())?;
     let directory = std::path::PathBuf::from(installed.trim());
     if !directory.join("dji4g-panel.exe").is_file() {
-        return Err("安装文件验证失败。".into());
+        return Err(t(
+            language,
+            dji4g_panel::localization::TextKey::SetupVerifyFailed,
+        ));
     }
     if dji4g_windows_platform::confirm_message_box(
         None,
-        "安装完成",
-        "程序和离线驱动已安装，桌面快捷方式已创建。\n\n现在安装模块驱动吗？需要管理员确认。\n已有驱动可选“否”，直接打开程序。",
+        &t(language, dji4g_panel::localization::TextKey::SetupDoneTitle),
+        &t(language, dji4g_panel::localization::TextKey::SetupDoneBody),
     ) {
         let status = Command::new(directory.join("dji4g-driver-setup.exe"))
             .status()
             .map_err(|e| e.to_string())?;
-        driver_result(status.code())?;
+        driver_result(status.code(), language)?;
     }
     Command::new(directory.join("dji4g-panel.exe"))
         .spawn()
@@ -78,12 +106,17 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn driver_result(code: Option<i32>) -> Result<(), String> {
+fn driver_result(code: Option<i32>, language: Language) -> Result<(), String> {
     match code {
         Some(0) => Ok(()),
-        Some(1223) => Err("驱动安装已取消。程序文件已安装，但未确认模块驱动可用。".into()),
-        _ => Err(format!(
-            "驱动安装未完成（退出码：{code:?}）。程序文件已安装，但不会自动打开面板。\n\n若安全软件有拦截，请保留报告中的检测名称与文件路径。不要关闭防护；请将报告交给开发者核查。"
+        Some(1223) => Err(t(
+            language,
+            dji4g_panel::localization::TextKey::SetupDriverCancelled,
+        )),
+        _ => Err(dji4g_panel::localization::format_positional(
+            language,
+            dji4g_panel::localization::TextKey::SetupDriverIncomplete,
+            &[&format!("{code:?}")],
         )),
     }
 }
@@ -95,12 +128,15 @@ mod tests {
     #[test]
     fn failed_or_cancelled_driver_setup_stops_app_launch() {
         for code in [Some(1), Some(1223), Some(64), None] {
-            assert!(driver_result(code).is_err(), "must stop for {code:?}");
+            assert!(
+                driver_result(code, dji4g_panel::localization::Language::ZhCn).is_err(),
+                "must stop for {code:?}"
+            );
         }
     }
 
     #[test]
     fn successful_driver_setup_allows_app_launch() {
-        assert!(driver_result(Some(0)).is_ok());
+        assert!(driver_result(Some(0), dji4g_panel::localization::Language::ZhCn).is_ok());
     }
 }

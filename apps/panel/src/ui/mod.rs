@@ -17,6 +17,11 @@ use crate::localization::{
     hotspot_unsupported_reason, rollback_outcome, unexecuted_reason,
 };
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 pub mod action_availability;
 pub(crate) mod components;
 pub mod device_tools;
@@ -50,22 +55,37 @@ pub enum StatusTone {
 }
 
 impl StatusTone {
+    /// Tone is carried by exactly two hues: green for correct/available, red for wrong/failed.
+    /// The in-between states stay on the grey ramp, so a page can never turn into a colour chart.
     #[must_use]
-    pub const fn color(self) -> Color32 {
+    pub fn color(self) -> Color32 {
         match self {
-            Self::Positive => Color32::from_rgb(24, 116, 74),
-            Self::Caution => scale::WARNING,
-            Self::Negative => Color32::from_rgb(170, 48, 48),
-            Self::Progress => scale::DOWNLOAD,
-            Self::Neutral => scale::SECONDARY,
+            Self::Positive => scale::success(),
+            Self::Negative => scale::danger(),
+            Self::Caution | Self::Progress => scale::secondary(),
+            Self::Neutral => scale::faint(),
         }
     }
 
+    /// Tinted background for a status surface, or `None` to use the plain sunken surface.
+    #[must_use]
+    pub fn fill(self) -> Option<Color32> {
+        match self {
+            Self::Positive => Some(scale::success_fill()),
+            Self::Negative => Some(scale::danger_fill()),
+            Self::Caution | Self::Progress | Self::Neutral => None,
+        }
+    }
+
+    /// The glyph that carries a tone in front of its text.
+    ///
+    /// Deliberately never a triangle: a disclosure triangle used to sit in front of every
+    /// collapsible section, so a triangular marker in front of a card reads as "click to open".
     #[must_use]
     pub const fn marker(self) -> &'static str {
         match self {
             Self::Positive => "●",
-            Self::Caution => "▲",
+            Self::Caution => "◆",
             Self::Negative => "■",
             Self::Progress => "◌",
             Self::Neutral => "○",
@@ -227,19 +247,16 @@ pub fn freshness_text(
 }
 
 #[must_use]
-pub fn format_age(age: Duration, _language: Language) -> LocalizedText {
+pub fn format_age(age: Duration, language: Language) -> LocalizedText {
     let seconds = age.as_secs();
-    let text = if seconds < 60 {
-        format!("{seconds} 秒")
+    let (key, value) = if seconds < 60 {
+        (TextKey::AgeSeconds, seconds)
     } else if seconds < 3600 {
-        format!("{} 分钟", seconds / 60)
+        (TextKey::AgeMinutes, seconds / 60)
     } else {
-        format!("{} 小时", seconds / 3600)
+        (TextKey::AgeHours, seconds / 3600)
     };
-    LocalizedText {
-        key: TextKey::ObservedAgo,
-        text,
-    }
+    format_text_in(language, key, &TextArgs::count(value as usize))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,35 +449,109 @@ pub fn prepared_action_text(
 }
 
 pub(crate) mod icons;
+/// The shared dialog component. It is complete and covered by its own tests, but no page calls it
+/// yet — wiring it in is a separate change — so its API is explicitly allowed to be unused rather
+/// than deleted and rebuilt later.
+// The dialog is one small component with a deliberately complete surface: every option it exposes
+// (a destructive title, a non-dismissible card, an action that stays open, the measured footer
+// rects) is covered by the module's own tests, but the panel does not need all of them yet. The
+// allowance is scoped to this module so it cannot hide dead code anywhere else.
+#[allow(dead_code)]
+pub(crate) mod modal;
 pub(crate) mod shell;
 pub(crate) mod theme;
 /// Install the production font and visual styles without opening any native surfaces.
 pub fn initialize_visuals(ctx: &egui::Context) {
     let _ = crate::font::install_chinese_font(ctx);
-    theme::style_root(ctx);
+    theme::apply_style(ctx);
 }
 
-pub(crate) use theme::{scale, style_root};
+#[cfg(test)]
+pub(crate) use theme::apply_style;
+/// Re-exported for the crate's own tests, which pin one theme explicitly instead of following the
+/// system preference that `apply_style` resolves at runtime.
+#[cfg(test)]
+pub(crate) use theme::style_root;
+pub(crate) use theme::{apply_settings_theme, scale};
 
+/// Pin the active theme, for review captures that must render one specific ramp instead of
+/// following the operating system.
+///
+/// Production never calls this: the settings page owns the user's real choice, and `apply_style`
+/// reads it every pass. A capture pass needs the light ramp pinned because the machine that takes
+/// the screenshots reports a dark system preference.
+#[cfg(debug_assertions)]
+pub fn set_review_theme(ctx: &egui::Context, preference: egui::ThemePreference) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("review-theme-override"), preference));
+    theme::store_theme(ctx, preference);
+}
+
+/// A flat, shadowless card. Every page composes its content from these, which is what makes the
+/// blocks line up: identical fill, radius, padding and separation.
+///
+/// The card hugs its content. It is never padded out to match a neighbour: a card stretched to
+/// someone else's height just holds a slab of empty surface, which reads as a layout bug no matter
+/// how level the edges are.
 pub(crate) fn section_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    // Outer spacing belongs to the page; section contents do not add a second gap.
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(
-            scale::SECTION_MARGIN[0],
-            scale::SECTION_MARGIN[1],
-        ))
-        // Borderless cards: set the stroke on the frame itself so no global visuals state can
-        // reintroduce an outline (and with it the line that collided with the scrollbar).
-        .fill(Color32::from_rgb(248, 250, 253))
-        .rounding(16.0)
-        .stroke(Stroke::NONE)
+    egui::Frame::none()
+        .fill(scale::surface())
+        .rounding(egui::Rounding::same(scale::RADIUS_CONTAINER))
+        .stroke(Stroke::new(1.0_f32, scale::line()))
+        .inner_margin(egui::Margin::same(scale::CARD_PAD))
+        .outer_margin(egui::Margin {
+            bottom: scale::BLOCK_GAP,
+            ..Default::default()
+        })
         .show(ui, |ui| {
-            // Stretch every section to the panel width so the grouped boxes align as even
-            // columns instead of hugging their content and leaving ragged right edges.
+            // Stretch every card to the panel width so the blocks align as even columns instead
+            // of hugging their content and leaving ragged right edges.
             ui.set_min_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.spacing_mut().item_spacing.y = scale::SECTION_GAP;
             add_contents(ui);
         });
+}
+
+/// Lay two cards side by side at half the content width.
+///
+/// This is the page's default arrangement on a desktop-width window: content that used to be
+/// stacked into one narrow column now fills the width, so a card can be read without scrolling
+/// past its neighbour. Below `TWO_COLUMN_MIN_WIDTH` the page falls back to a single column, which
+/// is what keeps the narrow layout working instead of squeezing both cards.
+///
+/// Each card keeps its own height. Rows are therefore aligned at the top and may end at different
+/// depths — the honest shape of uneven content, and the only shape that wastes no space.
+pub(crate) const TWO_COLUMN_MIN_WIDTH: f32 = 760.0;
+
+pub(crate) fn two_columns(ui: &mut Ui, left: impl FnOnce(&mut Ui), right: impl FnOnce(&mut Ui)) {
+    let available = ui.available_width();
+    if available < TWO_COLUMN_MIN_WIDTH {
+        left(ui);
+        right(ui);
+        return;
+    }
+    let gap = scale::BLOCK_GAP;
+    let column_width = ((available - gap) / 2.0).floor();
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.allocate_ui_with_layout(
+            egui::vec2(column_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_width(column_width);
+                ui.set_max_width(column_width);
+                left(ui);
+            },
+        );
+        ui.allocate_ui_with_layout(
+            egui::vec2(column_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_width(column_width);
+                ui.set_max_width(column_width);
+                right(ui);
+            },
+        );
+    });
 }
 
 /// A label/value grid with the reference's 88px label column, shared by every page.
@@ -505,33 +596,35 @@ pub(crate) fn wrapped_label(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> e
     ui.add(egui::Label::new(text).wrap())
 }
 
-/// Group heading inside a page (设备 / 蜂窝网络 / 低风险与网络恢复 / …).
+/// Group heading inside a page.
 pub(crate) fn section_heading(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(scale::SECTION).strong()
+    RichText::new(text.into())
+        .size(scale::HEADING)
+        .strong()
+        .color(scale::ink())
 }
 
 /// Label of a label/value row. Muted rather than bold so the value carries the emphasis and a
 /// column of values reads as one continuous vertical run.
 pub(crate) fn field_label(text: impl Into<String>) -> RichText {
     RichText::new(text.into())
-        .size(scale::LABEL)
-        .color(scale::MUTED)
+        .size(scale::BODY)
+        .color(scale::secondary())
 }
 
 /// Hints, timestamps, and descriptions: the quietest tier of the scale.
 pub(crate) fn meta_text(text: impl Into<String>) -> RichText {
     RichText::new(text.into())
         .size(scale::META)
-        .color(scale::FAINT)
+        .color(scale::faint())
 }
 
-/// Supporting evidence (the diagnostics 「详情」 rows and the explanation under a status badge):
-/// same quiet size as meta copy, but in the distinct `DETAIL` slate so it reads separately from
-/// hints and timestamps.
+/// Supporting evidence: the same quiet size as meta copy, in the mid tier so it reads apart from
+/// timestamps without introducing a colour.
 pub(crate) fn detail_text(text: impl Into<String>) -> RichText {
     RichText::new(text.into())
         .size(scale::META)
-        .color(scale::DETAIL)
+        .color(scale::secondary())
 }
 
 /// Presentation-side ring of the measured throughput samples backing the overview chart.
@@ -616,7 +709,7 @@ pub(crate) const TEMPERATURE_SAMPLE_PERIOD: Duration = Duration::from_secs(10);
 
 /// Chart height of the temperature trend — compact, because it lives inside the overview section
 /// rather than in the rate dashboard.
-pub(crate) const TEMPERATURE_CHART_HEIGHT: f32 = 72.0;
+pub(crate) const TEMPERATURE_CHART_HEIGHT: f32 = 64.0;
 
 impl TemperatureHistory {
     #[must_use]
@@ -729,16 +822,16 @@ pub fn speed_grade(down_bytes_per_sec: Option<u64>) -> (TextKey, StatusTone) {
 /// (`CHN-UNICOM` → `CHN-UNICOM（中国联通）`).  The match is a closed substring set over the
 /// big-four carriers; anything unknown or empty passes through untouched — nothing is guessed.
 #[must_use]
-pub fn carrier_display_name(raw: &str) -> String {
+pub fn carrier_display_name(raw: &str, language: crate::localization::Language) -> String {
     let upper = raw.to_ascii_uppercase();
     let chinese = if upper.contains("UNICOM") || upper.contains("CUCC") {
-        "中国联通"
+        t(language, crate::localization::TextKey::CarrierChinaUnicom)
     } else if upper.contains("MOBILE") || upper.contains("CMCC") {
-        "中国移动"
+        t(language, crate::localization::TextKey::CarrierChinaMobile)
     } else if upper.contains("TELECOM") || upper.contains("CTCC") {
-        "中国电信"
+        t(language, crate::localization::TextKey::CarrierChinaTelecom)
     } else if upper.contains("CBN") || upper.contains("BROADCAST") {
-        "中国广电"
+        t(language, crate::localization::TextKey::CarrierChinaBroadnet)
     } else {
         return raw.to_owned();
     };
@@ -762,8 +855,9 @@ pub fn status_tone_for_availability(snapshot: &AppSnapshot) -> StatusTone {
 pub(crate) const DOWN_COLOR: Color32 = scale::DOWNLOAD;
 pub(crate) const UP_COLOR: Color32 = scale::UPLOAD;
 
-/// Chart height of the rate section (the reference's 218px `chart-container`).
-pub(crate) const RATE_CHART_HEIGHT: f32 = 168.0;
+/// Chart height of the rate section. Tall enough to read a one-minute trend properly now that the
+/// legend sits under the plot instead of above it.
+pub(crate) const RATE_CHART_HEIGHT: f32 = 150.0;
 /// X-axis span in seconds: the ring covers `capacity × cadence` ending at 现在.
 const RATE_CHART_X_SPAN_SECS: f32 = RATE_SAMPLE_PERIOD.as_secs_f32() * RATE_HISTORY_CAPACITY as f32;
 
@@ -888,21 +982,29 @@ pub fn render_rate_section(
             // here; otherwise a wrapped row would measure against the unbounded parent width.
             ui.set_min_width(width);
             ui.set_max_width(width);
-            // Heading row: 实时速率 with the window length at the right, like the reference.
+            // Heading row: the live-rate caption with the window length at the right, like the reference.
             ui.horizontal(|ui| {
-                ui.label(section_heading("实时速率"));
+                ui.label(section_heading(t(
+                    language,
+                    crate::localization::TextKey::RateHeading,
+                )));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     wrapped_label(
                         ui,
                         RichText::new(window_text.clone())
                             .size(scale::RATE_AUX)
-                            .color(scale::SECONDARY),
+                            .color(scale::secondary()),
                     );
                 });
             });
             ui.add_space(6.0);
-            // Hero numbers: caption row (↓下载 / ↑上传) over a 28pt reading and a 13pt unit.
-            // Wrapped so the two readings fold onto a second line in the narrowest column.
+            // The plot comes first and takes the height the legend row used to occupy. The live
+            // readings then sit under it, next to the window peaks, so the numbers read as the
+            // chart's footer rather than as a separate block on top of it.
+            rate_chart::paint(ui, history, language);
+            ui.add_space(8.0);
+            // Hero numbers: caption row (↓下载 / ↑上传) over a reading and a unit. Wrapped so the
+            // two readings fold onto a second line in the narrowest column.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 28.0;
                 rate_hero_block(
@@ -915,15 +1017,22 @@ pub fn render_rate_section(
                 );
                 rate_hero_block(ui, TextKey::RateCaptionUp, "↑", up, UP_COLOR, language);
             });
-            ui.add_space(11.0);
-            rate_chart::paint(ui, history, language);
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 24.0;
-                for (caption, value) in [("下载峰值", down_peak), ("上传峰值", up_peak)] {
-                    let value = value
-                        .map(format_rate_peak)
-                        .unwrap_or_else(|| "未获取".into());
+                for (caption, value) in [
+                    (
+                        t(language, crate::localization::TextKey::RatePeakDownload),
+                        down_peak,
+                    ),
+                    (
+                        t(language, crate::localization::TextKey::RatePeakUpload),
+                        up_peak,
+                    ),
+                ] {
+                    let value = value.map(format_rate_peak).unwrap_or_else(|| {
+                        t(language, crate::localization::TextKey::ValueNotAvailable)
+                    });
                     ui.label(detail_text(format!("{caption}  {value}")));
                 }
             });
@@ -960,7 +1069,7 @@ fn rate_hero_block(
                 0.0,
                 egui::text::TextFormat::simple(
                     egui::FontId::proportional(scale::RATE_AUX),
-                    scale::SECONDARY,
+                    scale::secondary(),
                 ),
             );
             job.append(
@@ -968,7 +1077,7 @@ fn rate_hero_block(
                 0.0,
                 egui::text::TextFormat::simple(
                     egui::FontId::proportional(scale::RATE_NUMBER),
-                    scale::INK,
+                    scale::ink(),
                 ),
             );
             job.append(
@@ -976,7 +1085,7 @@ fn rate_hero_block(
                 0.0,
                 egui::text::TextFormat::simple(
                     egui::FontId::proportional(scale::RATE_AUX),
-                    scale::SECONDARY,
+                    scale::secondary(),
                 ),
             );
         }
@@ -986,7 +1095,7 @@ fn rate_hero_block(
                 0.0,
                 egui::text::TextFormat::simple(
                     egui::FontId::proportional(scale::RATE_AUX),
-                    scale::SECONDARY,
+                    scale::secondary(),
                 ),
             );
             job.append(
@@ -994,7 +1103,7 @@ fn rate_hero_block(
                 0.0,
                 egui::text::TextFormat::simple(
                     egui::FontId::proportional(scale::BODY),
-                    scale::FAINT,
+                    scale::faint(),
                 ),
             );
         }
@@ -1002,10 +1111,10 @@ fn rate_hero_block(
     job.wrap.max_width = ui.available_width();
     let galley = ui.painter().layout_job(job);
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
-    ui.painter().galley(rect.min, galley, scale::INK);
+    ui.painter().galley(rect.min, galley, scale::ink());
 }
 
-/// Hand-rolled compact trend for the measured module temperature: white plot, the window's own
+/// Hand-rolled compact trend for the measured module temperature: a raised plot, the window's own
 /// min/max as the y-range (padded by one degree so a flat run draws as a line instead of hugging an
 /// edge), three labelled gridlines in degrees, one violet series, no fill, no animation.  Samples
 /// are placed by their real timestamps, so a cycle that reported nothing leaves an honest gap
@@ -1021,7 +1130,7 @@ pub(crate) fn paint_temperature_chart(
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::WHITE);
+    painter.rect_filled(rect, 0.0, scale::surface_raised());
     let plot = egui::Rect::from_min_max(
         egui::Pos2::new(rect.left() + 42.0, rect.top() + 8.0),
         egui::Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0),
@@ -1035,7 +1144,7 @@ pub(crate) fn paint_temperature_chart(
             egui::Align2::CENTER_CENTER,
             LocalizedText::new(language, TextKey::TemperatureTrendSampling).text,
             egui::FontId::proportional(scale::RATE_AUX),
-            scale::SECONDARY,
+            scale::secondary(),
         );
         return;
     }
@@ -1050,21 +1159,14 @@ pub(crate) fn paint_temperature_chart(
                 egui::Pos2::new(plot.left(), y),
                 egui::Pos2::new(plot.right(), y),
             ],
-            Stroke::new(
-                1.0_f32,
-                if fraction == 0.0 {
-                    scale::AXIS
-                } else {
-                    scale::GRID
-                },
-            ),
+            Stroke::new(1.0_f32, scale::line()),
         );
         painter.text(
             egui::Pos2::new(plot.left() - 6.0, y),
             egui::Align2::RIGHT_CENTER,
             format!("{label:.0}"),
             egui::FontId::proportional(scale::META),
-            scale::AXIS_LABEL,
+            scale::faint(),
         );
     }
     painter.text(
@@ -1072,7 +1174,7 @@ pub(crate) fn paint_temperature_chart(
         egui::Align2::RIGHT_TOP,
         "°C",
         egui::FontId::proportional(scale::META),
-        scale::AXIS_LABEL,
+        scale::faint(),
     );
 
     let newest = samples
@@ -1104,23 +1206,19 @@ pub(crate) fn paint_temperature_chart(
     for run in &runs {
         match run.as_slice() {
             [point] => {
-                series_painter.circle_filled(*point, 2.0, scale::TEMPERATURE);
+                series_painter.circle_filled(*point, 2.0, scale::secondary());
             }
             [_, _, ..] => {
                 series_painter.add(Shape::line(
                     run.clone(),
-                    Stroke::new(2.0_f32, scale::TEMPERATURE),
+                    Stroke::new(2.0_f32, scale::secondary()),
                 ));
             }
             _ => {}
         }
     }
     if let Some((at, Some(value))) = samples.last() {
-        series_painter.circle_filled(
-            egui::Pos2::new(x_of(*at), y_of(*value)),
-            3.0,
-            scale::TEMPERATURE,
-        );
+        series_painter.circle_filled(egui::Pos2::new(x_of(*at), y_of(*value)), 3.0, scale::ink());
     }
 }
 
@@ -1230,7 +1328,7 @@ mod tests {
             "rate section overflowed its column: {rect:?}"
         );
         assert!(
-            (260.0..460.0).contains(&rect.height()),
+            (180.0..460.0).contains(&rect.height()),
             "unexpected rate section height: {rect:?}"
         );
     }
@@ -1311,14 +1409,22 @@ mod tests {
     }
 
     #[test]
-    fn style_root_keeps_controls_readable_and_accessible() {
+    fn every_control_keeps_one_height_and_one_quiet_type_scale() {
         let context = egui::Context::default();
-        style_root(&context);
+        apply_style(&context);
         let style = context.style();
-        assert!(style.spacing.interact_size.y >= 32.0);
-        assert!(style.text_styles[&egui::TextStyle::Body].size >= 14.0);
-        assert!(style.text_styles[&egui::TextStyle::Small].size >= 12.0);
-        assert!(!style.visuals.dark_mode);
+        // One control height everywhere is what stops a page growing oversized buttons.
+        assert_eq!(style.spacing.interact_size.y, scale::CONTROL_H);
+        assert_eq!(style.text_styles[&egui::TextStyle::Body].size, scale::BODY);
+        assert_eq!(style.text_styles[&egui::TextStyle::Small].size, scale::META);
+        assert_eq!(
+            style.text_styles[&egui::TextStyle::Button].size,
+            scale::BODY
+        );
+        let fill = style.visuals.selection.bg_fill;
+        assert_eq!(fill, scale::selected());
+        assert_eq!(style.visuals.hyperlink_color, scale::accent());
+        assert_ne!(fill, scale::accent());
     }
 
     #[test]

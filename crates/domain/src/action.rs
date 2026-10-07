@@ -82,7 +82,7 @@ pub struct ActionPlan {
 
 impl ActionPlan {
     pub fn try_new(draft: ActionPlanDraft) -> Result<Self, ActionSafetyError> {
-        if !draft.target.is_supported() {
+        if !draft.target.allows_controlled_actions() {
             return Err(ActionSafetyError::UnsupportedDevice);
         }
         if draft.current_epoch != draft.evidence_epoch {
@@ -110,7 +110,7 @@ impl ActionPlan {
         before_state_hash: BeforeStateHash,
         now: SystemTime,
     ) -> Result<(), ActionSafetyError> {
-        if !target.is_supported() {
+        if !target.allows_controlled_actions() {
             return Err(ActionSafetyError::UnsupportedDevice);
         }
         if now > self.expires_at {

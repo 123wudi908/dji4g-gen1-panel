@@ -718,6 +718,8 @@ pub struct NormalizedNetworkEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LanguageCode {
     ZhCn,
+    /// Traditional Chinese, Hong Kong vocabulary.
+    ZhTw,
     EnUs,
 }
 
@@ -773,10 +775,19 @@ pub struct AutostartApplyOutcome {
     pub observed: Result<AutostartKnownState, FailureCode>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThemeCode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub revision: u64,
     pub language: LanguageCode,
+    pub theme: ThemeCode,
     pub autostart: AutostartStatus,
     pub start_minimized: bool,
     pub active_probe: bool,
@@ -789,6 +800,7 @@ impl Default for SettingsSnapshot {
         Self {
             revision: 0,
             language: LanguageCode::ZhCn,
+            theme: ThemeCode::System,
             autostart: AutostartStatus::Loading,
             start_minimized: false,
             active_probe: true,

@@ -28,6 +28,11 @@ use crate::localization::{
     Language, LocalizedText, TextArgs, TextKey, feature_status_note, format_text_in,
 };
 
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
+
 /// One projected stored message. Sender and body are carried verbatim only inside this UI-local
 /// value; the list projection never feeds a log, a diagnostic export, or any serialized document.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,7 +160,11 @@ pub fn row_tags(row: &SmsRowVm, language: Language) -> Vec<SmsRowTag> {
     }];
     if let Some((_, total)) = row.multipart {
         tags.push(SmsRowTag {
-            text: format!("已读取 {} / {total} 个分片", row.fragments.len()),
+            text: crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsFragmentsRead,
+                &[&row.fragments.len().to_string(), &total.to_string()],
+            ),
             tone: StatusTone::Neutral,
         });
     }
@@ -171,7 +180,7 @@ pub fn row_tags(row: &SmsRowVm, language: Language) -> Vec<SmsRowTag> {
 /// Project one stored message. The sender defaults to its masked form; the full sender and body
 /// are placed in the VM so an explicit row click can reveal/copy them in place.
 #[must_use]
-pub fn sms_row_vm(message: &SmsMessage, _language: Language) -> SmsRowVm {
+pub fn sms_row_vm(message: &SmsMessage) -> SmsRowVm {
     let fragments = if message.direction == SmsDirection::Incoming {
         vec![message.fragment_key()]
     } else {
@@ -201,8 +210,8 @@ pub fn sms_row_vm(message: &SmsMessage, _language: Language) -> SmsRowVm {
     }
 }
 
-fn display_row_vm(message: &SmsDisplayMessage, language: Language) -> SmsRowVm {
-    let mut row = sms_row_vm(&message.message, language);
+fn display_row_vm(message: &SmsDisplayMessage) -> SmsRowVm {
+    let mut row = sms_row_vm(&message.message);
     row.stable_id = message.stable_id();
     row.fragments = message.fragments.clone();
     row.delete_allowed = message.delete_allowed;
@@ -215,33 +224,58 @@ pub fn sms_vm(snapshot: &ControllerSnapshot, messages: &[SmsMessage], language: 
     let mut status = sms_status_text(summary.status, language);
     if let Some(error) = &snapshot.sms_inbox_failure {
         let reason = match error.code.stable().as_str() {
-            "sms:port_busy" => "串口上一个操作尚未结束，请稍后刷新",
-            "sms:port_open_failed" | "sms:permission_denied" => "串口访问失败",
-            "sms:unsupported" => "未找到可验证的短信 AT 串口",
-            "sms:pdu_mode_required" | "sms:pdu_confirm_failed" => "短信 PDU 模式未确认",
-            "sms:verification_failed" => "模块响应未通过验证",
-            "sms:timeout" | "app:stage_timeout" => "短信查询超时",
-            "sms:no_device" => "无已验证的设备，请先检查概览中的模块连接状态",
-            "sms:device_removed" => "设备已断开",
-            "sms:sim_identity_required" => "尚未识别 SIM 卡，请先返回概览刷新连接状态",
-            "sms:sim_changed" => "SIM 卡已更换，本次短信未加入列表；请返回概览重新检测",
+            "sms:port_busy" => t(language, crate::localization::TextKey::SmsErrPortBusy),
+            "sms:port_open_failed" | "sms:permission_denied" => {
+                t(language, crate::localization::TextKey::SmsErrPortAccess)
+            }
+            "sms:unsupported" => t(language, crate::localization::TextKey::SmsErrNoAtPort),
+            "sms:pdu_mode_required" | "sms:pdu_confirm_failed" => {
+                t(language, crate::localization::TextKey::SmsErrPduMode)
+            }
+            "sms:verification_failed" => t(
+                language,
+                crate::localization::TextKey::SmsErrResponseInvalid,
+            ),
+            "sms:timeout" | "app:stage_timeout" => {
+                t(language, crate::localization::TextKey::SmsErrTimeout)
+            }
+            "sms:no_device" => t(language, crate::localization::TextKey::SmsErrNoDevice),
+            "sms:device_removed" => t(language, crate::localization::TextKey::SmsErrDeviceGone),
+            "sms:sim_identity_required" => {
+                t(language, crate::localization::TextKey::SmsErrSimUnknown)
+            }
+            "sms:sim_changed" => t(language, crate::localization::TextKey::SmsErrSimChanged),
             "sms:sim_identity_unverified" => {
-                "无法确认 SIM 卡身份，本次未读取短信；请检查 SIM 后重新检测"
+                t(language, crate::localization::TextKey::SmsErrSimIdentity)
             }
-            "sms:read_cancelled" => "已停止读取，原有列表已保留",
-            "sms:context_changed" => "模块或 SIM 已变化，本次结果已丢弃，请重新检测",
-            "sms:storage_restore_unknown" => {
-                "无法确认已恢复原读取位置；请先重新检测模块，暂不要发送或删除短信"
+            "sms:read_cancelled" => t(language, crate::localization::TextKey::SmsStopped),
+            "sms:context_changed" => {
+                t(language, crate::localization::TextKey::SmsErrContextChanged)
             }
-            "sms:storage_unsupported" | "sms:storage_selection_unavailable" => {
-                "模块不支持读取此位置，请使用当前存储位置"
-            }
-            "sms:list_too_large" => "短信数量或返回内容超过安全上限，本次列表未更新",
-            _ => "短信查询失败",
+            "sms:storage_restore_unknown" => t(
+                language,
+                crate::localization::TextKey::SmsErrRestoreUnconfirmed,
+            ),
+            "sms:storage_unsupported" | "sms:storage_selection_unavailable" => t(
+                language,
+                crate::localization::TextKey::SmsErrUnsupportedLocation,
+            ),
+            "sms:list_too_large" => t(language, crate::localization::TextKey::SmsErrLimit),
+            _ => t(language, crate::localization::TextKey::SmsErrQueryFailed),
         };
-        status.text = format!("{reason}（{}）", error.code.stable().as_str());
+        status.text = crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::SmsFailureWithCode,
+            &[&reason, error.code.stable().as_str()],
+        );
         if let Some(code) = error.os_code {
-            status.text.push_str(&format!("；系统错误 {code}"));
+            status
+                .text
+                .push_str(&crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::SmsSystemError,
+                    &[&code.to_string()],
+                ));
         }
     }
     SmsVm {
@@ -263,10 +297,7 @@ pub fn sms_vm(snapshot: &ControllerSnapshot, messages: &[SmsMessage], language: 
         incomplete_warning: LocalizedText::new(language, TextKey::SmsIncompleteWarning),
         empty_text: LocalizedText::new(language, TextKey::SmsEmpty),
         list_pending_text: LocalizedText::new(language, TextKey::SmsListPending),
-        rows: messages
-            .iter()
-            .map(|message| sms_row_vm(message, language))
-            .collect(),
+        rows: messages.iter().map(sms_row_vm).collect(),
     }
 }
 
@@ -284,6 +315,12 @@ fn list_viewport_id() -> egui::Id {
     egui::Id::new("sms-list-viewport")
 }
 
+fn read_only_module(snapshot: &ControllerSnapshot) -> bool {
+    snapshot.app.device.as_ref().is_some_and(|device| {
+        device.identity.profile().is_some() && !device.identity.allows_controlled_actions()
+    })
+}
+
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
@@ -293,41 +330,66 @@ pub(crate) fn render(
     state: &mut SmsComposeState,
 ) {
     let mut vm = sms_vm(snapshot, &[], language);
-    vm.rows = messages
-        .iter()
-        .map(|message| display_row_vm(message, language))
-        .collect();
+    vm.rows = messages.iter().map(display_row_vm).collect();
     ui.spacing_mut().item_spacing.y = 8.0;
     state.serial_busy = snapshot.serial_work_busy;
+    state.module_read_only = read_only_module(snapshot);
+    if state.module_read_only {
+        ui.label(meta_text(t(language, TextKey::ReadOnlyModuleReason)));
+        state.storage_confirmation = None;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new("短信").size(scale::PAGE).color(scale::INK));
+            ui.label(
+                RichText::new(t(language, crate::localization::TextKey::SmsPageTitle))
+                    .size(scale::TITLE)
+                    .color(scale::ink()),
+            );
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let details_label = if state.refresh_error.is_some() || state.auto_refresh_paused {
-                "读取详情 · 需注意"
+                t(
+                    language,
+                    crate::localization::TextKey::SmsReadDetailsAttention,
+                )
             } else {
-                "读取详情"
+                t(language, crate::localization::TextKey::SmsReadDetails)
             };
             ui.menu_button(details_label, |ui| {
                 ui.set_max_width(420.0);
-                render_history_controls(ui, snapshot, sink, state);
-                render_inbox_notes(ui, &vm, snapshot, state);
+                render_history_controls(ui, language, snapshot, sink, state);
+                render_inbox_notes(ui, language, &vm, snapshot, state);
             });
-            if ui.add(super::theme::primary_button("新建短信")).clicked() {
+            if ui
+                .add_enabled(
+                    !state.module_read_only,
+                    super::theme::primary_button(t(
+                        language,
+                        crate::localization::TextKey::ComposeTitle,
+                    )),
+                )
+                .clicked()
+            {
                 state.open_editor();
             }
-            refresh_button(ui, snapshot, sink, state, "刷新列表");
+            refresh_button(
+                ui,
+                language,
+                snapshot,
+                sink,
+                state,
+                &t(language, crate::localization::TextKey::SmsRefreshList),
+            );
         });
     });
     if snapshot.sms_refresh_pending {
-        render_history_controls(ui, snapshot, sink, state);
+        render_history_controls(ui, language, snapshot, sink, state);
     }
-    render_storage_confirmation(ui, snapshot, sink, state);
+    render_storage_confirmation(ui, language, snapshot, sink, state);
     ui.add_space(4.0);
-    compose::render(ui, state, snapshot, sink);
+    compose::render(ui, language, state, snapshot, sink);
     if let Some(deletion) = &snapshot.sms_delete {
-        render_delete_result(ui, deletion);
+        render_delete_result(ui, language, deletion);
     }
     let busy = snapshot.serial_work_busy
         || snapshot
@@ -342,7 +404,7 @@ pub(crate) fn render(
         });
     state.auto_refresh(
         Instant::now(),
-        snapshot.app.device.is_some(),
+        snapshot.app.device.is_some() && !state.module_read_only,
         busy,
         snapshot.sms_refresh_pending,
         sink,
@@ -356,6 +418,7 @@ fn refresh(sink: &dyn UiCommandSink, state: &mut SmsComposeState) {
 
 fn refresh_button(
     ui: &mut Ui,
+    language: Language,
     snapshot: &ControllerSnapshot,
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
@@ -363,10 +426,19 @@ fn refresh_button(
 ) -> egui::Response {
     let response = ui
         .add_enabled(
-            !snapshot.sms_refresh_pending && !snapshot.serial_work_busy,
+            !read_only_module(snapshot)
+                && !snapshot.sms_refresh_pending
+                && !snapshot.serial_work_busy,
             egui::Button::new(label),
         )
-        .on_disabled_hover_text("当前通信任务尚未结束，请稍后刷新");
+        .on_disabled_hover_text(t(
+            language,
+            if read_only_module(snapshot) {
+                TextKey::ReadOnlyModuleReason
+            } else {
+                TextKey::SmsBusyWait
+            },
+        ));
     if response.clicked() {
         refresh(sink, state);
     }
@@ -375,6 +447,7 @@ fn refresh_button(
 
 fn render_history_controls(
     ui: &mut Ui,
+    language: Language,
     snapshot: &ControllerSnapshot,
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
@@ -388,32 +461,52 @@ fn render_history_controls(
         ui.horizontal_wrapped(|ui| {
             crate::ui::components::loading_spinner(ui);
             let label = match snapshot.sms_read_phase {
-                None => "等候读取",
-                Some(SmsReadPhase::Verifying) => "正在确认模块与 SIM",
-                Some(SmsReadPhase::ReadingStorage) => "正在查询短信存储位置",
-                Some(SmsReadPhase::SwitchingStorage) => "正在选择读取位置",
-                Some(SmsReadPhase::Listing) => "正在读取历史短信",
-                Some(SmsReadPhase::Decoding) => "正在整理短信",
-                Some(SmsReadPhase::RestoringStorage) => "正在恢复原读取位置，请稍候",
-                Some(SmsReadPhase::Complete) => "正在释放连接，请稍候",
+                None => t(language, crate::localization::TextKey::SmsPhaseWaiting),
+                Some(SmsReadPhase::Verifying) => {
+                    t(language, crate::localization::TextKey::SmsPhaseConfirming)
+                }
+                Some(SmsReadPhase::ReadingStorage) => t(
+                    language,
+                    crate::localization::TextKey::SmsPhaseQueryingStorage,
+                ),
+                Some(SmsReadPhase::SwitchingStorage) => {
+                    t(language, crate::localization::TextKey::SmsPhaseSelecting)
+                }
+                Some(SmsReadPhase::Listing) => {
+                    t(language, crate::localization::TextKey::SmsPhaseReading)
+                }
+                Some(SmsReadPhase::Decoding) => {
+                    t(language, crate::localization::TextKey::SmsPhaseOrganizing)
+                }
+                Some(SmsReadPhase::RestoringStorage) => {
+                    t(language, crate::localization::TextKey::SmsPhaseRestoring)
+                }
+                Some(SmsReadPhase::Complete) => {
+                    t(language, crate::localization::TextKey::SmsPhaseReleasing)
+                }
             };
-            ui.label(format!(
-                "{label} · 已读取 {} 个存储记录",
-                snapshot.sms_read_progress
+            ui.label(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsProgressRecords,
+                &[&label, &snapshot.sms_read_progress.to_string()],
             ));
             if ui
-                .add_enabled(!state.read_cancel_requested, egui::Button::new("停止读取"))
+                .add_enabled(
+                    !state.read_cancel_requested,
+                    egui::Button::new(t(language, crate::localization::TextKey::SmsStopReading)),
+                )
                 .clicked()
             {
                 match sink.try_send(UiCommand::SmsCancelRead) {
                     Ok(()) => {
                         state.auto_refresh_paused = true;
                         state.read_cancel_requested = true;
-                        state.refresh_error = Some(
-                            "已请求停止，正在等待连接释放；自动刷新已暂停，可手动刷新继续。".into(),
-                        );
+                        state.refresh_error =
+                            Some(t(language, crate::localization::TextKey::SmsStopRequested));
                     }
-                    Err(error) => state.refresh_error = Some(compose::enqueue_error(error).into()),
+                    Err(error) => {
+                        state.refresh_error = Some(compose::enqueue_error(error, language))
+                    }
                 }
             }
         });
@@ -423,25 +516,76 @@ fn render_history_controls(
         .as_ref()
         .filter(|_| !snapshot.sms_refresh_pending)
     {
-        let location = report
-            .storage
-            .as_ref()
-            .map_or("未确认", |s| match s.0.as_str() {
-                "SM" => "SIM 卡",
-                "ME" => "模块",
-                "MT" => "模块当前汇总区",
-                _ => "当前存储区",
-            });
-        egui::CollapsingHeader::new(format!("已读取 {} 个记录 · 存储位置与读取详情", report.raw_records)).id_salt("sms-history-help").show(ui, |ui| {
-            ui.label(format!("最近读取：{location} · {} 个短信分片，{} 个其他记录未展示", report.decoded_records, report.skipped_records));
-            ui.label("刷新会读取当前位置中仍保存的全部短信（最多 1000 个存储记录）。长短信可能占多个记录；已被模块删除的内容无法重新读回。可开启“本地历史”保存之后读到的短信。");
-            ui.label("其他位置可能还有短信。选择前会再次确认；读取期间暂时切换读取位置，完成后恢复，可能将未读短信标为已读。");
+        let location = report.storage.as_ref().map_or(
+            t(
+                language,
+                crate::localization::TextKey::SmsStorageUnconfirmed,
+            ),
+            |s| match s.0.as_str() {
+                "SM" => t(language, crate::localization::TextKey::SmsStorageSim),
+                "ME" => t(language, crate::localization::TextKey::SmsStorageModule),
+                "MT" => t(language, crate::localization::TextKey::SmsStorageModuleArea),
+                _ => t(
+                    language,
+                    crate::localization::TextKey::SmsStorageCurrentArea,
+                ),
+            },
+        );
+        egui::CollapsingHeader::new(crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::SmsRecordsRead,
+            &[&report.raw_records.to_string()],
+        ))
+        .id_salt("sms-history-help")
+        .show(ui, |ui| {
+            ui.label(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsLastRead,
+                &[
+                    &location,
+                    &report.decoded_records.to_string(),
+                    &report.skipped_records.to_string(),
+                ],
+            ));
+            ui.label(t(language, crate::localization::TextKey::SmsRefreshNote));
+            ui.label(t(
+                language,
+                crate::localization::TextKey::SmsOtherLocationsNote,
+            ));
             ui.horizontal_wrapped(|ui| {
-                for (token, label) in [("SM", "读取 SIM 卡短信"), ("ME", "读取模块短信")] {
+                for (token, label) in [
+                    ("SM", t(language, crate::localization::TextKey::SmsReadSim)),
+                    (
+                        "ME",
+                        t(language, crate::localization::TextKey::SmsReadModule),
+                    ),
+                ] {
                     let supported = report.supported_storages.iter().any(|s| s.0 == token);
-                    let reason = if snapshot.serial_work_busy { "当前通信任务尚未结束" } else if !supported { "模块尚未确认支持此存储位置" } else { "读取前将再次确认" };
-                    if ui.add_enabled(supported && !snapshot.serial_work_busy, egui::Button::new(label)).on_hover_text(reason).clicked() {
-                        state.storage_confirmation = Some((context.0, context.1, dji4g_domain::SmsStorageId(token.into())));
+                    let reason = if read_only_module(snapshot) {
+                        t(language, TextKey::ReadOnlyModuleReason)
+                    } else if snapshot.serial_work_busy {
+                        t(language, crate::localization::TextKey::SmsTaskBusy)
+                    } else if !supported {
+                        t(
+                            language,
+                            crate::localization::TextKey::SmsLocationUnsupported,
+                        )
+                    } else {
+                        t(language, crate::localization::TextKey::SmsWillConfirm)
+                    };
+                    if ui
+                        .add_enabled(
+                            supported && !snapshot.serial_work_busy && !read_only_module(snapshot),
+                            egui::Button::new(label),
+                        )
+                        .on_hover_text(reason)
+                        .clicked()
+                    {
+                        state.storage_confirmation = Some((
+                            context.0,
+                            context.1,
+                            dji4g_domain::SmsStorageId(token.into()),
+                        ));
                         ui.close_menu();
                     }
                 }
@@ -452,6 +596,7 @@ fn render_history_controls(
 
 fn render_storage_confirmation(
     ui: &mut Ui,
+    language: Language,
     snapshot: &ControllerSnapshot,
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
@@ -470,22 +615,61 @@ fn render_storage_confirmation(
         state.storage_confirmation = None;
     }
     if let Some((_, _, storage)) = state.storage_confirmation.clone() {
-        egui::Window::new("读取其他位置的短信").collapsible(false).resizable(false).default_width(370.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ui.ctx(), |ui| {
-                ui.label(format!("将读取{}中保存的短信，期间暂停其他模块操作。读取可能改变短信已读状态；完成后会恢复原读取位置，不改变短信写入和接收位置。", if storage.0 == "SM" { "SIM 卡" } else { "模块" }));
-                if let Some(error) = &state.refresh_error {
-                    wrapped_label(ui, RichText::new(error).color(StatusTone::Negative.color()));
+        egui::Window::new(t(
+            language,
+            crate::localization::TextKey::SmsReadOtherLocation,
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(370.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            let storage_label = if storage.0 == "SM" {
+                t(language, crate::localization::TextKey::SmsStorageSim)
+            } else {
+                t(language, crate::localization::TextKey::SmsStorageModule)
+            };
+            ui.label(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsReadOtherBody,
+                &[&storage_label],
+            ));
+            if let Some(error) = &state.refresh_error {
+                wrapped_label(ui, RichText::new(error).color(StatusTone::Negative.color()));
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button(t(language, crate::localization::TextKey::ButtonCancel))
+                    .clicked()
+                {
+                    state.storage_confirmation = None;
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() { state.storage_confirmation = None; }
-                    if ui.add_enabled(!snapshot.serial_work_busy, egui::Button::new("确认读取")).clicked() {
-                        match sink.try_send(UiCommand::SmsReadStorage { storage: storage.clone() }) {
-                            Ok(()) => { state.auto_refresh_paused = true; state.read_cancel_requested = false; state.refresh_error = None; state.storage_confirmation = None; }
-                            Err(error) => state.refresh_error = Some(compose::enqueue_error(error).into()),
+                if ui
+                    .add_enabled(
+                        !snapshot.serial_work_busy,
+                        egui::Button::new(t(
+                            language,
+                            crate::localization::TextKey::SmsConfirmRead,
+                        )),
+                    )
+                    .clicked()
+                {
+                    match sink.try_send(UiCommand::SmsReadStorage {
+                        storage: storage.clone(),
+                    }) {
+                        Ok(()) => {
+                            state.auto_refresh_paused = true;
+                            state.read_cancel_requested = false;
+                            state.refresh_error = None;
+                            state.storage_confirmation = None;
+                        }
+                        Err(error) => {
+                            state.refresh_error = Some(compose::enqueue_error(error, language))
                         }
                     }
-                });
+                }
             });
+        });
     }
 }
 
@@ -510,7 +694,7 @@ fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
         ui.horizontal(|ui| {
             ui.add_space(((ui.available_width() - 68.0) / 2.0).max(0.0));
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(211, 227, 253))
+                .fill(scale::surface_sunken())
                 .rounding(18.0)
                 .inner_margin(20.0)
                 .show(ui, |ui| {
@@ -521,7 +705,7 @@ fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
                 });
         });
         ui.add_space(16.0);
-        ui.label(RichText::new(title).size(18.0).strong().color(scale::INK));
+        ui.label(RichText::new(title).size(18.0).strong().color(scale::ink()));
         ui.add_space(4.0);
         wrapped_label(ui, meta_text(note));
     });
@@ -529,6 +713,7 @@ fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
 
 fn render_inbox_notes(
     ui: &mut Ui,
+    language: Language,
     vm: &SmsVm,
     snapshot: &ControllerSnapshot,
     state: &SmsComposeState,
@@ -537,25 +722,43 @@ fn render_inbox_notes(
     ui.horizontal_wrapped(|ui| {
         if snapshot.sms_refresh_pending {
             crate::ui::components::loading_spinner(ui);
-            ui.label(meta_text("正在同步模块短信…"));
+            ui.label(meta_text(t(
+                language,
+                crate::localization::TextKey::SmsSyncing,
+            )));
         } else {
             ui.label(meta_text(&vm.status.text));
         }
         if vm.unread_count > 0 {
-            badge(ui, format!("{} 条未读", vm.unread_count), scale::DOWNLOAD);
+            badge(
+                ui,
+                crate::localization::format_positional(
+                    language,
+                    crate::localization::TextKey::SmsUnreadCount,
+                    &[&vm.unread_count.to_string()],
+                ),
+                scale::DOWNLOAD,
+            );
         }
         if let Some((used, total)) = vm.capacity {
-            ui.label(meta_text(format!("存储 {used} / {total}")));
+            ui.label(meta_text(crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsStorageUsage,
+                &[&used.to_string(), &total.to_string()],
+            )));
         }
     });
     if state.auto_refresh_paused {
-        ui.label(meta_text("自动同步已暂停 · 点击刷新列表继续"));
+        ui.label(meta_text(t(
+            language,
+            crate::localization::TextKey::SmsAutoSyncPaused,
+        )));
     }
     // A sync failure is real information, but it used to print a full paragraph above the list
     // and eat the space the messages needed. It stays one click away instead.
     if let Some(error) = &state.refresh_error {
         egui::CollapsingHeader::new(
-            RichText::new("短信同步遇到问题")
+            RichText::new(t(language, crate::localization::TextKey::SmsSyncProblem))
                 .size(13.0)
                 .color(StatusTone::Caution.color()),
         )
@@ -566,7 +769,7 @@ fn render_inbox_notes(
         });
     }
     if vm.has_incomplete || vm.evicted > 0 {
-        egui::CollapsingHeader::new("同步提示与历史记录")
+        egui::CollapsingHeader::new(t(language, crate::localization::TextKey::SmsSyncHistory))
             .id_salt("sms-sync-notes")
             .default_open(false)
             .show(ui, |ui| {
@@ -580,9 +783,10 @@ fn render_inbox_notes(
                 if vm.evicted > 0 {
                     wrapped_label(
                         ui,
-                        meta_text(format!(
-                            "本地缓存已移出 {} 条较早短信；模块存储可能仍有记录。",
-                            vm.evicted
+                        meta_text(crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::SmsCacheTrimmed,
+                            &[&vm.evicted.to_string()],
                         )),
                     );
                 }
@@ -600,9 +804,12 @@ fn render_inbox(
 ) {
     ui.add_space(4.0);
     egui::Frame::none()
-        .fill(egui::Color32::WHITE)
+        .fill(scale::surface())
         .rounding(14.0)
-        .inner_margin(0.0)
+        // The sheet holds the tabs, the search field, the list and the footer note, so it needs the
+        // same card padding every other card in the panel uses; without it those controls sit
+        // flush against the rounded edge.
+        .inner_margin(egui::Margin::same(scale::CARD_PAD))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let incoming = vm
@@ -616,8 +823,22 @@ fn render_inbox(
                 egui::Id::new("sms-direction"),
                 &mut state.outgoing,
                 &[
-                    super::components::TabItem::new(false, format!("收件箱  {incoming}")),
-                    super::components::TabItem::new(true, format!("发送记录  {outgoing}")),
+                    super::components::TabItem::new(
+                        false,
+                        crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::SmsTabInbox,
+                            &[&incoming.to_string()],
+                        ),
+                    ),
+                    super::components::TabItem::new(
+                        true,
+                        crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::SmsTabOutgoing,
+                            &[&outgoing.to_string()],
+                        ),
+                    ),
                 ],
             ) {
                 state.selected = None;
@@ -671,7 +892,7 @@ fn render_inbox(
                             );
                             ui.painter().line_segment(
                                 [divider.center_top(), divider.center_bottom()],
-                                egui::Stroke::new(1.0_f32, scale::LINE),
+                                egui::Stroke::new(1.0_f32, scale::line()),
                             );
                             ui.allocate_ui_with_layout(
                                 egui::vec2(layout.detail_width, layout.body_height),
@@ -690,7 +911,10 @@ fn render_inbox(
                         // Narrow layout: the reader replaces the list, the back button stays
                         // pinned above its own bounded scroll area so a long message scrolls
                         // inside the reader instead of moving the page.
-                        if ui.button("返回消息列表").clicked() {
+                        if ui
+                            .button(t(language, crate::localization::TextKey::SmsBackToList))
+                            .clicked()
+                        {
                             state.selected = None;
                         }
                         ui.add_space(8.0);
@@ -709,9 +933,10 @@ fn render_inbox(
             ui.separator();
             // Truncated to one line so the reserved footer height above stays exact.
             ui.add(
-                egui::Label::new(meta_text(
-                    "模块接受发送 ≠ 收件人已收到  ·  短信内容不会写入诊断日志",
-                ))
+                egui::Label::new(meta_text(t(
+                    language,
+                    crate::localization::TextKey::SmsFooterNote,
+                )))
                 .truncate(),
             );
         });
@@ -730,7 +955,7 @@ fn list_panel(
     let column_height = ui.available_height();
     ui.add(
         egui::TextEdit::singleline(&mut state.search)
-            .hint_text("搜索号码或短信内容")
+            .hint_text(t(language, crate::localization::TextKey::SmsSearchHint))
             .desired_width(f32::INFINITY)
             .margin(egui::vec2(12.0, 10.0)),
     );
@@ -742,25 +967,48 @@ fn list_panel(
     });
     if rows.is_empty() {
         let (title, note) = if !state.search.trim().is_empty() {
-            ("没有找到相关短信", "试试其他号码或关键词")
+            (
+                t(language, crate::localization::TextKey::SmsEmptySearch),
+                t(language, crate::localization::TextKey::SmsEmptySearchHint),
+            )
         } else if state.outgoing {
-            ("还没有发送记录", "点击右上角「新建短信」开始写信")
+            (
+                t(language, crate::localization::TextKey::SmsEmptyOutgoing),
+                t(language, crate::localization::TextKey::SmsEmptyOutgoingHint),
+            )
         } else if snapshot.sms_refresh_pending {
-            ("正在读取短信", "正在与模块同步，请稍候")
+            (
+                t(language, crate::localization::TextKey::SmsLoading),
+                t(language, crate::localization::TextKey::SmsLoadingHint),
+            )
         } else {
             match snapshot.sms_inbox.status {
-                FeatureStatus::NotProbed => ("收件箱等待同步", "连接模块后会自动读取已保存的短信"),
-                FeatureStatus::Supported | FeatureStatus::Empty => {
-                    ("暂无收到的短信", "模块中暂时没有可显示的短信")
-                }
-                _ => ("暂时无法读取短信", "请查看上方的具体错误，检查连接后重试"),
+                FeatureStatus::NotProbed => (
+                    t(language, crate::localization::TextKey::SmsInboxWaiting),
+                    t(language, crate::localization::TextKey::SmsInboxWaitingHint),
+                ),
+                FeatureStatus::Supported | FeatureStatus::Empty => (
+                    t(language, crate::localization::TextKey::SmsInboxEmpty),
+                    t(language, crate::localization::TextKey::SmsInboxEmptyHint),
+                ),
+                _ => (
+                    t(language, crate::localization::TextKey::SmsUnavailable),
+                    t(language, crate::localization::TextKey::SmsUnavailableHint),
+                ),
             }
         };
-        empty_panel(ui, title, note, viewport);
+        empty_panel(ui, &title, &note, viewport);
         if !state.outgoing && state.search.is_empty() && !snapshot.sms_refresh_pending {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
-                refresh_button(ui, snapshot, sink, state, "刷新短信");
+                refresh_button(
+                    ui,
+                    language,
+                    snapshot,
+                    sink,
+                    state,
+                    &t(language, crate::localization::TextKey::SmsRefreshMessages),
+                );
             });
         }
     } else {
@@ -789,9 +1037,9 @@ fn render_list(
             .rounding(10.0)
             .inner_margin(10.0)
             .fill(if selected {
-                egui::Color32::from_rgb(211, 227, 253)
+                scale::surface_raised()
             } else {
-                egui::Color32::from_rgb(0xf8, 0xf9, 0xfc)
+                scale::surface_alt()
             });
         let response = frame
             .show(ui, |ui| {
@@ -808,15 +1056,22 @@ fn render_list(
                         RichText::new(&row.sender_masked)
                             .size(15.0)
                             .strong()
-                            .color(scale::INK),
+                            .color(scale::ink()),
                     );
-                    ui.label(meta_text(row.timestamp.as_deref().unwrap_or("时间未提供")));
+                    ui.label(meta_text(
+                        row.timestamp
+                            .as_deref()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                t(language, crate::localization::TextKey::SmsNoTimestamp)
+                            }),
+                    ));
                 });
                 ui.add(
                     egui::Label::new(
                         RichText::new(body_preview(&row.body))
                             .size(14.0)
-                            .color(scale::SECONDARY),
+                            .color(scale::secondary()),
                     )
                     .truncate(),
                 );
@@ -832,16 +1087,19 @@ fn render_list(
             .interact(egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.hovered() && !selected {
-            ui.painter()
-                .rect_stroke(response.rect, 10.0, egui::Stroke::new(1.0_f32, scale::LINE));
+            ui.painter().rect_stroke(
+                response.rect,
+                10.0,
+                egui::Stroke::new(1.0_f32, scale::line()),
+            );
         }
         if response.clicked() {
             state.selected = Some(key);
-            if !outgoing && !state.serial_busy {
+            if !outgoing && !state.serial_busy && !state.module_read_only {
                 state.error = sink
                     .try_send(UiCommand::SmsRead { index: row.index })
                     .err()
-                    .map(|e| compose::enqueue_error(e).to_owned());
+                    .map(|e| compose::enqueue_error(e, language));
             }
         }
         ui.add_space(6.0);
@@ -861,8 +1119,8 @@ fn render_detail(
     else {
         empty_panel(
             ui,
-            "消息阅读区",
-            "从左侧选择一条短信，即可在这里查看完整内容",
+            &t(language, crate::localization::TextKey::SmsReaderEmpty),
+            &t(language, crate::localization::TextKey::SmsReaderEmptyHint),
             ui.available_height(),
         );
         return;
@@ -872,9 +1130,9 @@ fn render_detail(
         badge(
             ui,
             if row.direction == SmsDirection::Incoming {
-                "收到的短信"
+                t(language, crate::localization::TextKey::SmsKindIncoming)
             } else {
-                "发送记录"
+                t(language, crate::localization::TextKey::SmsKindOutgoing)
             },
             scale::DOWNLOAD,
         );
@@ -885,16 +1143,24 @@ fn render_detail(
     ui.add_space(6.0);
     wrapped_label(ui, RichText::new(&row.sender_full).size(18.0).strong());
     ui.label(meta_text(
-        row.timestamp.as_deref().unwrap_or("模块未提供时间"),
+        row.timestamp
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                t(
+                    language,
+                    crate::localization::TextKey::SmsNoTimestampFromModule,
+                )
+            }),
     ));
     ui.add_space(8.0);
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(0xf5, 0xf7, 0xfb))
+        .fill(scale::surface_alt())
         .rounding(12.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            wrapped_label(ui, RichText::new(&row.body).size(14.0).color(scale::INK));
+            wrapped_label(ui, RichText::new(&row.body).size(14.0).color(scale::ink()));
         });
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
@@ -905,10 +1171,10 @@ fn render_detail(
         if row.direction == SmsDirection::Incoming {
             if super::components::action_button(
                 ui,
-                "回复",
+                &t(language, crate::localization::TextKey::SmsReply),
                 super::components::ButtonKind::Tonal,
                 !state.serial_busy,
-                Some("当前通信任务尚未结束"),
+                Some(&t(language, crate::localization::TextKey::SmsTaskBusy)),
             )
             .clicked()
             {
@@ -930,12 +1196,15 @@ fn render_detail(
 fn render_delete_button(
     ui: &mut Ui,
     row: &SmsRowVm,
-    _language: Language,
+    language: Language,
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
 ) {
     let armed_id = egui::Id::new(("sms-row-delete-armed", row.stable_id));
-    let enabled = row.delete_allowed && !row.fragments.is_empty() && !state.serial_busy;
+    let enabled = row.delete_allowed
+        && !row.fragments.is_empty()
+        && !state.serial_busy
+        && !state.module_read_only;
     if !enabled {
         ui.data_mut(|data| data.remove::<Instant>(armed_id));
     }
@@ -944,18 +1213,43 @@ fn render_delete_button(
             .data(|data| data.get_temp::<Instant>(armed_id))
             .is_some_and(|at| at.elapsed() < CONFIRM_ARM_WINDOW);
     let label = if armed {
-        format!("确认删除 {} 个已读取分片", row.fragments.len())
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::SmsConfirmDeleteFragments,
+            &[&row.fragments.len().to_string()],
+        )
     } else if row.status == SmsStatus::Incomplete {
-        format!("删除已读取 {} 个分片", row.fragments.len())
+        crate::localization::format_positional(
+            language,
+            crate::localization::TextKey::SmsDeleteFragments,
+            &[&row.fragments.len().to_string()],
+        )
     } else {
-        format!("删除短信（{} 个分片）", row.fragments.len())
+        // English inflects the noun, so a single-fragment message reads its own arm; Chinese has
+        // one form and the two arms render identically.
+        crate::localization::format_positional(
+            language,
+            if row.fragments.len() == 1 {
+                crate::localization::TextKey::SmsDeleteMessageOne
+            } else {
+                crate::localization::TextKey::SmsDeleteMessage
+            },
+            &[&row.fragments.len().to_string()],
+        )
     };
     if super::components::action_button(
         ui,
         &label,
         super::components::ButtonKind::Destructive,
         enabled,
-        Some("请等待通信任务结束，并重新核对短信分片"),
+        Some(&t(
+            language,
+            if state.module_read_only {
+                TextKey::ReadOnlyModuleReason
+            } else {
+                TextKey::SmsDeleteBusy
+            },
+        )),
     )
     .clicked()
     {
@@ -966,7 +1260,7 @@ fn render_delete_button(
                     fragments: row.fragments.clone(),
                 })
                 .err()
-                .map(|error| compose::enqueue_error(error).to_owned());
+                .map(|error| compose::enqueue_error(error, language));
         } else {
             ui.data_mut(|data| data.insert_temp(armed_id, Instant::now()));
         }
@@ -974,12 +1268,15 @@ fn render_delete_button(
     if !row.delete_allowed {
         wrapped_label(
             ui,
-            meta_text("分片身份存在冲突，暂不能删除；请重新读取并核对。"),
+            meta_text(t(language, crate::localization::TextKey::SmsDeleteConflict)),
         );
     }
 }
 
-fn delete_result_text(deletion: &dji4g_application::SmsDeleteSnapshot) -> (StatusTone, String) {
+fn delete_result_text(
+    deletion: &dji4g_application::SmsDeleteSnapshot,
+    language: Language,
+) -> (StatusTone, String) {
     let deleted = deletion
         .items
         .iter()
@@ -993,53 +1290,84 @@ fn delete_result_text(deletion: &dji4g_application::SmsDeleteSnapshot) -> (Statu
     if !deletion.finished {
         return (
             StatusTone::Progress,
-            format!("正在删除：已确认 {deleted} / {} 个分片", deletion.total),
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsDeleting,
+                &[&deleted.to_string(), &deletion.total.to_string()],
+            ),
         );
     }
     if deleted == deletion.total && deletion.total > 0 {
         return (
             StatusTone::Positive,
-            format!("已确认删除全部 {} 个已读取分片", deletion.total),
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsDeletedAll,
+                &[&deletion.total.to_string()],
+            ),
         );
     }
     if unknown > 0 {
         return (
             StatusTone::Caution,
-            format!(
-                "删除结果未知：已确认 {deleted} / {} 个，{unknown} 个未能确认。请刷新核对，不会自动重试。",
-                deletion.total
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsDeleteUnknown,
+                &[
+                    &deleted.to_string(),
+                    &deletion.total.to_string(),
+                    &unknown.to_string(),
+                ],
             ),
         );
     }
     if deleted > 0 {
         return (
             StatusTone::Caution,
-            format!(
-                "部分删除：已确认 {deleted} / {} 个分片，其余失败或未执行。",
-                deletion.total
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SmsDeletePartial,
+                &[&deleted.to_string(), &deletion.total.to_string()],
             ),
         );
     }
     (
         StatusTone::Negative,
-        "未确认删除任何分片；请查看原因并重新读取。".into(),
+        t(language, crate::localization::TextKey::SmsDeleteNone),
     )
 }
 
-fn render_delete_result(ui: &mut Ui, deletion: &dji4g_application::SmsDeleteSnapshot) {
-    let (tone, text) = delete_result_text(deletion);
+fn render_delete_result(
+    ui: &mut Ui,
+    language: Language,
+    deletion: &dji4g_application::SmsDeleteSnapshot,
+) {
+    let (tone, text) = delete_result_text(deletion, language);
     wrapped_label(
         ui,
         RichText::new(format!("{} {text}", tone.marker())).color(tone.color()),
     );
     if deletion.items.len() > 1 || deletion.items.iter().any(|item| item.code.is_some()) {
-        egui::CollapsingHeader::new("删除分片结果").show(ui, |ui| {
+        egui::CollapsingHeader::new(t(
+            language,
+            crate::localization::TextKey::SmsDeleteResultTitle,
+        ))
+        .show(ui, |ui| {
             for item in &deletion.items {
                 let result = match item.result {
-                    SmsDeleteItemResult::Deleted => "已确认删除",
-                    SmsDeleteItemResult::Failed => "失败",
-                    SmsDeleteItemResult::OutcomeUnknown => "结果未知",
-                    SmsDeleteItemResult::NotAttempted => "未执行",
+                    SmsDeleteItemResult::Deleted => {
+                        t(language, crate::localization::TextKey::SmsDeleteConfirmed)
+                    }
+                    SmsDeleteItemResult::Failed => {
+                        t(language, crate::localization::TextKey::SmsDeleteFailed)
+                    }
+                    SmsDeleteItemResult::OutcomeUnknown => t(
+                        language,
+                        crate::localization::TextKey::SmsDeleteUnknownShort,
+                    ),
+                    SmsDeleteItemResult::NotAttempted => {
+                        t(language, crate::localization::TextKey::SmsDeleteNotRun)
+                    }
                 };
                 let code = item.code.as_deref().unwrap_or("");
                 wrapped_label(
@@ -1193,19 +1521,16 @@ mod tests {
             SmsStatus::Received,
         );
         assert_ne!(
-            sms_row_vm(&original, Language::ZhCn).stable_id,
-            sms_row_vm(&other_storage, Language::ZhCn).stable_id
+            sms_row_vm(&original).stable_id,
+            sms_row_vm(&other_storage).stable_id
         );
         assert_ne!(
-            sms_row_vm(&original, Language::ZhCn).stable_id,
-            sms_row_vm(&replacement, Language::ZhCn).stable_id
+            sms_row_vm(&original).stable_id,
+            sms_row_vm(&replacement).stable_id
         );
         let mut read = original.clone();
         read.read = Some(true);
-        assert_eq!(
-            sms_row_vm(&original, Language::ZhCn).stable_id,
-            sms_row_vm(&read, Language::ZhCn).stable_id
-        );
+        assert_eq!(sms_row_vm(&original).stable_id, sms_row_vm(&read).stable_id);
     }
 
     #[test]
@@ -1229,13 +1554,31 @@ mod tests {
                 },
             ],
         };
-        assert!(delete_result_text(&deletion).1.contains("部分删除"));
+        assert!(
+            delete_result_text(&deletion, Language::ZhCn)
+                .1
+                .contains("部分删除")
+        );
         deletion.items[1].result = SmsDeleteItemResult::OutcomeUnknown;
-        assert_eq!(delete_result_text(&deletion).0, StatusTone::Caution);
-        assert!(delete_result_text(&deletion).1.contains("不会自动重试"));
+        assert_eq!(
+            delete_result_text(&deletion, Language::ZhCn).0,
+            StatusTone::Caution
+        );
+        assert!(
+            delete_result_text(&deletion, Language::ZhCn)
+                .1
+                .contains("不会自动重试")
+        );
         deletion.items[1].result = SmsDeleteItemResult::Deleted;
-        assert_eq!(delete_result_text(&deletion).0, StatusTone::Positive);
-        assert!(delete_result_text(&deletion).1.contains("全部 2"));
+        assert_eq!(
+            delete_result_text(&deletion, Language::ZhCn).0,
+            StatusTone::Positive
+        );
+        assert!(
+            delete_result_text(&deletion, Language::ZhCn)
+                .1
+                .contains("全部 2")
+        );
     }
 
     #[test]
@@ -1307,10 +1650,7 @@ mod tests {
 
     #[test]
     fn sms_row_vm_masks_the_sender_and_keeps_read_state_and_parts() {
-        let row = sms_row_vm(
-            &message(7, Some(false), SmsStatus::Incomplete),
-            Language::ZhCn,
-        );
+        let row = sms_row_vm(&message(7, Some(false), SmsStatus::Incomplete));
         assert_eq!(row.index, 7);
         assert_eq!(row.direction, SmsDirection::Incoming);
         assert_eq!(row.unread, Some(true));
@@ -1325,7 +1665,7 @@ mod tests {
 
     #[test]
     fn sms_row_vm_projects_outgoing_records_as_local_bookkeeping() {
-        let row = sms_row_vm(&outgoing_message(SmsStatus::Submitted), Language::ZhCn);
+        let row = sms_row_vm(&outgoing_message(SmsStatus::Submitted));
         assert_eq!(row.direction, SmsDirection::Outgoing);
         assert_eq!(row.status, SmsStatus::Submitted);
         // Outgoing mail is never unread mail.
@@ -1337,7 +1677,7 @@ mod tests {
 
     #[test]
     fn sms_row_vm_keeps_an_unknown_read_state_unknown() {
-        let row = sms_row_vm(&message(1, None, SmsStatus::Received), Language::ZhCn);
+        let row = sms_row_vm(&message(1, None, SmsStatus::Received));
         assert_eq!(row.unread, None);
     }
 
@@ -1429,10 +1769,7 @@ mod tests {
 
     #[test]
     fn row_tags_keep_encoding_and_fragments_neutral_and_flag_the_incomplete_message() {
-        let row = sms_row_vm(
-            &message(7, Some(true), SmsStatus::Incomplete),
-            Language::ZhCn,
-        );
+        let row = sms_row_vm(&message(7, Some(true), SmsStatus::Incomplete));
         let tags = row_tags(&row, Language::ZhCn);
         let texts = tags.iter().map(|tag| tag.text.as_str()).collect::<Vec<_>>();
         assert_eq!(texts, ["UCS2", "已读取 1 / 3 个分片", "未完整"]);
@@ -1445,7 +1782,7 @@ mod tests {
     fn row_tags_drop_the_incomplete_warning_for_a_complete_message() {
         let mut complete = message(8, Some(false), SmsStatus::Received);
         complete.multipart = None;
-        let row = sms_row_vm(&complete, Language::ZhCn);
+        let row = sms_row_vm(&complete);
         let tags = row_tags(&row, Language::ZhCn);
         let texts = tags.iter().map(|tag| tag.text.as_str()).collect::<Vec<_>>();
         assert_eq!(texts, ["UCS2"]);
@@ -1454,7 +1791,7 @@ mod tests {
 
     #[test]
     fn row_tags_are_empty_for_outgoing_rows() {
-        let row = sms_row_vm(&outgoing_message(SmsStatus::Submitted), Language::ZhCn);
+        let row = sms_row_vm(&outgoing_message(SmsStatus::Submitted));
         assert_eq!(row_tags(&row, Language::ZhCn), Vec::new());
     }
 
@@ -1556,7 +1893,13 @@ mod tests {
 
     #[test]
     fn both_refresh_controls_disable_during_serial_work_or_pending_reads() {
-        for label in ["刷新列表", "刷新短信"] {
+        for label in [
+            t(Language::ZhCn, crate::localization::TextKey::SmsRefreshList),
+            t(
+                Language::ZhCn,
+                crate::localization::TextKey::SmsRefreshMessages,
+            ),
+        ] {
             for (serial_busy, read_pending) in [(true, false), (false, true), (false, false)] {
                 let context = egui::Context::default();
                 let mut snapshot =
@@ -1569,7 +1912,15 @@ mod tests {
                 let _ = context.run(egui::RawInput::default(), |context| {
                     egui::CentralPanel::default().show(context, |ui| {
                         enabled = Some(
-                            refresh_button(ui, &snapshot, &NoopSink, &mut state, label).enabled(),
+                            refresh_button(
+                                ui,
+                                Language::ZhCn,
+                                &snapshot,
+                                &NoopSink,
+                                &mut state,
+                                &label,
+                            )
+                            .enabled(),
                         );
                     });
                 });
@@ -1595,10 +1946,26 @@ mod tests {
             }
         }
         for (action, busy, fail) in [
-            ("取消", false, false),
-            ("确认读取", false, false),
-            ("确认读取", true, false),
-            ("确认读取", false, true),
+            (
+                t(Language::ZhCn, crate::localization::TextKey::ButtonCancel),
+                false,
+                false,
+            ),
+            (
+                t(Language::ZhCn, crate::localization::TextKey::SmsConfirmRead),
+                false,
+                false,
+            ),
+            (
+                t(Language::ZhCn, crate::localization::TextKey::SmsConfirmRead),
+                true,
+                false,
+            ),
+            (
+                t(Language::ZhCn, crate::localization::TextKey::SmsConfirmRead),
+                false,
+                true,
+            ),
         ] {
             let context = egui::Context::default();
             let mut snapshot =
@@ -1665,7 +2032,7 @@ mod tests {
                 });
             }
             let commands = sink.commands.lock().unwrap();
-            if action == "确认读取" && !busy {
+            if action == t(Language::ZhCn, crate::localization::TextKey::SmsConfirmRead) && !busy {
                 assert_eq!(commands.len(), 1);
                 assert!(
                     matches!(&commands[0], UiCommand::SmsReadStorage { storage } if storage.0 == "SM")
@@ -1797,6 +2164,79 @@ mod tests {
                 list <= workspace + 0.5,
                 "{width}x{height} list {list} exceeds workspace {workspace}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_only_regressions {
+    use super::*;
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Sink(Mutex<Vec<UiCommand>>);
+    impl UiCommandSink for Sink {
+        fn try_send(&self, command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+            self.0.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+    #[test]
+    fn generic_sms_page_never_reads_on_entry_click_or_expired_timer() {
+        for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+            let snapshot = dji4g_application::ReducerState::test_ready_for(
+                dji4g_domain::QUECTEL_GENERIC,
+                std::time::SystemTime::now(),
+            )
+            .snapshot();
+            let ctx = egui::Context::default();
+            crate::ui::apply_style(&ctx);
+            let sink = Sink::default();
+            let mut state = SmsComposeState::default();
+            let mut button = egui::Rect::NOTHING;
+            for tick in 0..5 {
+                let events = if tick >= 3 {
+                    vec![
+                        egui::Event::PointerMoved(button.center()),
+                        egui::Event::PointerButton {
+                            pos: button.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed: tick == 3,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                } else {
+                    vec![]
+                };
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 700.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render(ui, &snapshot, &[], language, &sink, &mut state);
+                            let response = refresh_button(
+                                ui, language, &snapshot, &sink, &mut state, "Refresh",
+                            );
+                            assert!(!response.enabled());
+                            button = response.rect;
+                        });
+                    },
+                );
+            }
+            state.auto_refresh(
+                Instant::now() + Duration::from_secs(65),
+                true,
+                false,
+                false,
+                &sink,
+            );
+            assert!(state.module_read_only);
+            assert!(sink.0.lock().unwrap().is_empty());
         }
     }
 }

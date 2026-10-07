@@ -74,6 +74,7 @@ fn saving_snapshot(revision: u64, desired_enabled: bool) -> Arc<ControllerSnapsh
         active_probe: false,
         log_level: LogLevel::Debug,
         language: LanguageCode::ZhCn,
+        theme: dji4g_application::ThemeCode::System,
         persistence: SettingsPersistenceState::Saving,
     };
     Arc::new(snapshot)
@@ -207,6 +208,7 @@ fn a_pending_toggle_drives_one_save_and_one_registration_per_revision() {
             onboarding_completed: false,
             sms_archive_enabled: false,
             language: LanguageCode::ZhCn,
+            theme: dji4g_application::ThemeCode::System,
             autostart: true,
             start_minimized: true,
             active_probe: false,
@@ -474,4 +476,28 @@ fn the_service_loop_never_blocks_the_drain_path() {
             .collect::<Vec<_>>(),
         (1..=8).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn themes_use_the_existing_save_service_and_report_failure() {
+    use dji4g_application::ThemeCode;
+    for theme in [ThemeCode::System, ThemeCode::Light, ThemeCode::Dark] {
+        for result in [Ok(()), Err(ConfigError::new("config:write_failed"))] {
+            let mut h = harness(result.clone(), Ok(AutostartObservedState::Disabled));
+            let mut snapshot = (*initial_snapshot()).clone();
+            snapshot.settings.theme = theme;
+            snapshot.settings.revision = 1;
+            snapshot.settings.persistence = SettingsPersistenceState::Saving;
+            h.snapshot_tx.send(Arc::new(snapshot.clone())).unwrap();
+            h.app.receive_latest_nonblocking(&h.context);
+            h.snapshot_tx.send(Arc::new(snapshot)).unwrap();
+            h.app.receive_latest_nonblocking(&h.context);
+            let saves = h.calls.saves.lock().unwrap();
+            assert_eq!(saves.len(), 1);
+            assert_eq!(saves[0].theme, theme);
+            let outcomes = save_outcomes(&recorded_commands(&h.sink));
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].result.is_ok(), result.is_ok());
+        }
+    }
 }

@@ -15,12 +15,43 @@ impl DeviceProfile {
     pub const fn matches(self, vid: u16, pid: u16) -> bool {
         self.vid == vid && self.pid == pid
     }
+
+    /// The declared profile for one USB VID/PID pair, or `None` when the module is not recognized.
+    #[must_use]
+    pub fn from_vid_pid(vid: u16, pid: u16) -> Option<Self> {
+        SUPPORTED
+            .into_iter()
+            .find(|profile| profile.matches(vid, pid))
+    }
+
+    /// Whether the panel may write to this profile at all.
+    ///
+    /// Recognition and write eligibility are deliberately separate: a recognized profile is
+    /// inspected read-only unless it is proven write-capable.  Today only [`DJI_GEN1`] carries the
+    /// reviewed repairs, driver package and controlled AT writes; every other recognized profile
+    /// (the generic `2C7C:0125` module) stays read-only, and this predicate is the single place
+    /// that decision is made.
+    #[must_use]
+    pub const fn allows_controlled_actions(self) -> bool {
+        self.vid == DJI_GEN1.vid && self.pid == DJI_GEN1.pid
+    }
 }
 
 pub const DJI_GEN1: DeviceProfile = DeviceProfile {
     vid: 0x2CA3,
     pid: 0x4006,
 };
+
+/// A generic Quectel module (`2C7C` is Quectel's USB vendor ID).  It is recognized so the panel
+/// can identify it, find its AT interface and run the read-only checks, but it is never eligible
+/// for driver installation, controlled repairs, SMS send or storage switching.
+pub const QUECTEL_GENERIC: DeviceProfile = DeviceProfile {
+    vid: 0x2C7C,
+    pid: 0x0125,
+};
+
+/// Every module profile the panel recognizes, in a stable order.
+pub const SUPPORTED: [DeviceProfile; 2] = [DJI_GEN1, QUECTEL_GENERIC];
 
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -39,9 +70,30 @@ pub struct StableDeviceIdentity {
 impl StableDeviceIdentity {
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        self.parsed_usb_vid_pid().is_some_and(|(vid, pid)| {
-            DJI_GEN1.matches(vid, pid) && (vid, pid) == (self.vid, self.pid)
-        })
+        self.profile().is_some()
+    }
+
+    /// The declared profile this identity matches, or `None` when it is not a recognized module.
+    ///
+    /// The recorded `vid`/`pid` must agree exactly with the VID/PID parsed out of
+    /// `device_instance_id`, so a scalar field can never hide a contradictory instance identity.
+    #[must_use]
+    pub fn profile(&self) -> Option<DeviceProfile> {
+        let (vid, pid) = self.parsed_usb_vid_pid()?;
+        if (vid, pid) != (self.vid, self.pid) {
+            return None;
+        }
+        DeviceProfile::from_vid_pid(vid, pid)
+    }
+
+    /// Whether this identity names a recognized module the panel may write to.
+    ///
+    /// A recognized read-only module (the generic `2C7C:0125`) is `is_supported()` but not
+    /// `allows_controlled_actions()`; an unrecognized identity is neither.
+    #[must_use]
+    pub fn allows_controlled_actions(&self) -> bool {
+        self.profile()
+            .is_some_and(DeviceProfile::allows_controlled_actions)
     }
 
     fn parsed_usb_vid_pid(&self) -> Option<(u16, u16)> {

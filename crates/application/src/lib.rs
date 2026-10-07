@@ -30,9 +30,10 @@ pub use device_tools::{
     MAX_TRANSCRIPT_BYTES, ModuleProfile, PROBE_BATCH_BUDGET, PendingExpertTool,
     TOOL_TRANSACTION_TIMEOUT, ToolCapabilityRow, ToolContext, ToolControl, ToolHistory,
     ToolHistoryEntry, ToolMode, ToolOperation, ToolOperationKind, ToolOutcome, ToolPhase,
-    ToolReceipt, ToolRequest, ToolTaskSnapshot, ToolTranscript, UsbNetReading, as_at_response,
-    extract_identity, extract_payload, item_deadline, parse_profile_temperature, parse_usb_net,
-    transcript_from_response,
+    ToolReceipt, ToolRequest, ToolTaskSnapshot, ToolTranscript, URC_TRANSCRIPT_PREFIX,
+    UsbNetReading, as_at_response, extract_identity, extract_payload, item_deadline,
+    parse_profile_temperature, parse_usb_net, transcript_from_response, urc_transcript_line,
+    urc_transcript_payload,
 };
 pub use features::{FeatureCapability, FeatureKey};
 pub use host_network::{
@@ -55,7 +56,8 @@ pub use ports::{
     LogLevel, MonoTime, NetworkProbePort, NetworkRouteChoice, NormalizedNetworkEvidence, PortError,
     PortFuture, PrivilegedExecutor, ProbeObservationDto, ProbeStageDto, SettingsPersistenceState,
     SettingsSaveOutcome, SettingsSnapshot, SmsListing, SmsPort, SmsReadResult, SmsSendReceipt,
-    SmsSendResult, StableCode, StableCodeError, SystemRouteDto, TargetContext, mask_recipient,
+    SmsSendResult, StableCode, StableCodeError, SystemRouteDto, TargetContext, ThemeCode,
+    mask_recipient,
 };
 pub use reducer::{
     ActionReadiness, ActionReadinessKey, BackendEvent, CheckMask, CheckResult, ControllerSnapshot,

@@ -676,14 +676,29 @@ fn the_rate_history_is_a_bounded_ring() {
 #[test]
 fn carrier_names_gain_their_chinese_name_from_a_closed_set() {
     use dji4g_panel::ui::carrier_display_name;
-    assert_eq!(carrier_display_name("CHN-UNICOM"), "CHN-UNICOM（中国联通）");
-    assert_eq!(carrier_display_name("Chn-Mobile"), "Chn-Mobile（中国移动）");
-    assert_eq!(carrier_display_name("CMCC"), "CMCC（中国移动）");
     assert_eq!(
-        carrier_display_name("CHN-TELECOM"),
+        carrier_display_name("CHN-UNICOM", dji4g_panel::localization::Language::ZhCn),
+        "CHN-UNICOM（中国联通）"
+    );
+    assert_eq!(
+        carrier_display_name("Chn-Mobile", dji4g_panel::localization::Language::ZhCn),
+        "Chn-Mobile（中国移动）"
+    );
+    assert_eq!(
+        carrier_display_name("CMCC", dji4g_panel::localization::Language::ZhCn),
+        "CMCC（中国移动）"
+    );
+    assert_eq!(
+        carrier_display_name("CHN-TELECOM", dji4g_panel::localization::Language::ZhCn),
         "CHN-TELECOM（中国电信）"
     );
     // Unknown and empty names pass through untouched — nothing is guessed.
-    assert_eq!(carrier_display_name("Foo Carrier"), "Foo Carrier");
-    assert_eq!(carrier_display_name(""), "");
+    assert_eq!(
+        carrier_display_name("Foo Carrier", dji4g_panel::localization::Language::ZhCn),
+        "Foo Carrier"
+    );
+    assert_eq!(
+        carrier_display_name("", dji4g_panel::localization::Language::ZhCn),
+        ""
+    );
 }

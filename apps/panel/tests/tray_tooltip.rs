@@ -1,6 +1,7 @@
 //! The tray tooltip is the only always-visible surface while the window hides to the tray, so it
 //! must track the availability verdict: pushed once per change, never spammed per snapshot.
 
+use dji4g_panel::localization::Language;
 use std::{sync::Arc, time::SystemTime};
 
 use dji4g_application::{ControllerSnapshot, DeviceEpoch, DiagnosticSet, UiCommand, UiSendError};
@@ -71,8 +72,11 @@ fn harness() -> (
         Availability::Detecting,
         Freshness::Unknown,
     )));
-    let tray = TrayController::initialize(MemoryTrayBackend::default(), TrayLabels::zh_cn())
-        .expect("memory tray initialises");
+    let tray = TrayController::initialize(
+        MemoryTrayBackend::default(),
+        TrayLabels::for_language(Language::ZhCn),
+    )
+    .expect("memory tray initialises");
     let mut app = PanelApp::headless(PanelInputs::new(
         snapshot_rx,
         Arc::new(NoopSink),

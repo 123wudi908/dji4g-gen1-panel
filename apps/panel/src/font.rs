@@ -9,9 +9,16 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, FontFamily};
 
 pub const CJK_FONT_NAME: &str = "dji4g-cjk-system";
+pub const CJK_BOLD_FONT_NAME: &str = "dji4g-cjk-system-bold";
 pub const CJK_FONT_ERROR_CODE: &str = "ui:cjk_font_unavailable";
 
+/// Explicit bold family, so headings and measured values render in a real Bold face.
+pub const BOLD_FAMILY: &str = "panel-bold";
+
 const CJK_FONT_FILES: [&str; 4] = ["msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"];
+
+/// The heavy companion of [`CJK_FONT_FILES`], in the same preference order.
+const CJK_BOLD_FONT_FILES: [&str; 4] = ["msyhbd.ttc", "msyh.ttc", "simhei.ttf", "simsun.ttc"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FontInstallError {
@@ -118,16 +125,41 @@ where
 /// Install the selected system font before the first egui pass.
 pub fn install_chinese_font(ctx: &egui::Context) -> Result<PathBuf, FontInstallError> {
     let loaded = load_first_font(&windows_font_candidates(), |path| std::fs::read(path))?;
+    // A bold face is optional: when it is absent the bold family falls back to the regular file,
+    // so `strong()` still renders — just at the same weight — instead of failing to lay out.
+    let bold = load_first_font(&windows_bold_font_candidates(), |path| std::fs::read(path)).ok();
+
     let mut definitions = egui::FontDefinitions::default();
+    let regular_bytes = loaded.bytes.clone();
     definitions.font_data.insert(
         CJK_FONT_NAME.to_owned(),
-        egui::FontData::from_owned(loaded.bytes),
+        egui::FontData::from_owned(regular_bytes.clone()),
+    );
+    definitions.font_data.insert(
+        CJK_BOLD_FONT_NAME.to_owned(),
+        egui::FontData::from_owned(
+            bold.as_ref()
+                .map_or_else(|| regular_bytes.clone(), |font| font.bytes().to_vec()),
+        ),
     );
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         let names = definitions.families.entry(family).or_default();
-        names.retain(|name| name != CJK_FONT_NAME);
+        names.retain(|name| name != CJK_FONT_NAME && name != CJK_BOLD_FONT_NAME);
         names.insert(0, CJK_FONT_NAME.to_owned());
     }
+    // The heavy family keeps egui's own Latin faces behind it so digits and Latin text also have
+    // a heavier companion on offer.
+    let latin = definitions
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    definitions.families.insert(
+        FontFamily::Name(BOLD_FAMILY.into()),
+        std::iter::once(CJK_BOLD_FONT_NAME.to_owned())
+            .chain(latin.into_iter().filter(|name| name != CJK_FONT_NAME))
+            .collect(),
+    );
     definitions.font_data.insert(
         "material-symbols".into(),
         egui::FontData::from_static(include_bytes!(
@@ -141,6 +173,36 @@ pub fn install_chinese_font(ctx: &egui::Context) -> Result<PathBuf, FontInstallE
     ctx.set_fonts(definitions);
     ctx.data_mut(|data| data.insert_temp(egui::Id::new("panel-icons-installed"), true));
     Ok(loaded.path)
+}
+
+/// Candidates for the heavy face, preferring the real Bold file.
+#[must_use]
+pub(crate) fn windows_bold_font_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(2);
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        let path = PathBuf::from(windir);
+        if path.is_absolute()
+            && path
+                .components()
+                .all(|component| !matches!(component, std::path::Component::ParentDir))
+        {
+            roots.push(path);
+        }
+    }
+    let fallback = PathBuf::from(r"C:\Windows");
+    if !roots.iter().any(|root| root == &fallback) {
+        roots.push(fallback);
+    }
+    let mut candidates = Vec::new();
+    for root in roots {
+        for name in CJK_BOLD_FONT_FILES {
+            let path = root.join("Fonts").join(name);
+            if !candidates.iter().any(|candidate| candidate == &path) {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates
 }
 
 #[cfg(test)]
@@ -210,7 +272,7 @@ mod tests {
         let _ = context.run(egui::RawInput::default(), |_| {});
         let has_glyphs = context.fonts(|fonts| {
             let font_id = egui::FontId::proportional(14.0);
-            ["模块网络：受限", "诊断", "设置", "●○▲■→"]
+            ["模块网络：受限", "诊断", "设置", "●◆■◌○→"]
                 .iter()
                 .all(|text| fonts.has_glyphs(&font_id, text))
         });

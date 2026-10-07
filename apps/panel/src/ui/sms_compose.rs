@@ -1,7 +1,13 @@
 //! UI-owned SMS drafts. Never logged or serialized; confirmation freezes the exact payload.
 use crate::app::UiCommandSink;
+use crate::localization::Language;
 use dji4g_application::{SmsSendPhase, SmsSendResult, SmsSendSnapshot, UiCommand, UiSendError};
 use eframe::egui::{self, Ui};
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct Draft {
@@ -53,10 +59,13 @@ pub(crate) struct SmsComposeState {
     last_visible: Option<std::time::Instant>,
     pub selected: Option<[u8; 32]>,
     pub serial_busy: bool,
+    pub module_read_only: bool,
     reply_recipient: Option<String>,
     pub error: Option<String>,
     last_send_rejected: u64,
     context: Option<(Option<dji4g_domain::DeviceEpoch>, u64)>,
+    /// The interface language of the last frame, so notices built outside `render` follow it too.
+    language: Language,
 }
 
 impl SmsComposeState {
@@ -70,6 +79,7 @@ impl SmsComposeState {
         self.synchronize(controller.sms_send.as_ref());
         self.observe_send_rejection(controller.command_state.sms_send_rejected_seq);
         self.serial_busy = controller.serial_work_busy;
+        self.module_read_only = super::read_only_module(controller);
     }
 
     pub(super) fn open_editor(&mut self) {
@@ -80,13 +90,22 @@ impl SmsComposeState {
     }
 
     pub(super) fn begin_reply(&mut self, recipient: &str) -> ReplyStartResult {
-        if self.serial_busy || self.pending.is_some() || self.confirmation.is_some() {
-            self.error = Some("当前任务或发送确认尚未结束，草稿已保留。".into());
+        if self.module_read_only
+            || self.serial_busy
+            || self.pending.is_some()
+            || self.confirmation.is_some()
+        {
+            self.error = Some(t(
+                self.language,
+                crate::localization::TextKey::ComposeBusyDraftKept,
+            ));
             return ReplyStartResult::Busy;
         }
         if dji4g_at_protocol::validate_sms_recipient(recipient).is_err() {
-            self.error =
-                Some("此发件人不是受支持的短信号码，无法直接回复。原号码未被修改。".into());
+            self.error = Some(t(
+                self.language,
+                crate::localization::TextKey::ComposeUnsupportedSender,
+            ));
             return ReplyStartResult::InvalidRecipient;
         }
         self.error = None;
@@ -108,7 +127,12 @@ impl SmsComposeState {
         let Some(recipient) = self.reply_recipient.take() else {
             return;
         };
-        if replace && !self.serial_busy && self.pending.is_none() && self.confirmation.is_none() {
+        if replace
+            && !self.module_read_only
+            && !self.serial_busy
+            && self.pending.is_none()
+            && self.confirmation.is_none()
+        {
             self.draft = Draft {
                 recipient,
                 body: String::new(),
@@ -128,7 +152,10 @@ impl SmsComposeState {
     pub(crate) fn review_confirmation(&mut self) {
         self.draft = Draft {
             recipient: "+12025550123".into(),
-            body: "【模拟数据·界面验收】这是一条仅用于截图的短信草稿，请勿实际发送。".into(),
+            body: t(
+                Language::ZhCn,
+                crate::localization::TextKey::ComposeDemoDraft,
+            ),
         };
         self.confirmation = Some(self.draft.clone());
         self.open = true;
@@ -145,7 +172,7 @@ impl SmsComposeState {
     #[cfg(debug_assertions)]
     pub(crate) fn review_queue_error(&mut self) {
         self.review_editor();
-        self.error = Some(enqueue_error(UiSendError::QueueFull).to_owned());
+        self.error = Some(enqueue_error(UiSendError::QueueFull, self.language));
     }
 
     pub(super) fn request_refresh(&mut self, now: std::time::Instant, sink: &dyn UiCommandSink) {
@@ -155,7 +182,7 @@ impl SmsComposeState {
         self.refresh_error = sink
             .try_send(UiCommand::SmsRefresh)
             .err()
-            .map(|e| enqueue_error(e).to_owned());
+            .map(|e| enqueue_error(e, self.language));
     }
 
     pub(super) fn auto_refresh(
@@ -175,7 +202,8 @@ impl SmsComposeState {
         self.last_visible = Some(now);
         // Background reads share the module's serial channel. Keep that channel free while the
         // user edits or reviews a draft, so synchronization cannot disable the focused fields.
-        if self.auto_refresh_paused
+        if self.module_read_only
+            || self.auto_refresh_paused
             || self.open
             || self.confirmation.is_some()
             || self.reply_recipient.is_some()
@@ -227,7 +255,7 @@ impl SmsComposeState {
                     context_changed: false,
                 });
             }
-            Err(error) => self.error = Some(enqueue_error(error).to_owned()),
+            Err(error) => self.error = Some(enqueue_error(error, self.language)),
         }
     }
 
@@ -280,22 +308,25 @@ impl SmsComposeState {
             pending.request_id.is_none() && seq > pending.after_send_rejected
         }) {
             self.pending = None;
-            self.error =
-                Some("后台正忙，本条短信未提交。请等待当前任务结束后重试；草稿已保留。".into());
+            self.error = Some(t(
+                self.language,
+                crate::localization::TextKey::ComposeBackendBusy,
+            ));
         }
         self.last_send_rejected = self.last_send_rejected.max(seq);
     }
 }
 
-pub(super) fn enqueue_error(error: UiSendError) -> &'static str {
+pub(super) fn enqueue_error(error: UiSendError, language: Language) -> String {
     match error {
-        UiSendError::QueueFull => "操作队列已满，未提交。请稍后重试；草稿已保留。",
-        UiSendError::Closed => "后台连接已关闭，未提交。请恢复连接后重试；草稿已保留。",
+        UiSendError::QueueFull => t(language, crate::localization::TextKey::ComposeQueueFull),
+        UiSendError::Closed => t(language, crate::localization::TextKey::ComposeChannelClosed),
     }
 }
 
 pub(super) fn render(
     ui: &mut Ui,
+    language: Language,
     state: &mut SmsComposeState,
     controller: &dji4g_application::ControllerSnapshot,
     sink: &dyn UiCommandSink,
@@ -304,23 +335,32 @@ pub(super) fn render(
     state.observe_snapshot(controller);
     let sending =
         state.pending.is_some() || snapshot.is_some_and(|s| s.phase != SmsSendPhase::Finished);
-    let busy = state.serial_busy || sending;
+    let busy = state.serial_busy || state.module_read_only || sending;
     if let Some(snapshot) = snapshot {
         egui::Frame::none()
-            .fill(egui::Color32::from_rgb(0xf3, 0xf5, 0xfc))
+            .fill(crate::ui::scale::surface_sunken())
             .rounding(10.0)
             .inner_margin(14.0)
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 let text = match snapshot.phase {
-                    SmsSendPhase::Queued => "短信已排队，请勿重复发送",
-                    SmsSendPhase::Preparing => "正在准备短信",
-                    SmsSendPhase::Submitting => "正在提交短信",
-                    SmsSendPhase::WaitingForResult => "正在等待模块确认",
+                    SmsSendPhase::Queued => phase_name(snapshot.phase, language),
+                    SmsSendPhase::Preparing => phase_name(snapshot.phase, language),
+                    SmsSendPhase::Submitting => phase_name(snapshot.phase, language),
+                    SmsSendPhase::WaitingForResult => phase_name(snapshot.phase, language),
                     SmsSendPhase::Finished => match snapshot.result {
-                        Some(SmsSendResult::Submitted) => "已提交给模块，尚不能确认对方收到。",
-                        Some(SmsSendResult::Failed) => "发送失败，草稿已保留。",
-                        _ => "发送结果未知，可能已提交。请先核实，避免重复发送；草稿已保留。",
+                        Some(SmsSendResult::Submitted) => t(
+                            language,
+                            crate::localization::TextKey::ComposeSubmittedUnknown,
+                        ),
+                        Some(SmsSendResult::Failed) => t(
+                            language,
+                            crate::localization::TextKey::ComposeFailedDraftKept,
+                        ),
+                        _ => t(
+                            language,
+                            crate::localization::TextKey::ComposeUnknownMaybeSent,
+                        ),
                     },
                 };
                 ui.horizontal_wrapped(|ui| {
@@ -340,94 +380,136 @@ pub(super) fn render(
                     }
                 });
                 if let Some(failure) = &snapshot.failure {
-                    egui::CollapsingHeader::new("查看原因和处理建议").show(ui, |ui| {
-                        ui.label(format!(
-                            "失败阶段：{} · 错误码：{}",
-                            phase_name(failure.stage),
-                            failure.code
+                    // The failure explanation used to sit behind a disclosure triangle inside this
+                    // notice.  It is now a flat always-open block, and the detail keeps the quiet
+                    // tiers so the notice does not grow into a second card.
+                    ui.label(crate::ui::section_heading(t(
+                        language,
+                        crate::localization::TextKey::ComposeFailureHeading,
+                    )));
+                    crate::ui::wrapped_label(
+                        ui,
+                        crate::ui::detail_text(crate::localization::format_positional(
+                            language,
+                            crate::localization::TextKey::ComposeFailureStage,
+                            &[&phase_name(failure.stage, language), &failure.code],
+                        )),
+                    );
+                    crate::ui::wrapped_label(
+                        ui,
+                        crate::ui::detail_text(failure_advice(&failure.code, language)),
+                    );
+                    if let Some(code) = failure.cms_code {
+                        ui.label(crate::ui::meta_text(
+                            crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::ComposeCmsError,
+                                &[&code.to_string()],
+                            ),
                         ));
-                        ui.label(failure_advice(&failure.code));
-                        if let Some(code) = failure.cms_code {
-                            ui.label(format!("CMS：{code}"));
-                        }
-                        if let Some(code) = failure.cme_code {
-                            ui.label(format!("CME：{code}"));
-                        }
-                        if let Some(code) = failure.os_code {
-                            ui.label(format!("系统错误：{code}"));
-                        }
-                        ui.label(submission_notice(snapshot.result, failure));
-                    });
+                    }
+                    if let Some(code) = failure.cme_code {
+                        ui.label(crate::ui::meta_text(
+                            crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::ComposeCmeError,
+                                &[&code.to_string()],
+                            ),
+                        ));
+                    }
+                    if let Some(code) = failure.os_code {
+                        ui.label(crate::ui::meta_text(
+                            crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::ComposeSystemError,
+                                &[&code.to_string()],
+                            ),
+                        ));
+                    }
+                    crate::ui::wrapped_label(
+                        ui,
+                        crate::ui::detail_text(submission_notice(
+                            snapshot.result,
+                            failure,
+                            language,
+                        )),
+                    );
                 }
             });
     } else if state.pending.is_some() {
-        ui.label("短信已排队，请勿重复发送");
+        ui.label(t(language, crate::localization::TextKey::ComposeQueued));
     }
     if !state.open
         && let Some(error) = &state.error
     {
         ui.colored_label(super::StatusTone::Negative.color(), error);
     }
-    if state.open && state.confirmation.is_none() {
-        let mut opened = true;
-        egui::Window::new("新建短信")
-            .id(egui::Id::new("sms-compose-window"))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .default_width(500.0)
-            .max_width((ui.ctx().screen_rect().width() - 48.0).max(260.0))
-            .collapsible(false)
-            .resizable(false)
-            .vscroll(false)
-            .open(&mut opened)
-            .show(ui.ctx(), |ui| {
+    // A reply whose original draft still needs a decision takes the screen on its own: showing the
+    // editor underneath a second dialog would stack two dimmed cards and two scrims.
+    if state.open && state.confirmation.is_none() && state.reply_recipient.is_none() {
+        // The form is the only element allowed to grow, so it carries the bound: the reserve covers
+        // the card's padding, its title block, the hairline and the decision row.
+        let fields_max_height = (ui.ctx().screen_rect().height() - 340.0).clamp(140.0, 400.0);
+        let can_advance = state.ready() && !busy;
+        let outcome = crate::ui::modal::show(
+            ui.ctx(),
+            &crate::ui::modal::Dialog::new(
+                "sms-compose-window",
+                &t(language, crate::localization::TextKey::ComposeTitle),
+            )
+            .description(&t(language, crate::localization::TextKey::ComposeIntro))
+            .width(500.0),
+            |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 egui::ScrollArea::vertical()
-                    .max_height((ui.ctx().screen_rect().height() - 240.0).clamp(100.0, 420.0))
+                    .id_salt("sms-compose-fields")
+                    .max_height(fields_max_height)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(211, 227, 253))
-                                .rounding(12.0)
-                                .inner_margin(12.0)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        crate::ui::icons::text(
-                                            ui.ctx(),
-                                            crate::ui::icons::EDIT,
-                                            24.0,
-                                        )
-                                        .color(crate::ui::scale::DOWNLOAD),
-                                    );
-                                });
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("写一条短信").size(20.0).strong());
-                                ui.label(crate::ui::meta_text("通过当前连接的 4G 模块发送"));
-                            });
-                        });
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("收件人").strong());
+                        ui.label(
+                            egui::RichText::new(t(
+                                language,
+                                crate::localization::TextKey::ComposeRecipient,
+                            ))
+                            .strong(),
+                        );
+                        // 5pt of vertical padding puts this single-line box exactly on the shared
+                        // `CONTROL_H` (28pt): a field taller than every other control was the one
+                        // thing that still made the compose card read as uneven.
                         let recipient = ui.add_enabled(
                             !busy,
                             egui::TextEdit::singleline(&mut state.draft.recipient)
                                 .id(egui::Id::new("sms-compose-recipient"))
-                                .hint_text("+86 手机号码")
+                                .hint_text(t(
+                                    language,
+                                    crate::localization::TextKey::ComposeRecipientHint,
+                                ))
                                 .desired_width(f32::INFINITY)
-                                .margin(egui::vec2(12.0, 10.0)),
+                                .margin(egui::vec2(12.0, 5.0)),
                         );
-                        ui.label(crate::ui::meta_text(
-                            "请输入含国家码的完整号码，例如 +8613800138000",
-                        ));
+                        ui.label(crate::ui::meta_text(t(
+                            language,
+                            crate::localization::TextKey::ComposeRecipientNote,
+                        )));
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("短信内容").strong());
+                            ui.label(
+                                egui::RichText::new(t(
+                                    language,
+                                    crate::localization::TextKey::ComposeBodyLabel,
+                                ))
+                                .strong(),
+                            );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(crate::ui::meta_text(format!(
-                                        "{} / 70 字",
-                                        state.draft.body.chars().count()
-                                    )));
+                                    ui.label(crate::ui::meta_text(
+                                        crate::localization::format_positional(
+                                            language,
+                                            crate::localization::TextKey::ComposeLength,
+                                            &[&state.draft.body.chars().count().to_string()],
+                                        ),
+                                    ));
                                 },
                             );
                         });
@@ -435,7 +517,10 @@ pub(super) fn render(
                             !busy,
                             egui::TextEdit::multiline(&mut state.draft.body)
                                 .id(egui::Id::new("sms-compose-body"))
-                                .hint_text("在这里输入短信内容…")
+                                .hint_text(t(
+                                    language,
+                                    crate::localization::TextKey::ComposeBodyHint,
+                                ))
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(4)
                                 .margin(egui::vec2(12.0, 12.0)),
@@ -452,16 +537,18 @@ pub(super) fn render(
                         }
                         ui.add_space(10.0);
                         egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(0xf5, 0xf7, 0xfb))
+                            .fill(crate::ui::scale::surface_sunken())
                             .rounding(8.0)
                             .inner_margin(12.0)
                             .show(ui, |ui| {
-                                ui.label(crate::ui::meta_text(
-                                    "单条短信 · 最多 70 字 · 不支持 Emoji",
-                                ));
-                                ui.label(crate::ui::meta_text(
-                                    "可能产生运营商费用；下一步将核对号码和正文。",
-                                ));
+                                ui.label(crate::ui::meta_text(t(
+                                    language,
+                                    crate::localization::TextKey::ComposeLimits,
+                                )));
+                                ui.label(crate::ui::meta_text(t(
+                                    language,
+                                    crate::localization::TextKey::ComposeCostNote,
+                                )));
                             });
                     });
                 if let Some(error) = &state.error {
@@ -470,112 +557,120 @@ pub(super) fn render(
                         egui::RichText::new(error).color(super::StatusTone::Negative.color()),
                     );
                 }
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(crate::ui::meta_text(if sending {
-                        "正在发送，请等待结果"
-                    } else if busy {
-                        "模块正在处理其他任务，请稍候"
-                    } else if state.error.is_some() {
-                        "草稿已保留"
-                    } else if !state.ready() {
-                        "填写有效号码和内容后即可继续"
-                    } else {
-                        "草稿已就绪"
-                    }));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                state.ready() && !busy,
-                                crate::ui::theme::primary_button("下一步：确认发送"),
-                            )
-                            .clicked()
-                        {
-                            state.confirmation = Some(state.draft.clone());
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-            });
-        state.open = opened;
-        if !opened {
+                ui.label(crate::ui::meta_text(if sending {
+                    t(language, crate::localization::TextKey::ComposeSendingWait)
+                } else if busy {
+                    t(language, crate::localization::TextKey::ComposeModuleBusy)
+                } else if state.error.is_some() {
+                    t(language, crate::localization::TextKey::ComposeDraftKept)
+                } else if !state.ready() {
+                    t(language, crate::localization::TextKey::ComposeNeedInput)
+                } else {
+                    t(language, crate::localization::TextKey::ComposeDraftReady)
+                }));
+            },
+            &[
+                crate::ui::modal::DialogAction::primary(&t(
+                    language,
+                    crate::localization::TextKey::ComposeNextConfirm,
+                ))
+                .enabled(can_advance),
+                crate::ui::modal::DialogAction::cancel(&t(
+                    language,
+                    crate::localization::TextKey::ButtonCancel,
+                )),
+            ],
+        );
+        if outcome.chosen() == Some(0) {
+            state.confirmation = Some(state.draft.clone());
+        } else if outcome.dismissed() {
+            state.open = false;
             state.editor_focus = None;
         }
     }
     if let Some(frozen) = state.confirmation.clone() {
-        let mut open = true;
-        egui::Window::new("确认发送短信")
-            .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .auto_sized()
-            .default_width(460.0)
-            .max_width((ui.ctx().screen_rect().width() - 48.0).min(460.0))
-            .open(&mut open)
-            .show(ui.ctx(), |ui| {
-                // Bound the review text, while keeping both decisions visible below it.
+        // The review text is the only element allowed to grow, so it is the one that carries the
+        // bound: the reserve covers the card's padding, its title block, the hairline and the
+        // decision row. That keeps the card inside the viewport on a short window, and both
+        // decisions on screen no matter how long the message is.
+        let review_max_height = (ui.ctx().screen_rect().height() - 280.0).clamp(64.0, 260.0);
+        let outcome = crate::ui::modal::show(
+            ui.ctx(),
+            &crate::ui::modal::Dialog::new(
+                "sms-compose-confirmation",
+                &t(language, crate::localization::TextKey::ComposeConfirmTitle),
+            )
+            .description(&t(
+                language,
+                crate::localization::TextKey::ComposeConfirmIntro,
+            ))
+            .width(460.0),
+            |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("sms-confirmation-content")
-                    .max_height((ui.ctx().screen_rect().height() - 180.0).max(64.0))
-                    .auto_shrink([true, true])
+                    .max_height(review_max_height)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.label("请核对以下完整号码和正文：");
                         ui.label(egui::RichText::new(&frozen.recipient).strong());
                         ui.separator();
                         ui.add(egui::Label::new(&frozen.body).wrap());
-                        ui.separator();
-                        ui.add(
-                            egui::Label::new(
-                                "本次发送 1 条短信，可能产生运营商费用。模块接受不代表对方收到。",
-                            )
-                            .wrap(),
-                        );
                     });
-                ui.horizontal_wrapped(|ui| {
-                    if crate::ui::components::action_button(
-                        ui,
-                        "取消",
-                        crate::ui::components::ButtonKind::Text,
-                        true,
-                        None,
-                    )
-                    .clicked()
-                    {
-                        state.confirmation = None;
-                    }
-                    if ui
-                        .add_enabled(!busy, crate::ui::theme::primary_button("确认发送这条短信"))
-                        .clicked()
-                    {
-                        state.confirm(sink, snapshot);
-                    }
-                });
-            });
-        if !open {
+                ui.add(
+                    egui::Label::new(t(
+                        language,
+                        crate::localization::TextKey::ComposeConfirmNote,
+                    ))
+                    .wrap(),
+                );
+            },
+            &[
+                crate::ui::modal::DialogAction::primary(&t(
+                    language,
+                    crate::localization::TextKey::ComposeConfirmAction,
+                ))
+                .enabled(!busy),
+                crate::ui::modal::DialogAction::cancel(&t(
+                    language,
+                    crate::localization::TextKey::ButtonCancel,
+                )),
+            ],
+        );
+        if outcome.chosen() == Some(0) {
+            state.confirm(sink, snapshot);
+        } else if outcome.dismissed() {
             state.confirmation = None;
         }
     }
     if state.reply_recipient.is_some() {
-        let mut open = true;
-        egui::Window::new("保留当前草稿？")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ui.ctx(), |ui| {
-                ui.label("已有未发送草稿。默认保留；替换后将只填写回复号码，正文为空。");
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("保留草稿").clicked() {
-                        state.resolve_reply(false);
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("替换为回复草稿"))
-                        .clicked()
-                    {
-                        state.resolve_reply(true);
-                    }
-                });
-            });
-        if !open {
+        let outcome = crate::ui::modal::show(
+            ui.ctx(),
+            &crate::ui::modal::Dialog::new(
+                "sms-compose-keep-draft",
+                &t(
+                    language,
+                    crate::localization::TextKey::ComposeKeepDraftTitle,
+                ),
+            )
+            .description(&t(
+                language,
+                crate::localization::TextKey::ComposeKeepDraftBody,
+            )),
+            |_ui| {},
+            &[
+                crate::ui::modal::DialogAction::destructive(&t(
+                    language,
+                    crate::localization::TextKey::ComposeReplaceDraft,
+                ))
+                .enabled(!busy),
+                crate::ui::modal::DialogAction::cancel(&t(
+                    language,
+                    crate::localization::TextKey::ComposeKeepDraft,
+                )),
+            ],
+        );
+        if outcome.chosen() == Some(0) {
+            state.resolve_reply(true);
+        } else if outcome.dismissed() {
             state.resolve_reply(false);
         }
     }
@@ -595,62 +690,93 @@ fn send_result_tone(snapshot: &SmsSendSnapshot) -> super::StatusTone {
 fn submission_notice(
     result: Option<SmsSendResult>,
     failure: &dji4g_application::SmsFailureDetail,
-) -> &'static str {
+    language: Language,
+) -> String {
     if result == Some(SmsSendResult::Failed) && failure.code == "sms:module_rejected" {
-        "模块已明确拒绝本条短信，未接受提交。请根据错误码排查后再手动发送。"
+        t(language, crate::localization::TextKey::ComposeRejected)
     } else if failure.submission_possible {
-        "可能已经提交，请勿直接重发。"
+        t(language, crate::localization::TextKey::ComposeMaybeSent)
     } else {
-        "本次未提交，可检查连接、SIM 卡和短信服务后重试。"
+        t(language, crate::localization::TextKey::ComposeNotSubmitted)
     }
 }
 
-fn phase_name(phase: SmsSendPhase) -> &'static str {
+fn phase_name(phase: SmsSendPhase, language: Language) -> String {
     match phase {
-        SmsSendPhase::Queued => "排队",
-        SmsSendPhase::Preparing => "准备",
-        SmsSendPhase::Submitting => "提交",
-        SmsSendPhase::WaitingForResult => "等待模块结果",
-        SmsSendPhase::Finished => "完成",
+        SmsSendPhase::Queued => t(language, crate::localization::TextKey::ComposeStageQueued),
+        SmsSendPhase::Preparing => t(
+            language,
+            crate::localization::TextKey::ComposeStagePreparing,
+        ),
+        SmsSendPhase::Submitting => t(
+            language,
+            crate::localization::TextKey::ComposeStageSubmitting,
+        ),
+        SmsSendPhase::WaitingForResult => {
+            t(language, crate::localization::TextKey::ComposeStageAwaiting)
+        }
+        SmsSendPhase::Finished => t(language, crate::localization::TextKey::ComposeStageDone),
     }
 }
 
-fn failure_advice(code: &str) -> &'static str {
+fn failure_advice(code: &str, language: Language) -> String {
     match code {
-        "sms:port_busy" => return "串口正被其他任务占用。请等待任务结束，再手动重试。",
-        "sms:port_open_failed" => return "无法打开短信串口。请检查设备连接及其他串口程序是否占用。",
-        "sms:cleanup_timeout" => {
-            return "串口关闭超时，后台未能确认资源已释放。请恢复设备连接后再操作。";
+        "sms:port_busy" => return t(language, crate::localization::TextKey::ComposeSerialBusy),
+        "sms:port_open_failed" => {
+            return t(
+                language,
+                crate::localization::TextKey::ComposeSerialOpenFailed,
+            );
         }
-        "sms:no_device" => return "当前没有可用设备。请连接模块并刷新设备状态。",
+        "sms:cleanup_timeout" => {
+            return t(
+                language,
+                crate::localization::TextKey::ComposeSerialCloseTimeout,
+            );
+        }
+        "sms:no_device" => return t(language, crate::localization::TextKey::ComposeNoDevice),
         "sms:device_changed" => {
-            return "发送过程中设备或 SIM 卡发生变化。请核对当前设备及发送记录。";
+            return t(
+                language,
+                crate::localization::TextKey::ComposeContextChanged,
+            );
         }
         "sms:module_rejected" => {
-            return "模块拒绝了短信。请结合 CMS/CME 错误码检查 SIM 卡、余额及运营商短信服务。";
+            return t(
+                language,
+                crate::localization::TextKey::ComposeModuleRejected,
+            );
         }
-        "sms:transport_failed" => return "串口通信失败。请检查 USB 连接和模块供电。",
-        "sms:timeout" => return "等待模块响应超时。请核实发送记录及连接状态，避免重复发送。",
+        "sms:transport_failed" => {
+            return t(language, crate::localization::TextKey::ComposeSerialFailed);
+        }
+        "sms:timeout" => return t(language, crate::localization::TextKey::ComposeTimeout),
         "sms:missing_reference" => {
-            return "模块没有返回短信提交编号，无法确认提交结果。请先核实是否已发送。";
+            return t(language, crate::localization::TextKey::ComposeNoReference);
         }
         "sms:unexpected_final_code" => {
-            return "模块返回了非预期的结束响应，无法确认提交结果。请保留错误码并核实发送情况。";
+            return t(language, crate::localization::TextKey::ComposeUnexpectedEnd);
         }
         _ => {}
     }
     if code.contains("lease") || code.contains("busy") {
-        "串口正在被其他任务占用，请等待任务结束。"
+        t(
+            language,
+            crate::localization::TextKey::ComposeSerialBusyShort,
+        )
     } else if code.contains("open") || code.contains("access") {
-        "无法打开串口，请检查设备连接及端口占用。"
+        t(language, crate::localization::TextKey::ComposePortBusyShort)
     } else if code.contains("timeout") || code.contains("deadline") {
-        "等待模块响应超时，请检查连接及模块状态。"
+        t(language, crate::localization::TextKey::ComposeTimeoutShort)
     } else if code.contains("invalid") {
-        "号码或正文未通过校验，请检查国际号码和正文长度。"
+        t(
+            language,
+            crate::localization::TextKey::ComposeValidationFailed,
+        )
     } else if code.contains("disconnect") || code.contains("closed") || code.contains("removed") {
-        "设备连接中断，请重新连接设备并刷新。"
+        t(language, crate::localization::TextKey::ComposeDeviceLost)
     } else {
-        "请检查设备连接、SIM 卡状态和运营商短信服务；保留错误码以便排查。"
+        t(language, crate::localization::TextKey::ComposeGenericAdvice)
     }
 }
 
@@ -816,11 +942,18 @@ mod tests {
             "sms:module_rejected",
             true,
         );
-        assert!(submission_notice(Some(SmsSendResult::Failed), &failure).contains("明确拒绝"));
+        assert!(
+            submission_notice(Some(SmsSendResult::Failed), &failure, Language::ZhCn)
+                .contains("明确拒绝")
+        );
         assert!(failure.submission_possible);
         assert!(
-            submission_notice(Some(SmsSendResult::OutcomeUnknown), &failure)
-                .contains("可能已经提交")
+            submission_notice(
+                Some(SmsSendResult::OutcomeUnknown),
+                &failure,
+                Language::ZhCn
+            )
+            .contains("可能已经提交")
         );
     }
     struct Sink(Result<(), UiSendError>);
@@ -1096,7 +1229,7 @@ mod tests {
                 },
                 |context| {
                     egui::CentralPanel::default().show(context, |ui| {
-                        render(ui, state, &snapshot, &Sink(Ok(())));
+                        render(ui, Language::ZhCn, state, &snapshot, &Sink(Ok(())));
                     });
                 },
             );
@@ -1294,37 +1427,60 @@ mod tests {
                             },
                             |context| {
                                 egui::CentralPanel::default().show(context, |ui| {
-                                    render(ui, &mut state, &snapshot, &sink);
+                                    render(ui, Language::ZhCn, &mut state, &snapshot, &sink);
                                 });
                             },
                         );
                         if tick == 2 {
                             let window = context
-                                .read_response(egui::Id::new("确认发送短信"))
+                                .read_response(egui::Id::new("sms-compose-confirmation"))
                                 .expect("the confirmation window must be rendered")
                                 .rect;
                             assert!(screen.contains_rect(window), "{size:?}: {window:?}");
-                            for label in ["取消", "确认发送这条短信"] {
+                            let cancel_label =
+                                t(Language::ZhCn, crate::localization::TextKey::ButtonCancel);
+                            let confirm_label = t(
+                                Language::ZhCn,
+                                crate::localization::TextKey::ComposeConfirmAction,
+                            );
+                            for label in [&cancel_label, &confirm_label] {
+                                // Match the decision *inside the confirmation window*: the label
+                                // 取消 also appears elsewhere on the page, and shapes are emitted in
+                                // paint order, so taking the first match picked the wrong one.
                                 let text = output.shapes.iter().find_map(|shape| {
                                     if let egui::Shape::Text(text) = &shape.shape
                                         && text.galley.text() == label
                                     {
-                                        Some(egui::Rect::from_min_size(
-                                            text.pos,
-                                            text.galley.size(),
-                                        ))
+                                        let rect =
+                                            egui::Rect::from_min_size(text.pos, text.galley.size());
+                                        window.contains_rect(rect).then_some(rect)
                                     } else {
                                         None
                                     }
                                 });
-                                let text = text.expect("both decisions must be visible");
+                                let text = text.unwrap_or_else(|| {
+                                    let seen = output
+                                        .shapes
+                                        .iter()
+                                        .filter_map(|shape| match &shape.shape {
+                                            egui::Shape::Text(text) => {
+                                                Some(text.galley.text().to_owned())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    panic!(
+                                        "{size:?}: {label:?} not inside {window:?}; \
+                                         texts on screen: {seen:?}"
+                                    )
+                                });
                                 assert!(screen.contains_rect(text));
                                 assert!(window.contains_rect(text));
                                 if label
                                     == if confirm {
-                                        "确认发送这条短信"
+                                        confirm_label.as_str()
                                     } else {
-                                        "取消"
+                                        cancel_label.as_str()
                                     }
                                 {
                                     action = Some(text.center());
@@ -1352,7 +1508,7 @@ mod tests {
             state.open_editor();
             let draft = state.draft.clone();
             state.confirm(&Sink(Err(failure.clone())), None);
-            let expected = enqueue_error(failure);
+            let expected = enqueue_error(failure, Language::ZhCn);
             let mut visible_error = None;
             for _ in 0..2 {
                 let output = context.run(
@@ -1365,7 +1521,7 @@ mod tests {
                     },
                     |context| {
                         egui::CentralPanel::default().show(context, |ui| {
-                            render(ui, &mut state, &snapshot, &Sink(Ok(())));
+                            render(ui, Language::ZhCn, &mut state, &snapshot, &Sink(Ok(())));
                         });
                     },
                 );
@@ -1380,10 +1536,12 @@ mod tests {
                 });
             }
             let point = visible_error.expect("queue error should be drawn in the editor");
+            // The editor is the panel's modal now, so its text lives in the dialog's foreground
+            // layer rather than in a `egui::Window`'s middle layer.
             assert_eq!(
                 context.layer_id_at(point),
                 Some(egui::LayerId::new(
-                    egui::Order::Middle,
+                    egui::Order::Foreground,
                     egui::Id::new("sms-compose-window"),
                 ))
             );

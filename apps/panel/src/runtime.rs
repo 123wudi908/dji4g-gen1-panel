@@ -158,7 +158,15 @@ impl ProductionInventory {
             }
         };
 
-        let identity = stable_identity(device);
+        // A snapshot only ever holds roots that proved a declared profile, so this cannot upgrade
+        // an unrecognized device; it only reports which profile was proved.
+        let Some(profile) = device.profile() else {
+            return Err(PortError::new(
+                ErrorCode::Unsupported,
+                "pnp:unsupported_device",
+            ));
+        };
+        let identity = stable_identity(device, profile);
         if !state.present || state.identity.as_ref() != Some(&identity) {
             state.epoch = next_epoch(state.epoch);
         }
@@ -172,7 +180,9 @@ impl ProductionInventory {
         let adapter_id = unique_adapter_id(device);
         Ok(InventoryObservation {
             epoch: state.epoch,
-            presence: DevicePresenceDto::Supported(dji4g_domain::DJI_GEN1),
+            // The presence carries the profile the inventory actually proved, so every read-only
+            // consumer sees the matched module and every write gate can refuse a read-only one.
+            presence: DevicePresenceDto::Supported(profile),
             identity: Some(identity),
             problem_code: device.problem_code(),
             at_port,
@@ -405,6 +415,12 @@ pub struct ProductionSms {
 
 impl ProductionSms {
     fn target_device(&self, target: &TargetContext) -> Result<(DjiDevice, DeviceEpoch), PortError> {
+        if !target.identity().allows_controlled_actions() {
+            return Err(PortError::new(
+                ErrorCode::Unsupported,
+                "sms:read_only_module",
+            ));
+        }
         let device = current_device(&self.inventory, target)?;
         Ok((device, target.epoch()))
     }
@@ -2002,12 +2018,15 @@ fn next_epoch(current: DeviceEpoch) -> DeviceEpoch {
     DeviceEpoch(current.0.saturating_add(1).max(1))
 }
 
-fn stable_identity(device: &DjiDevice) -> StableDeviceIdentity {
+fn stable_identity(
+    device: &DjiDevice,
+    profile: dji4g_domain::DeviceProfile,
+) -> StableDeviceIdentity {
     StableDeviceIdentity {
         container_id: device.container_id().unwrap_or_default().to_owned(),
         device_instance_id: device.root_instance_id().to_owned(),
-        vid: dji4g_domain::DJI_GEN1.vid,
-        pid: dji4g_domain::DJI_GEN1.pid,
+        vid: profile.vid,
+        pid: profile.pid,
     }
 }
 
@@ -2126,7 +2145,9 @@ fn adapter_metrics(metrics: InterfaceMetrics) -> AdapterMetrics {
 }
 
 fn map_platform_error(error: PlatformError) -> PortError {
-    let category = if error.code.contains("permission") {
+    let category = if matches!(error.code, "sms:read_only_module" | "sms:unsupported") {
+        ErrorCode::Unsupported
+    } else if error.code.contains("permission") {
         ErrorCode::PermissionDenied
     } else if error.code.contains("not_found") || error.code.contains("removed") {
         ErrorCode::DeviceRemoved

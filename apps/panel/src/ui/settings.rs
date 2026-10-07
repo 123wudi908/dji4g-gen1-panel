@@ -9,8 +9,13 @@ use eframe::egui::{self, RichText, Ui};
 
 use super::{meta_text, scale, wrapped_label};
 use crate::localization::{
-    Language, LocalizedText, TextKey, available_languages, english_available,
+    Language, LocalizedText, TextKey, available_languages, language_code, language_key,
 };
+
+/// One catalog string in the language this page was rendered with.
+fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
+    crate::localization::LocalizedText::new(language, key).text
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsVm {
@@ -47,8 +52,8 @@ pub fn settings_vm(snapshot: &ControllerSnapshot, language: Language) -> Setting
 pub fn settings_vm_from(settings: &SettingsSnapshot, language: Language) -> SettingsVm {
     let selected_language = match settings.language {
         LanguageCode::ZhCn => Language::ZhCn,
-        LanguageCode::EnUs if english_available() => Language::EnUs,
-        LanguageCode::EnUs => Language::ZhCn,
+        LanguageCode::ZhTw => Language::ZhTw,
+        LanguageCode::EnUs => Language::EnUs,
     };
     let autostart = match &settings.autostart {
         AutostartStatus::Loading => AutostartVm {
@@ -132,7 +137,7 @@ pub(crate) fn render(
     language: Language,
 ) -> SettingsRenderOutput {
     let vm = settings_vm(snapshot, language);
-    super::components::page_heading(ui, &vm.title.text, "让面板按你的习惯工作");
+    super::components::page_heading(ui, &vm.title.text, "");
     ui.add_space(4.0);
     // Rows like the reference's `.setting-row`: label + description on the left, the control on
     // the right. Generous whitespace separates rows instead of hairlines so the page breathes.
@@ -142,21 +147,79 @@ pub(crate) fn render(
     let mut controls = Vec::new();
     let mut commands = Vec::new();
     super::section_frame(ui, |ui| {
-        ui.label(super::section_heading("常规"));
+        ui.label(super::section_heading(t(
+            language,
+            crate::localization::TextKey::SettingsGeneral,
+        )));
+        controls.push(setting_row(
+            ui,
+            t(
+                language,
+                crate::localization::TextKey::SettingsInterfaceTheme,
+            ),
+            |ui| {
+                let current = super::theme::theme_preference(snapshot.settings.theme);
+                let mut selected = current;
+                let combo = egui::ComboBox::from_id_salt("settings-theme")
+                    .selected_text(super::theme::theme_label(selected, language))
+                    .show_ui(ui, |ui| {
+                        for choice in super::theme::THEME_CHOICES {
+                            if ui
+                                .selectable_label(
+                                    choice == selected,
+                                    super::theme::theme_label(choice, language),
+                                )
+                                .clicked()
+                            {
+                                selected = choice;
+                            }
+                        }
+                    });
+                if selected != current {
+                    commands.push(UiCommand::SetTheme(super::theme::theme_code(selected)));
+                }
+                combo.response
+            },
+        ));
         controls.push(setting_row(
             ui,
             TextKey::SettingsLanguage.to_string(language),
-            Some("English 选项将在完整翻译审核后开放。".to_owned()),
-            |ui| wrapped_label(ui, TextKey::LanguageZhCn.to_string(language)),
+            |ui| {
+                // Same control as the theme row above, and the same shape: pick a value, and only a
+                // real change emits a command. Each option is labelled with its own endonym, so
+                // someone who cannot read the current language can still find theirs.
+                let mut selected = vm.language;
+                let combo = egui::ComboBox::from_id_salt("settings-language")
+                    .selected_text(crate::localization::template(
+                        language,
+                        language_key(selected),
+                    ))
+                    .show_ui(ui, |ui| {
+                        for choice in vm.language_options {
+                            let label =
+                                crate::localization::template(language, language_key(*choice));
+                            if ui.selectable_label(*choice == selected, label).clicked() {
+                                selected = *choice;
+                            }
+                        }
+                    });
+                if selected != vm.language {
+                    commands.push(UiCommand::SetLanguage(language_code(selected)));
+                }
+                combo.response
+            },
         ));
         controls.push(setting_row(
             ui,
             TextKey::SettingsActiveProbe.to_string(language),
-            Some(TextKey::SettingsActiveProbeDescription.to_string(language)),
             |ui| {
                 let mut active_probe = vm.active_probe;
-                let response =
-                    super::components::switch(ui, &mut active_probe, "主动联网检查", true);
+                let response = super::components::switch(
+                    ui,
+                    &mut active_probe,
+                    &t(language, crate::localization::TextKey::SettingsActiveProbe),
+                    true,
+                );
                 if response.changed() {
                     commands.push(UiCommand::SetActiveProbe(active_probe));
                 }
@@ -165,17 +228,19 @@ pub(crate) fn render(
         ));
     });
     super::section_frame(ui, |ui| {
-        ui.label(super::section_heading("启动与托盘"));
+        ui.label(super::section_heading(t(
+            language,
+            crate::localization::TextKey::SettingsStartupTray,
+        )));
         controls.push(setting_row(
             ui,
             TextKey::SettingsAutostart.to_string(language),
-            Some(TextKey::SettingsAutostartDescription.to_string(language)),
             |ui| {
                 let mut enabled = vm.autostart.enabled;
                 let response = super::components::switch(
                     ui,
                     &mut enabled,
-                    "登录后自动启动",
+                    &t(language, crate::localization::TextKey::SettingsAutoStart),
                     vm.autostart.toggle_enabled,
                 );
                 if response.changed() {
@@ -197,11 +262,14 @@ pub(crate) fn render(
         controls.push(setting_row(
             ui,
             TextKey::SettingsStartMinimized.to_string(language),
-            None,
             |ui| {
                 let mut start_minimized = vm.start_minimized;
-                let response =
-                    super::components::switch(ui, &mut start_minimized, "启动后隐藏到托盘", true);
+                let response = super::components::switch(
+                    ui,
+                    &mut start_minimized,
+                    &t(language, crate::localization::TextKey::SettingsStartHidden),
+                    true,
+                );
                 if response.changed() {
                     commands.push(UiCommand::SetStartMinimized(start_minimized));
                 }
@@ -209,11 +277,13 @@ pub(crate) fn render(
             },
         ));
         ui.separator();
-        ui.label(super::section_heading("日志"));
+        ui.label(super::section_heading(t(
+            language,
+            crate::localization::TextKey::SettingsLogging,
+        )));
         controls.push(setting_row(
             ui,
             TextKey::SettingsLogLevel.to_string(language),
-            Some(TextKey::SettingsLogLevelRestart.to_string(language)),
             |ui| {
                 let mut selected = vm.log_level;
                 let combo = egui::ComboBox::from_id_salt("settings-log-level")
@@ -243,16 +313,19 @@ pub(crate) fn render(
             },
         ));
         ui.separator();
-        ui.label(super::section_heading("关于"));
+        ui.label(super::section_heading(t(
+            language,
+            crate::localization::TextKey::SettingsAbout,
+        )));
         wrapped_label(
             ui,
-            format!("DJI 一代 4G 面板 · v{}", env!("CARGO_PKG_VERSION")),
+            crate::localization::format_positional(
+                language,
+                crate::localization::TextKey::SettingsVersion,
+                &[env!("CARGO_PKG_VERSION")],
+            ),
         );
-        setting_block(
-            ui,
-            TextKey::SettingsPrivacy.to_string(language),
-            Some(TextKey::SettingsPrivacyDescription.to_string(language)),
-        );
+        setting_block(ui, TextKey::SettingsPrivacy.to_string(language));
         ui.add_space(12.0);
         wrapped_label(ui, meta_text(vm.persistence.status.text));
     });
@@ -269,20 +342,11 @@ pub(crate) fn render(
 fn setting_row(
     ui: &mut Ui,
     label: String,
-    description: Option<String>,
     control: impl FnOnce(&mut Ui) -> egui::Response,
 ) -> egui::Response {
     ui.add_space(8.0);
     if ui.available_width() < 440.0 {
-        ui.label(RichText::new(label).strong().color(scale::INK));
-        if let Some(description) = description {
-            wrapped_label(
-                ui,
-                RichText::new(description)
-                    .size(scale::RATE_AUX)
-                    .color(scale::SECONDARY),
-            );
-        }
+        ui.label(RichText::new(label).strong().color(scale::ink()));
         let response = control(ui);
         ui.add_space(8.0);
         ui.separator();
@@ -294,18 +358,10 @@ fn setting_row(
             ui.set_max_width(ui.available_width() * 0.55);
             ui.label(
                 RichText::new(label)
-                    .size(scale::LABEL)
+                    .size(scale::HEADING)
                     .strong()
-                    .color(scale::INK),
+                    .color(scale::ink()),
             );
-            if let Some(description) = description {
-                wrapped_label(
-                    ui,
-                    RichText::new(description)
-                        .size(scale::RATE_AUX)
-                        .color(scale::SECONDARY),
-                );
-            }
         });
         let inner = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             response = Some(control(ui));
@@ -319,23 +375,15 @@ fn setting_row(
 }
 
 /// A full-width block without a control (privacy notice).
-fn setting_block(ui: &mut Ui, label: String, description: Option<String>) {
+fn setting_block(ui: &mut Ui, label: String) {
     ui.add_space(8.0);
     ui.vertical(|ui| {
         ui.label(
             RichText::new(label)
-                .size(scale::LABEL)
+                .size(scale::HEADING)
                 .strong()
-                .color(scale::INK),
+                .color(scale::ink()),
         );
-        if let Some(description) = description {
-            wrapped_label(
-                ui,
-                RichText::new(description)
-                    .size(scale::RATE_AUX)
-                    .color(scale::SECONDARY),
-            );
-        }
     });
     ui.add_space(8.0);
 }
@@ -436,8 +484,9 @@ mod tests {
         );
         assert_eq!(
             controls.len(),
-            5,
-            "all five setting rows must render a control"
+            6,
+            "every setting row must render a control (theme, language, probe, autostart, \
+             start-minimized, log level)"
         );
         for response in &controls {
             let rect = response.rect;
@@ -490,7 +539,7 @@ mod tests {
     #[test]
     fn retrying_failed_disable_collects_exactly_one_disable_command() {
         let context = egui::Context::default();
-        super::super::style_root(&context);
+        super::super::apply_style(&context);
         let mut snapshot = snapshot();
         snapshot.settings.autostart = failed_autostart(Some(AutostartKnownState::Enabled));
         let mut control_id = None;
@@ -523,7 +572,9 @@ mod tests {
                 |context| {
                     egui::CentralPanel::default().show(context, |ui| {
                         let output = render(ui, &snapshot, Language::ZhCn);
-                        control_id = Some(output.controls[2].id);
+                        // Row order in the 常规/启动与托盘 sections: theme, language, probe,
+                        // autostart, start-minimized, log level.
+                        control_id = Some(output.controls[3].id);
                         if tick != 1 {
                             assert!(output.commands.is_empty());
                         }

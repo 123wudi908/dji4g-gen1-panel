@@ -1,14 +1,27 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 //! One distributable EXE. Native resource extraction, no install script or shortcuts.
+use dji4g_panel::localization::Language;
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path},
     process::Command,
 };
+
+/// One catalog string in the language this page was rendered with.
+fn t(
+    language: dji4g_panel::localization::Language,
+    key: dji4g_panel::localization::TextKey,
+) -> String {
+    dji4g_panel::localization::LocalizedText::new(language, key).text
+}
 include!(concat!(env!("OUT_DIR"), "/standalone_bundle.rs"));
 
-fn prepare_files(root: &Path, files: &[(&str, &[u8])]) -> Result<Vec<File>, String> {
+fn prepare_files(
+    language: Language,
+    root: &Path,
+    files: &[(&str, &[u8])],
+) -> Result<Vec<File>, String> {
     let mut locks = Vec::new();
     for (name, bytes) in files {
         if name.is_empty()
@@ -16,17 +29,31 @@ fn prepare_files(root: &Path, files: &[(&str, &[u8])]) -> Result<Vec<File>, Stri
                 .components()
                 .all(|part| matches!(part, Component::Normal(_)))
         {
-            return Err(format!("安装资源路径无效：{name}"));
+            return Err(dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::PortableBadResourcePath,
+                &[name],
+            ));
         }
         let path = root.join(name);
-        std::fs::create_dir_all(path.parent().ok_or("资源目录无效")?).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(path.parent().ok_or(t(
+            language,
+            dji4g_panel::localization::TextKey::PortableBadResourceDir,
+        ))?)
+        .map_err(|e| e.to_string())?;
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => file
                 .write_all(bytes)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| e.to_string())?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("无法释放资源 {name}：{error}")),
+            Err(error) => {
+                return Err(dji4g_panel::localization::format_positional(
+                    language,
+                    dji4g_panel::localization::TextKey::PortableWriteFailed,
+                    &[name, &error.to_string()],
+                ));
+            }
         }
         let mut options = OpenOptions::new();
         options.read(true);
@@ -35,19 +62,27 @@ fn prepare_files(root: &Path, files: &[(&str, &[u8])]) -> Result<Vec<File>, Stri
             use std::os::windows::fs::OpenOptionsExt;
             options.share_mode(1); // Allow reads/execution, deny modification and deletion.
         }
-        let mut file = options
-            .open(&path)
-            .map_err(|e| format!("无法读取资源 {name}：{e}"))?;
+        let mut file = options.open(&path).map_err(|error| {
+            dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::PortableReadFailed,
+                &[name, &error.to_string()],
+            )
+        })?;
         if file.metadata().map_err(|e| e.to_string())?.len() != bytes.len() as u64 {
-            return Err(format!(
-                "资源校验失败：{name}。请保留安全软件报告，不要关闭防护。"
+            return Err(dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::PortableVerifyFailed,
+                &[name],
             ));
         }
         let mut actual = Vec::with_capacity(bytes.len());
         file.read_to_end(&mut actual).map_err(|e| e.to_string())?;
         if actual != *bytes {
-            return Err(format!(
-                "资源校验失败：{name}。请保留安全软件报告，不要关闭防护。"
+            return Err(dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::PortableVerifyFailed,
+                &[name],
             ));
         }
         locks.push(file);
@@ -56,25 +91,38 @@ fn prepare_files(root: &Path, files: &[(&str, &[u8])]) -> Result<Vec<File>, Stri
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let language = dji4g_panel::localization::configured_language();
+    if let Err(error) = run(language) {
         if std::env::args().any(|arg| arg == "--verify-bundle") {
             eprintln!("{error}");
         } else {
-            dji4g_windows_platform::show_message_box("大疆 4G 面板启动失败", &error);
+            dji4g_windows_platform::show_message_box(
+                &t(
+                    language,
+                    dji4g_panel::localization::TextKey::PortableLaunchFailed,
+                ),
+                &error,
+            );
         }
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
+fn run(language: Language) -> Result<(), String> {
     if FILES.is_empty() || BUNDLE_ID.len() != 64 {
-        return Err("此构建未包含独立运行资源。".into());
+        return Err(t(
+            language,
+            dji4g_panel::localization::TextKey::PortableNoPayload,
+        ));
     }
-    let base = std::env::var_os("LOCALAPPDATA").ok_or("无法读取当前用户的应用数据目录")?;
+    let base = std::env::var_os("LOCALAPPDATA").ok_or(t(
+        language,
+        dji4g_panel::localization::TextKey::PortableNoAppData,
+    ))?;
     let directory = Path::new(&base)
         .join("Dji4GPanel/standalone")
         .join(BUNDLE_ID);
-    let _locks = prepare_files(&directory, FILES)?;
+    let _locks = prepare_files(language, &directory, FILES)?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--verify-bundle" {
         println!(
@@ -88,10 +136,18 @@ fn run() -> Result<(), String> {
         .args(args)
         .current_dir(&directory)
         .status()
-        .map_err(|e| format!("无法打开面板：{e}。如有安全软件拦截，请保留报告。"))?;
+        .map_err(|error| {
+            dji4g_panel::localization::format_positional(
+                language,
+                dji4g_panel::localization::TextKey::PortableOpenFailed,
+                &[&error.to_string()],
+            )
+        })?;
     if !status.success() {
-        return Err(format!(
-            "面板异常退出：{status}。请保留安全软件报告及程序日志。"
+        return Err(dji4g_panel::localization::format_positional(
+            language,
+            dji4g_panel::localization::TextKey::PortableExitedAbnormally,
+            &[&status.to_string()],
         ));
     }
     Ok(())
@@ -120,14 +176,17 @@ mod tests {
     fn extracts_and_reuses_exact_payload_with_unicode_paths() {
         let root = scratch().join("中文 空格");
         let files: &[(&str, &[u8])] = &[("panel.exe", b"panel"), ("drivers/a.inf", b"driver")];
-        let locks = prepare_files(&root, files).unwrap();
+        let locks = prepare_files(Language::ZhCn, &root, files).unwrap();
         assert_eq!(
             std::fs::read(root.join("drivers/a.inf")).unwrap(),
             b"driver"
         );
         assert_eq!(locks.len(), 2);
         drop(locks);
-        assert_eq!(prepare_files(&root, files).unwrap().len(), 2);
+        assert_eq!(
+            prepare_files(Language::ZhCn, &root, files).unwrap().len(),
+            2
+        );
         std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
@@ -135,7 +194,7 @@ mod tests {
     fn rejects_changed_executable_instead_of_launching_it() {
         let root = scratch();
         std::fs::write(root.join("panel.exe"), b"changed").unwrap();
-        assert!(prepare_files(&root, &[("panel.exe", b"expected")]).is_err());
+        assert!(prepare_files(Language::ZhCn, &root, &[("panel.exe", b"expected")]).is_err());
         assert_eq!(std::fs::read(root.join("panel.exe")).unwrap(), b"changed");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -144,7 +203,10 @@ mod tests {
     fn rejects_paths_outside_resource_directory() {
         let root = scratch();
         for name in ["../escape.exe", "C:/escape.exe", "/escape.exe"] {
-            assert!(prepare_files(&root, &[(name, b"bad")]).is_err(), "{name}");
+            assert!(
+                prepare_files(Language::ZhCn, &root, &[(name, b"bad")]).is_err(),
+                "{name}"
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }

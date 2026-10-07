@@ -1,3 +1,4 @@
+use dji4g_panel::localization::Language;
 use dji4g_panel::tray::{
     CloseAction, TrayCommand, TrayLabels, WindowState, close_window, merge_activation,
     off_ui_command,
@@ -5,11 +6,18 @@ use dji4g_panel::tray::{
 
 #[test]
 fn tray_labels_and_command_mapping_are_closed_and_chinese() {
-    let labels = TrayLabels::zh_cn();
+    let labels = TrayLabels::for_language(Language::ZhCn);
     assert_eq!(
         labels.menu_items(),
         ["打开面板", "立即刷新", "热点状态", "退出"]
     );
+    // The tray is localized too, and the tooltip stays the window title.
+    let english = TrayLabels::for_language(Language::EnUs);
+    assert_eq!(
+        english.menu_items(),
+        ["Open the panel", "Refresh now", "Hotspot status", "Exit"]
+    );
+    assert_eq!(english.tooltip, "DJI 1st-gen 4G Panel");
     assert_eq!(TrayCommand::from_menu_id(1), Some(TrayCommand::Open));
     assert_eq!(TrayCommand::from_menu_id(2), Some(TrayCommand::RefreshNow));
     assert_eq!(

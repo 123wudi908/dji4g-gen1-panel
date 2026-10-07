@@ -5,9 +5,12 @@ fn main() {
         .expect("output directory required");
     let snapshot = dji4g_application::ReducerState::new(std::time::SystemTime::now()).snapshot();
     let path = dji4g_panel::support_report::collect(
-        std::path::Path::new(&directory), &snapshot,
+        dji4g_panel::localization::Language::ZhCn,
+        std::path::Path::new(&directory),
+        &snapshot,
         "SMOKE TEST: empty synthetic snapshot; OS/device sections below are live read-only observations.",
         |text| println!("{text}"),
-    ).expect("write report");
+    )
+    .expect("write report");
     println!("REPORT={}", path.display());
 }

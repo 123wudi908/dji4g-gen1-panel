@@ -11,7 +11,7 @@ use dji4g_domain::{
     DeviceSnapshot, Evidence, EvidenceSource, FeatureStatus, Freshness, GlobalConnectivity,
     HotspotStatus, Issue, IssueLayer, IssueSeverity, NetworkSnapshot, ProtocolCoverage,
     RegistrationState, ServingCell, SmsInboxSummary, SmsMessage, SmsStorageId,
-    StableDeviceIdentity, Timeline, TimelineEvent, TimelineEventKind, classify,
+    StableDeviceIdentity, Timeline, TimelineDetail, TimelineEvent, TimelineEventKind, classify,
 };
 
 use crate::sms::SmsStore;
@@ -23,7 +23,7 @@ use crate::{
 };
 use crate::{
     AutostartApplyOutcome, AutostartStatus, CommandStateSnapshot, FailureCode, LanguageCode,
-    LogLevel, SettingsPersistenceState, SettingsSnapshot, StableCode,
+    LogLevel, SettingsPersistenceState, SettingsSnapshot, StableCode, ThemeCode,
 };
 
 const EVIDENCE_TTL: Duration = Duration::from_secs(30);
@@ -609,6 +609,14 @@ impl ReducerState {
         self.evidence_revision = self.evidence_revision.saturating_add(1);
     }
 
+    pub fn set_theme(&mut self, theme: ThemeCode) {
+        if self.settings.theme != theme {
+            self.settings.theme = theme;
+            self.settings.revision = self.settings.revision.saturating_add(1);
+            self.publication_revision = self.publication_revision.saturating_add(1);
+        }
+    }
+
     pub fn set_language(&mut self, language: LanguageCode) {
         if self.settings.language != language {
             self.settings.language = language;
@@ -776,12 +784,26 @@ impl ReducerState {
         action: &dji4g_domain::ActionKind,
         now: SystemTime,
     ) -> Result<(), FailureCode> {
-        self.target_identity
+        let target = self
+            .target_identity
             .as_ref()
             .filter(|value| value.is_fresh_for(self.epoch, now))
             .map(|value| &value.value)
             .filter(|value| value.is_supported())
             .ok_or_else(|| failure(ErrorCodeForStage::Missing, "app:target_not_ready"))?;
+
+        // Recognition is not write eligibility. Every modeled action except the pure refresh
+        // writes to the module or to Windows, so a recognized read-only module (the generic
+        // `2C7C:0125`) is refused here with a reason the UI can show, instead of being offered a
+        // button that `ActionPlan::try_new` would silently reject later.
+        if !matches!(action, dji4g_domain::ActionKind::Refresh)
+            && !target.allows_controlled_actions()
+        {
+            return Err(failure(
+                ErrorCodeForStage::Unsupported,
+                "app:read_only_module",
+            ));
+        }
 
         let check_ready = |id: DiagnosticCheckId| {
             matches!(self.diagnostics.get(id).state, DiagnosticCheckState::Passed)
@@ -956,9 +978,16 @@ impl ReducerState {
 
     #[must_use]
     pub fn test_ready(now: SystemTime) -> Self {
+        Self::test_ready_for(dji4g_domain::DJI_GEN1, now)
+    }
+
+    /// The same fully-ready fixture keyed to one recognized profile, so read-only modules and
+    /// write-capable modules can be exercised through the identical evidence set.
+    #[must_use]
+    pub fn test_ready_for(profile: DeviceProfile, now: SystemTime) -> Self {
         let mut state = Self::new(now);
         let epoch = DeviceEpoch(1);
-        let identity = test_identity();
+        let identity = test_identity_for(profile);
         let binding = AdapterBinding {
             target: identity.clone(),
             adapter_id: "{adapter}".into(),
@@ -968,7 +997,7 @@ impl ReducerState {
         state.device_presence = Some(evidence(
             epoch,
             EvidenceSource::Pnp,
-            DevicePresence::Supported(dji4g_domain::DJI_GEN1),
+            DevicePresence::Supported(profile),
             now,
         ));
         state.target_identity = Some(evidence(epoch, EvidenceSource::Pnp, identity, now));
@@ -1192,7 +1221,7 @@ impl ReducerState {
             // is also the reducer's only evidence that the module re-enumerated, so the timeline
             // records the reappearance here exactly once.
             self.device_removed = false;
-            self.record_timeline(now, TimelineEventKind::DeviceArrived, "设备已重新枚举");
+            self.record_timeline(now, TimelineEventKind::DeviceArrived, TimelineDetail::Kind);
             self.invalidate(epoch, EpochInvalidationReason::Advanced, now);
             return true;
         }
@@ -1275,7 +1304,11 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
             if next_epoch > next.epoch {
                 if reason == EpochInvalidationReason::PhysicalRemoval {
                     next.device_removed = true;
-                    next.record_timeline(now, TimelineEventKind::DeviceRemoved, "设备已断开");
+                    next.record_timeline(
+                        now,
+                        TimelineEventKind::DeviceRemoved,
+                        TimelineDetail::Kind,
+                    );
                 }
                 next.invalidate(next_epoch, reason, now);
             }
@@ -1367,16 +1400,15 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
                 .and_then(|evidence| evidence.value.serving_cell.as_ref())
                 .map(serving_cell_identity);
             next.apply_at(result, epoch, now);
-            let mut registration_detail = None;
+            let mut registration_change = None;
             let mut cell_changed = false;
             if let Some(cellular) = next.cellular.as_ref().map(|evidence| &evidence.value) {
                 if let Some(previous) = previous_registration {
                     if previous != cellular.registration {
-                        registration_detail = Some(format!(
-                            "注册状态：{} → {}",
-                            registration_label(previous),
-                            registration_label(cellular.registration)
-                        ));
+                        registration_change = Some(TimelineDetail::Registration {
+                            from: previous,
+                            to: cellular.registration,
+                        });
                     }
                 }
                 if let Some(current_cell) = cellular.serving_cell.as_ref() {
@@ -1387,11 +1419,11 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
                     }
                 }
             }
-            if let Some(detail) = registration_detail {
+            if let Some(detail) = registration_change {
                 next.record_timeline(now, TimelineEventKind::RegistrationChanged, detail);
             }
             if cell_changed {
-                next.record_timeline(now, TimelineEventKind::CellChanged, "服务小区已变化");
+                next.record_timeline(now, TimelineEventKind::CellChanged, TimelineDetail::Kind);
             }
             next.observe_sim_identity(now);
             next.sync_feature_context();
@@ -1414,7 +1446,7 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
                 next.record_timeline(
                     now,
                     TimelineEventKind::AdapterLinkChanged,
-                    "网卡链路状态变化",
+                    TimelineDetail::Kind,
                 );
             }
         }
@@ -1436,7 +1468,10 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
                     next.record_timeline(
                         now,
                         TimelineEventKind::DnsChanged,
-                        format!("DNS 探测：{} → {}", dns_label(previous), dns_label(current)),
+                        TimelineDetail::Dns {
+                            from: previous,
+                            to: current,
+                        },
                     );
                 }
             }
@@ -1614,7 +1649,7 @@ impl ReducerState {
                     self.record_timeline(
                         observed_at,
                         TimelineEventKind::DeviceArrived,
-                        "设备已重新枚举",
+                        TimelineDetail::Kind,
                     );
                 }
                 if self.phase != ClassificationPhase::RecentInsertion {
@@ -1670,7 +1705,7 @@ impl ReducerState {
                     self.record_timeline(
                         observed_at,
                         TimelineEventKind::DeviceRemoved,
-                        "设备已断开",
+                        TimelineDetail::Kind,
                     );
                 }
                 self.phase = ClassificationPhase::Stable;
@@ -1872,14 +1907,14 @@ impl ReducerState {
                 self.sim_fingerprint = Some(fingerprint);
                 self.sim_epoch = self.sim_epoch.saturating_add(1);
                 self.sms_store.clear();
-                self.record_timeline(now, TimelineEventKind::SimChanged, "SIM 已更换");
+                self.record_timeline(now, TimelineEventKind::SimChanged, TimelineDetail::Kind);
                 true
             }
         }
     }
 
     /// The device profile (型号 + USB 组合) currently bound, preferring the PnP-verified profile
-    /// and falling back to the validated identity's VID/PID.
+    /// and falling back to the profile the validated identity itself proves.
     fn device_profile(&self) -> Option<DeviceProfile> {
         self.device_presence
             .as_ref()
@@ -1888,11 +1923,21 @@ impl ReducerState {
                 _ => None,
             })
             .or_else(|| {
-                self.target_identity.as_ref().map(|identity| DeviceProfile {
-                    vid: identity.value.vid,
-                    pid: identity.value.pid,
-                })
+                self.target_identity
+                    .as_ref()
+                    .and_then(|identity| identity.value.profile())
             })
+    }
+
+    /// Whether the identified module is a recognized module the panel must not write to (the
+    /// generic `2C7C:0125`).
+    ///
+    /// `false` when no module profile is anchored yet, so this can only ever *refuse* a write for
+    /// a module the panel positively identified as read-only; the pre-existing "no device" and
+    /// "target not ready" refusals still apply to an unidentified port.
+    pub(crate) fn read_only_module(&self) -> bool {
+        self.device_profile()
+            .is_some_and(|profile| !profile.allows_controlled_actions())
     }
 
     /// The capability context (profile + firmware) implied by the current evidence, if any.
@@ -2016,13 +2061,7 @@ impl ReducerState {
     /// Push one observed transition onto the bounded timeline, deduplicating an exact repeat of
     /// the newest entry. Recording is publication-only: the surrounding evidence handling decides
     /// what the transition means and already owns the evidence revision.
-    fn record_timeline(
-        &mut self,
-        at: SystemTime,
-        kind: TimelineEventKind,
-        detail: impl Into<String>,
-    ) {
-        let detail = detail.into();
+    fn record_timeline(&mut self, at: SystemTime, kind: TimelineEventKind, detail: TimelineDetail) {
         if self
             .timeline
             .events()
@@ -2628,27 +2667,6 @@ fn probe_dns_status(stage: &ProbeStageDto) -> BoundDnsStatus {
     }
 }
 
-/// Closed Chinese label for one observed registration state (timeline detail only).
-fn registration_label(state: RegistrationState) -> &'static str {
-    match state {
-        RegistrationState::RegisteredHome => "已注册到本地网络",
-        RegistrationState::RegisteredRoaming => "已注册到漫游网络",
-        RegistrationState::Searching => "正在搜索",
-        RegistrationState::Denied => "注册被拒绝",
-        RegistrationState::NotRegistered => "未注册",
-        RegistrationState::Unknown => "未知",
-    }
-}
-
-/// Closed Chinese label for one bound-DNS verdict (timeline detail only).
-fn dns_label(status: BoundDnsStatus) -> &'static str {
-    match status {
-        BoundDnsStatus::Succeeded => "通过",
-        BoundDnsStatus::Failed => "失败",
-        BoundDnsStatus::Incomplete => "未完成",
-    }
-}
-
 /// The probe verdict behind one bound-DNS diagnostic check, if the check carries a terminal
 /// probe result. `Unexecuted`/`Running`/`Expired` are not verdicts, so a timeline change is never
 /// claimed against them.
@@ -2746,12 +2764,15 @@ fn evidence<T>(
     }
 }
 
-fn test_identity() -> StableDeviceIdentity {
+fn test_identity_for(profile: DeviceProfile) -> StableDeviceIdentity {
     StableDeviceIdentity {
         container_id: "{container}".into(),
-        device_instance_id: "USB\\VID_2CA3&PID_4006\\INSTANCE".into(),
-        vid: 0x2CA3,
-        pid: 0x4006,
+        device_instance_id: format!(
+            "USB\\VID_{:04X}&PID_{:04X}\\INSTANCE",
+            profile.vid, profile.pid
+        ),
+        vid: profile.vid,
+        pid: profile.pid,
     }
 }
 

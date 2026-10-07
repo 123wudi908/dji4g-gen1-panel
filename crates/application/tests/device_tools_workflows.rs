@@ -12,7 +12,7 @@ use dji4g_application::{
     ToolHistory, ToolHistoryEntry, ToolOperation, ToolOperationKind, ToolOutcome, ToolPhase,
     ToolRequest, ToolTaskSnapshot, ToolTranscript, UsbNetReading, as_at_response, extract_identity,
     extract_payload, item_deadline, parse_profile_temperature, parse_usb_net,
-    transcript_from_response,
+    transcript_from_response, urc_transcript_payload,
 };
 use dji4g_at_protocol::{
     AtCommand, AtFinalCode, SensorTemperature, ToolReadId, ToolResponse, ValidatedToolLine,
@@ -252,8 +252,14 @@ fn urcs_are_shown_but_marked_as_module_originated() {
     };
     let transcript = transcript_from_response(&response);
     assert_eq!(transcript.lines()[0], "+CSQ: 19,99");
-    assert!(transcript.lines()[1].contains("+CMTI"));
-    assert!(transcript.lines()[1].contains("模块主动上报"));
+    // The URC is marked with a transport sentinel, never with wording: the panel turns the marker
+    // into the localized label, and the module's own text stays untouched behind it.
+    assert_eq!(
+        urc_transcript_payload(&transcript.lines()[1]),
+        Some("+CMTI: \"SM\",3")
+    );
+    assert_eq!(urc_transcript_payload(&transcript.lines()[0]), None);
+    assert!(transcript.lines()[1].len() > "+CMTI: \"SM\",3".len());
 }
 
 #[test]

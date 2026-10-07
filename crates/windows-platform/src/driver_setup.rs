@@ -17,7 +17,10 @@ pub enum DriverSetupOutcome {
 }
 
 impl DriverSetupOutcome {
-    pub fn code(self) -> &'static str {
+    /// The closed token this outcome travels as on the command line (`--driver-setup-result=`).
+    /// It is an IPC token, never shown to anyone: pairing it with [`Self::code`] keeps the wire
+    /// contract and the operator-facing explanation from drifting into each other.
+    fn handoff_code(self) -> &'static str {
         match self {
             Self::Ready => "ready",
             Self::RestartRequired => "restart-required",
@@ -46,10 +49,10 @@ impl DriverSetupOutcome {
             Self::Failed,
         ]
         .into_iter()
-        .find(|outcome| outcome.code() == code)
+        .find(|outcome| outcome.handoff_code() == code)
     }
     pub fn argument(self) -> String {
-        format!("--driver-setup-result={}", self.code())
+        format!("--driver-setup-result={}", self.handoff_code())
     }
     pub fn exit_code(self) -> u32 {
         match self {
@@ -98,35 +101,20 @@ impl DriverSetupOutcome {
     pub fn allows_recheck(self) -> bool {
         matches!(self, Self::Ready | Self::NotReady | Self::Disconnected)
     }
-    pub fn message(self) -> &'static str {
+    /// Stable ASCII code of this outcome's operator-facing explanation. This crate is below the
+    /// panel and cannot see its catalog, so it hands the caller a code and the presentation layer
+    /// resolves it (`localization::stable_code_text`, `driver:*`). Never shown raw to a person.
+    pub fn code(self) -> &'static str {
         match self {
-            Self::Ready => {
-                "Windows 中的驱动接口检查已通过。面板将重新检查 USB、网卡和 AT 通信；短信及上网是否可用，请以新的检查结果为准。"
-            }
-            Self::RestartRequired => {
-                "Windows 要求重启电脑，本次还不能确认驱动可用。请先保存工作并重启电脑，再打开面板检查模块。不要重复安装。"
-            }
-            Self::RestartRequiredAfterFailure => {
-                "驱动安装的部分操作失败，且 Windows 已要求重启电脑；本次不能确认驱动可用。请保留安装日志，先保存工作并重启电脑，再打开面板检查。不要重复安装；重启后仍异常时，把日志交给技术支持。"
-            }
-            Self::Cancelled => {
-                "已取消驱动安装或 Windows 管理员授权，未开始安装。你可以继续使用面板；确实需要安装时，点击“使用内置驱动”，并在 Windows 授权窗口选择“是”。"
-            }
-            Self::UnsupportedInterface => {
-                "当前驱动包没有为某个缺驱动接口找到唯一匹配项（例如 MI_04），本次未安装任何驱动。请先通过 Windows 更新查找适配驱动，或联系 DJI 官方支持提供该模块的匹配驱动。重复安装本包不能补齐该接口。"
-            }
-            Self::NotReady => {
-                "驱动检查后仍有接口异常，暂时不能确认可用。请查看面板的新检查结果；若仍异常，打开设备管理器查看原因，并把安装日志交给技术支持。不要反复安装。"
-            }
-            Self::Disconnected => {
-                "没有检测到已连接的大疆一代模块，或模块在安装后暂时断开。请插稳支持数据传输的 USB 线，等待模块识别，再点击“重新检查”。"
-            }
-            Self::ValidationFailed => {
-                "安装资源缺失、校验未通过，或与当前 Windows 不兼容，本次未开始安装。请重新取得完整的原始驱动版程序，或联系 DJI 官方支持；不要修改驱动文件。"
-            }
-            Self::Failed => {
-                "安装未完成，不能确认设备状态。请查看本次安装日志，并在面板中重新检查；如需协助，把日志交给技术支持。"
-            }
+            Self::Ready => "driver:ready",
+            Self::RestartRequired => "driver:restart_required",
+            Self::RestartRequiredAfterFailure => "driver:restart_after_failure",
+            Self::Cancelled => "driver:cancelled",
+            Self::UnsupportedInterface => "driver:no_match",
+            Self::NotReady => "driver:interfaces_abnormal",
+            Self::Disconnected => "driver:no_module",
+            Self::ValidationFailed => "driver:payload_invalid",
+            Self::Failed => "driver:incomplete",
         }
     }
 }
@@ -149,9 +137,9 @@ pub fn open_windows_update() -> std::io::Result<()> {
         )
     } as isize;
     if result <= 32 {
-        Err(std::io::Error::other(
-            "无法打开 Windows 更新，请从系统设置中打开。",
-        ))
+        // The message of a driver-setup error is always a stable code from the `driver:`
+        // namespace; the caller resolves it through the panel's catalog.
+        Err(std::io::Error::other("driver:windows_update_failed"))
     } else {
         Ok(())
     }
@@ -198,7 +186,7 @@ pub fn reopen_panel(outcome: DriverSetupOutcome) -> std::io::Result<()> {
     if elevation.TokenIsElevated != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "安装器以管理员身份运行，请从桌面正常打开面板。",
+            "driver:admin_required",
         ));
     }
     let exe = std::env::current_exe()?.canonicalize()?;
@@ -280,7 +268,7 @@ pub fn wait_for_panel_exit(
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "等待对象不是同目录面板，未安装驱动",
+            "driver:panel_not_same_directory",
         ));
     }
     // SAFETY: handle remains valid throughout the bounded wait.
@@ -293,7 +281,7 @@ pub fn wait_for_panel_exit(
         WAIT_OBJECT_0 => Ok(()),
         WAIT_TIMEOUT => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            "面板未能在 30 秒内退出，未安装驱动。请退出托盘中的面板后重试。",
+            "driver:panel_exit_timeout",
         )),
         _ => Err(std::io::Error::last_os_error()),
     }
@@ -442,7 +430,7 @@ mod outcome_tests {
                 DriverSetupOutcome::from_exit_code(outcome.exit_code()),
                 outcome
             );
-            assert!(!outcome.message().is_empty());
+            assert!(outcome.code().starts_with("driver:"));
         }
         for arg in [
             "ready",
@@ -551,6 +539,5 @@ fn partial_failure_with_restart_has_distinct_failed_process_marker() {
         DriverSetupOutcome::Failed
     );
     assert!(!outcome.allows_recheck());
-    assert!(outcome.message().contains("部分操作失败"));
-    assert!(outcome.message().contains("重启"));
+    assert_eq!(outcome.code(), "driver:restart_after_failure");
 }

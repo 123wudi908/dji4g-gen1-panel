@@ -239,7 +239,7 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
                 text(TextKey::FieldProblemCode),
                 device
                     .problem_code
-                    .map_or_else(&not_available, |code| code.to_string())
+                    .map_or_else(not_available, |code| code.to_string())
             ));
             report.push_str(&format!(
                 "{}：{}\n",
@@ -298,7 +298,7 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
                 text(TextKey::FieldSignal),
                 cellular
                     .signal_rssi_dbm
-                    .map_or_else(&not_available, |rssi| format!("{rssi} dBm"))
+                    .map_or_else(not_available, |rssi| format!("{rssi} dBm"))
             ));
             report.push_str(&format!(
                 "{}：{}\n",
@@ -307,7 +307,7 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
                     .apn
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
-                    .map_or_else(&not_available, |_| REDACTED_APN.to_owned())
+                    .map_or_else(not_available, |_| REDACTED_APN.to_owned())
             ));
             report.push_str(&format!(
                 "{}：{}\n",
@@ -427,7 +427,7 @@ fn build_human(snapshot: &ControllerSnapshot, now: SystemTime) -> String {
         snapshot
             .sms_inbox
             .capacity
-            .map_or_else(&not_available, |(used, total)| {
+            .map_or_else(not_available, |(used, total)| {
                 format_text_in(
                     language,
                     TextKey::SmsCapacityUsed,

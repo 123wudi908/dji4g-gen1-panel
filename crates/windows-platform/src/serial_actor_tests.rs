@@ -36,6 +36,7 @@ struct BlockingState {
     writes: Vec<Vec<u8>>,
     reads: VecDeque<Vec<u8>>,
     released: bool,
+    blocking_io: bool,
 }
 
 struct BlockingSerial(Arc<(Mutex<BlockingState>, Condvar)>);
@@ -1064,6 +1065,8 @@ impl SerialIo for DeleteBlockingSerial {
         state.writes.push(bytes.to_vec());
         changed.notify_all();
         if state.writes.len() == 8 && self.block_write {
+            state.blocking_io = true;
+            changed.notify_all();
             let _state = changed.wait_while(state, |state| !state.released).unwrap();
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -1073,6 +1076,8 @@ impl SerialIo for DeleteBlockingSerial {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().unwrap();
         if state.writes.len() == 8 {
+            state.blocking_io = true;
+            changed.notify_all();
             let _state = changed.wait_while(state, |state| !state.released).unwrap();
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -1102,15 +1107,25 @@ fn checked_delete_cancel_and_deadline_reach_actual_delete_read_and_write() {
                 }),
             );
             let control = dji4g_domain::SmsDeleteControl::new(if explicit_cancel {
-                Duration::from_secs(2)
+                Duration::from_secs(5)
             } else {
-                Duration::from_millis(100)
+                // Allow the worker to complete preflight under parallel CI load.
+                Duration::from_secs(2)
             });
             let canceller = if explicit_cancel {
                 let control = control.clone();
                 let state = state.clone();
                 Some(thread::spawn(move || {
-                    wait_for_writes(&state, 8);
+                    // Seeing CMGD written does not imply its response read has started.
+                    // Cancelling in that gap may be handled by the worker without native I/O.
+                    let (lock, changed) = &*state;
+                    let (blocked, timeout) = changed
+                        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(2), |state| {
+                            !state.blocking_io
+                        })
+                        .unwrap();
+                    assert!(!timeout.timed_out(), "delete I/O did not start blocking");
+                    drop(blocked);
                     control.cancel();
                 }))
             } else {
@@ -1128,7 +1143,11 @@ fn checked_delete_cancel_and_deadline_reach_actual_delete_read_and_write() {
             assert!(control.delete_attempted());
             assert!(
                 state.0.lock().unwrap().released,
-                "native cancellation handle was not invoked"
+                "native cancellation handle was not invoked: block_write={block_write}, explicit_cancel={explicit_cancel}"
+            );
+            assert!(
+                state.0.lock().unwrap().blocking_io,
+                "test must reach blocked delete I/O: block_write={block_write}, explicit_cancel={explicit_cancel}"
             );
             assert_eq!(state.0.lock().unwrap().writes.len(), 8);
         }

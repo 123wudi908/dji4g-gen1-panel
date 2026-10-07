@@ -151,11 +151,12 @@ jobs:
           $assets = Get-ChildItem dist -File | Where-Object { $_.Extension -in '.zip', '.msix', '.sha256', '.json' } | ForEach-Object { $_.FullName }
           gh release view $tag --repo '${{ github.repository }}' --json tagName *> $null
           if ($LASTEXITCODE -eq 0) {
-            # Permit packaging/documentation corrections without rewriting a published source tag.
+            # Permit packaging/documentation corrections and the named cfg(test)-only module.
+            # The serial_actor_tests module cannot enter the release binary; production paths remain blocked.
             # Runtime or dependency changes must increment the product version instead.
             $compareEndpoint = "repos/${{ github.repository }}/compare/$tag...${{ github.sha }}"
             $changed = @(gh api $compareEndpoint --jq '.files[].filename')
-            if ($LASTEXITCODE -ne 0 -or $changed.Count -ge 300 -or ($changed | Where-Object { $_ -notmatch '^(packaging/|docs/|README\.md$|\.github/workflows/ci\.yml$)' })) {
+            if ($LASTEXITCODE -ne 0 -or $changed.Count -ge 300 -or ($changed | Where-Object { $_ -notmatch '^(packaging/|docs/|README\.md$|\.github/workflows/ci\.yml$|crates/windows-platform/src/serial_actor_tests\.rs$)' })) {
               throw 'Existing release permits only packaging/documentation corrections; bump version for runtime changes'
             }
             gh release upload $tag @assets --repo '${{ github.repository }}' --clobber

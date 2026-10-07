@@ -168,10 +168,6 @@ cargo build --release --locked --target x86_64-pc-windows-msvc -p dji4g-panel -p
 
 依赖已缓存时可加 `--offline`。GitHub Actions 在通过检查后构建、校验便携 ZIP 与未签名 MSIX，并发布版本下载。
 
-## 关联项目
-
-[个人控制中心](control-center/README.md)是独立程序，可只读查看模块状态并控制特定拯救者性能模式。它与本面板不共享代码或配置，也不需要同时安装。
-
 ## 范围与许可
 
 目前面向第一代支持列表内的模块及 Windows x64。公开包不附带厂商驱动；不包含二代支持、固件升级、无限制 AT 命令终端或自动短信重发。

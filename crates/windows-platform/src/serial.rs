@@ -875,15 +875,20 @@ impl AtSessionActor {
         if !self.state.is_running() {
             return Err(self.state.terminal_error());
         }
-        let admitted = self
-            .state
-            .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < REQUEST_QUEUE_CAPACITY).then_some(current + 1)
-            })
-            .is_ok();
-        if !admitted {
-            return Err(ActorError::QueueFull);
+        let mut current = self.state.outstanding.load(Ordering::Acquire);
+        loop {
+            if current >= REQUEST_QUEUE_CAPACITY {
+                return Err(ActorError::QueueFull);
+            }
+            match self.state.outstanding.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         let request = make_request(Arc::clone(&self.state));
         match self.sender.try_send(request) {

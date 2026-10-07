@@ -64,11 +64,18 @@ impl FakeClock {
 
     pub fn set_wall_backwards(&self, by: Duration) {
         let millis = by.as_millis().min(u128::from(u64::MAX)) as u64;
-        let _ = self
-            .wall_millis
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                Some(value.saturating_sub(millis))
-            });
+        let mut current = self.wall_millis.load(Ordering::SeqCst);
+        loop {
+            match self.wall_millis.compare_exchange_weak(
+                current,
+                current.saturating_sub(millis),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn advance_mono(&self, by: Duration) {

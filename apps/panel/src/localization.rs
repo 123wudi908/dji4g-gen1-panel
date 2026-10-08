@@ -713,6 +713,23 @@ pub enum TextKey {
     ConfirmProbeNote,
     AboutWindowTitle,
     GitHubProject,
+    UpdateAvailable,
+    UpdateTitle,
+    UpdateDownloading,
+    UpdateProgress,
+    UpdateVerifying,
+    UpdateReady,
+    UpdatePreparing,
+    UpdateInstallRestart,
+    UpdateRetry,
+    UpdateBusy,
+    UpdateRestartHint,
+    UpdateFailedNetwork,
+    UpdateFailedChecksum,
+    UpdateFailedIntegrity,
+    UpdateFailedUpdater,
+    UpdateUnsupported,
+    UpdateRecoveryNotice,
     HostPreparingPlan,
     HostBackingUp,
     HostRestoring,
@@ -1985,6 +2002,23 @@ impl TextKey {
         Self::ConfirmProbeNote,
         Self::AboutWindowTitle,
         Self::GitHubProject,
+        Self::UpdateAvailable,
+        Self::UpdateTitle,
+        Self::UpdateDownloading,
+        Self::UpdateProgress,
+        Self::UpdateVerifying,
+        Self::UpdateReady,
+        Self::UpdatePreparing,
+        Self::UpdateInstallRestart,
+        Self::UpdateRetry,
+        Self::UpdateBusy,
+        Self::UpdateRestartHint,
+        Self::UpdateFailedNetwork,
+        Self::UpdateFailedChecksum,
+        Self::UpdateFailedIntegrity,
+        Self::UpdateFailedUpdater,
+        Self::UpdateUnsupported,
+        Self::UpdateRecoveryNotice,
         Self::HostPreparingPlan,
         Self::HostBackingUp,
         Self::HostRestoring,
@@ -3641,6 +3675,23 @@ fn zh_cn(key: TextKey) -> &'static str {
         }
         TextKey::AboutWindowTitle => "关于 {}",
         TextKey::GitHubProject => "GitHub 项目仓库",
+        TextKey::UpdateAvailable => "发现新版本 v{}",
+        TextKey::UpdateTitle => "软件更新",
+        TextKey::UpdateDownloading => "正在下载",
+        TextKey::UpdateProgress => "已下载 {} / {}",
+        TextKey::UpdateVerifying => "正在校验更新包",
+        TextKey::UpdateReady => "更新包校验通过，可以安装。",
+        TextKey::UpdatePreparing => "正在准备更新，请稍候。",
+        TextKey::UpdateInstallRestart => "安装并重启",
+        TextKey::UpdateRetry => "重新下载",
+        TextKey::UpdateBusy => "请等待当前操作结束后再安装。",
+        TextKey::UpdateRestartHint => "安装时软件会退出，完成后自动重启。",
+        TextKey::UpdateFailedNetwork => "更新下载失败，请检查网络后重试。",
+        TextKey::UpdateFailedChecksum => "无法取得有效的 SHA-256 校验值，禁止安装。",
+        TextKey::UpdateFailedIntegrity => "更新包校验失败，已删除无效临时包，禁止安装。",
+        TextKey::UpdateFailedUpdater => "更新程序无法启动或准备失败，当前软件继续运行。",
+        TextKey::UpdateUnsupported => "当前目录不支持原地更新，请使用正式 portable 包。",
+        TextKey::UpdateRecoveryNotice => "更新未完成，已重新启动旧版软件。原有文件仍然保留。",
         TextKey::HostPreparingPlan => "正在准备修复方案…",
         TextKey::HostBackingUp => "正在备份并修复代理配置…",
         TextKey::HostRestoring => "正在恢复原配置…",
@@ -5203,6 +5254,23 @@ fn zh_tw(key: TextKey) -> &'static str {
         }
         TextKey::AboutWindowTitle => "關於 {}",
         TextKey::GitHubProject => "GitHub 專案儲存庫",
+        TextKey::UpdateAvailable => "發現新版本 v{}",
+        TextKey::UpdateTitle => "軟體更新",
+        TextKey::UpdateDownloading => "正在下載",
+        TextKey::UpdateProgress => "已下載 {} / {}",
+        TextKey::UpdateVerifying => "正在驗證更新套件",
+        TextKey::UpdateReady => "更新套件驗證通過，可以安裝。",
+        TextKey::UpdatePreparing => "正在準備更新，請稍候。",
+        TextKey::UpdateInstallRestart => "安裝並重新啟動",
+        TextKey::UpdateRetry => "重新下載",
+        TextKey::UpdateBusy => "請等待目前操作結束後再安裝。",
+        TextKey::UpdateRestartHint => "安裝時軟體會退出，完成後自動重新啟動。",
+        TextKey::UpdateFailedNetwork => "更新下載失敗，請檢查網路後重試。",
+        TextKey::UpdateFailedChecksum => "無法取得有效的 SHA-256 驗證值，禁止安裝。",
+        TextKey::UpdateFailedIntegrity => "更新套件驗證失敗，已刪除無效暫存套件，禁止安裝。",
+        TextKey::UpdateFailedUpdater => "更新程式無法啟動或準備失敗，目前軟體繼續執行。",
+        TextKey::UpdateUnsupported => "目前目錄不支援原地更新，請使用正式 portable 套件。",
+        TextKey::UpdateRecoveryNotice => "更新未完成，已重新啟動舊版軟體。原有檔案仍然保留。",
         TextKey::HostPreparingPlan => "正在準備修復方案…",
         TextKey::HostBackingUp => "正在備份並修復代理配置…",
         TextKey::HostRestoring => "正在恢復原配置…",
@@ -6989,6 +7057,35 @@ fn en_us(key: TextKey) -> &'static str {
         }
         TextKey::AboutWindowTitle => "About {}",
         TextKey::GitHubProject => "GitHub project repository",
+        TextKey::UpdateAvailable => "New version v{} available",
+        TextKey::UpdateTitle => "Software update",
+        TextKey::UpdateDownloading => "Downloading",
+        TextKey::UpdateProgress => "Downloaded {} / {}",
+        TextKey::UpdateVerifying => "Verifying update package",
+        TextKey::UpdateReady => "Update verified and ready to install.",
+        TextKey::UpdatePreparing => "Preparing update. Please wait.",
+        TextKey::UpdateInstallRestart => "Install and restart",
+        TextKey::UpdateRetry => "Download again",
+        TextKey::UpdateBusy => "Wait for the current operation to finish before installing.",
+        TextKey::UpdateRestartHint => {
+            "The app exits during installation and restarts when it is complete."
+        }
+        TextKey::UpdateFailedNetwork => "Update download failed. Check your connection and retry.",
+        TextKey::UpdateFailedChecksum => {
+            "A valid SHA-256 checksum is unavailable. Installation is blocked."
+        }
+        TextKey::UpdateFailedIntegrity => {
+            "Update verification failed. The invalid temporary package was deleted. Installation is blocked."
+        }
+        TextKey::UpdateFailedUpdater => {
+            "The updater could not start or prepare. The current app remains running."
+        }
+        TextKey::UpdateUnsupported => {
+            "This directory cannot update in place. Use the official portable package."
+        }
+        TextKey::UpdateRecoveryNotice => {
+            "The update did not complete. The old app has restarted and its original files are preserved."
+        }
         TextKey::HostPreparingPlan => "Preparing the repair plan…",
         TextKey::HostBackingUp => "Backing up and repairing proxy configuration…",
         TextKey::HostRestoring => "Restoring the original configuration…",
@@ -8955,5 +9052,5 @@ fn english_catalog_has_no_chinese_leftovers() {
 /// a key missing from it would escape all of them. Bump this number with the key.
 #[test]
 fn the_key_list_covers_the_enum() {
-    assert_eq!(TextKey::ALL.len(), 1266);
+    assert_eq!(TextKey::ALL.len(), 1283);
 }

@@ -109,6 +109,10 @@ jobs:
           shared-key: windows-x64
 
       # Validates the packaging plan and asset generation without needing the Windows SDK.
+      - name: portable updater packaging regression
+        shell: pwsh
+        run: ./packaging/tests/portable-update.ps1
+
       - name: build-msix dry-run test
         shell: pwsh
         run: ./packaging/tests/build-msix-dry-run.ps1
@@ -134,6 +138,9 @@ jobs:
             dist/*.sha256
             dist/release-manifest.json
           if-no-files-found: error
+
+      - name: build portable updater
+        run: cargo build --locked --release --target ${{ env.TARGET }} -p dji4g-updater
 
       - name: build and verify portable ZIP
         shell: pwsh

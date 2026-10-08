@@ -23,3 +23,5 @@ pub mod ui;
 
 #[cfg(debug_assertions)]
 pub mod demo;
+
+pub mod update;

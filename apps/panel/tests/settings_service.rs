@@ -501,3 +501,44 @@ fn themes_use_the_existing_save_service_and_report_failure() {
         }
     }
 }
+
+#[test]
+fn theme_changes_during_autostart_drift_preserve_intent_without_registry_writes() {
+    use dji4g_application::ThemeCode;
+    for intent in [false, true] {
+        for result in [Ok(()), Err(ConfigError::new("config:write_failed"))] {
+            let mut h = harness(result.clone(), Ok(AutostartObservedState::Disabled));
+            h.app.configure_onboarding(&ConfigV1 {
+                onboarding_completed: true,
+                sms_archive_enabled: true,
+                theme: ThemeCode::Dark,
+                autostart: intent,
+                ..ConfigV1::default()
+            });
+            let mut snapshot = (*initial_snapshot()).clone();
+            snapshot.settings.autostart = AutostartStatus::Ready(AutostartKnownState::Drift);
+            snapshot.settings.theme = ThemeCode::Light;
+            snapshot.settings.revision = 1;
+            snapshot.settings.persistence = SettingsPersistenceState::Saving;
+            h.snapshot_tx.send(Arc::new(snapshot.clone())).unwrap();
+            h.app.receive_latest_nonblocking(&h.context);
+            h.snapshot_tx.send(Arc::new(snapshot)).unwrap();
+            h.app.receive_latest_nonblocking(&h.context);
+            let saves = h.calls.saves.lock().unwrap();
+            assert_eq!(
+                saves.len(),
+                1,
+                "drift must not block or duplicate theme saves"
+            );
+            assert_eq!(saves[0].theme, ThemeCode::Light);
+            assert_eq!(saves[0].autostart, intent);
+            assert!(saves[0].onboarding_completed);
+            assert!(saves[0].sms_archive_enabled);
+            assert!(h.calls.toggles.lock().unwrap().is_empty());
+            let outcomes = save_outcomes(&recorded_commands(&h.sink));
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].result.is_ok(), result.is_ok());
+            assert!(autostart_outcomes(&recorded_commands(&h.sink)).is_empty());
+        }
+    }
+}

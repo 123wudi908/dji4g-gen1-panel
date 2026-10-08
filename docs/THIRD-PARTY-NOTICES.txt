@@ -339,3 +339,13 @@ DEALINGS IN THE SOFTWARE.
 
 GitHub mark: https://github.com/logos
 GitHub is a registered trademark of GitHub, Inc. Used only to link to this project repository.
+
+IN-APP UPDATER DEPENDENCIES (0.1.14)
+reqwest 0.12: MIT OR Apache-2.0; https://github.com/seanmonstar/reqwest
+semver 1: MIT OR Apache-2.0; https://github.com/dtolnay/semver
+tempfile 3: MIT OR Apache-2.0; https://github.com/Stebalien/tempfile
+sha2 0.10: MIT OR Apache-2.0; https://github.com/RustCrypto/hashes
+zip 6: MIT; https://github.com/zip-rs/zip2
+windows-sys 0.61: MIT OR Apache-2.0; https://github.com/microsoft/windows-rs
+serde / serde_json: MIT OR Apache-2.0; https://github.com/serde-rs/serde
+Additional transitive dependencies and license evidence are recorded in docs/UPDATE_REVIEW_0.1.14.md.

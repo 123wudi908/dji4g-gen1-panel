@@ -434,6 +434,9 @@ pub struct PanelApp {
     /// registered with the tray backend on attach, so the native worker can restore/show/
     /// foreground the window itself while it is hidden and `update()` never runs.
     panel_hwnd: Option<isize>,
+    /// Last native theme request, including failed/unsupported attempts, so an idle UI does
+    /// not keep calling DWM. The handle is part of the key for late window wiring.
+    native_titlebar_theme: Option<(isize, bool)>,
     single_instance: Option<SingleInstance>,
     /// Panel-owned settings side effects; `None` when the config paths or the autostart control
     /// are unavailable (or in a demo session), in which case pending writes fail with a stable
@@ -461,9 +464,51 @@ pub struct PanelApp {
     /// Optional-feature probe record shared with the production AT port; the overview correlates
     /// it against the current snapshot before showing any status text (demo/headless: `None`).
     feature_probe: Option<Arc<Mutex<crate::feature_probe::FeatureProbeState>>>,
+    updates: crate::update::UpdateService,
+    update_window_open: bool,
+    update_exit_pending: bool,
+    update_startup_marker: Option<PathBuf>,
 }
 
 impl PanelApp {
+    /// Optional update work is detached from the device controller and demo/headless launches.
+    pub fn configure_updates(&mut self, ctx: &egui::Context) {
+        self.updates.start(ctx);
+    }
+    pub fn configure_update_startup_marker(&mut self, marker: Option<PathBuf>) {
+        self.update_startup_marker = marker;
+    }
+    fn update_install_idle(&self) -> bool {
+        !self.serial_work_busy()
+            && !self.dialog_busy.load(Ordering::Acquire)
+            && !self.support_report.busy()
+            && !crate::ui::driver_setup::installation_busy(&self.snapshot)
+            && !self
+                .snapshot
+                .operation
+                .as_ref()
+                .is_some_and(|op| !matches!(op.state, OperationState::Finished { .. }))
+    }
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if self.window.explicit_exit {
+            self.updates.poll();
+        } else {
+            self.updates.tick(ctx);
+        }
+        if self.update_exit_pending && !self.updates.handoff_active() {
+            self.window.explicit_exit = false;
+            self.update_exit_pending = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_window(ctx);
+        }
+        if self.update_install_idle() && self.updates.take_handoff() {
+            self.update_exit_pending = true;
+            self.window.explicit_exit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // Archive drain in render_ui defers tray exit until local I/O is complete.
+        }
+    }
+
     /// Call only for the production launch after loading its persisted configuration.
     /// Demo/headless constructors deliberately leave onboarding hidden.
     pub fn configure_onboarding(&mut self, config: &ConfigV1) {
@@ -695,6 +740,12 @@ impl PanelApp {
         };
         let snapshot = inputs.snapshot_rx.borrow();
         crate::ui::apply_settings_theme(&cc.egui_ctx, snapshot.settings.theme);
+        let panel_hwnd = panel_window_handle();
+        let native_titlebar_theme = panel_hwnd.map(|hwnd| {
+            let dark = cc.egui_ctx.style().visuals.dark_mode;
+            let _ = dji4g_windows_platform::window_theme::set_titlebar_dark_mode(hwnd, dark);
+            (hwnd, dark)
+        });
         let language = language_from_code(snapshot.settings.language);
         let persisted_revision = snapshot.settings.revision;
         let command_error = Arc::new(Mutex::new(None));
@@ -739,7 +790,8 @@ impl PanelApp {
             last_temperature_sample: None,
             notifier: AvailabilityNotifier::default(),
             tray_wake_installed: false,
-            panel_hwnd: panel_window_handle(),
+            panel_hwnd,
+            native_titlebar_theme,
             single_instance: None,
             settings_backend: inputs.settings_backend,
             persisted_revision,
@@ -750,6 +802,10 @@ impl PanelApp {
             dialog_busy: Arc::new(AtomicBool::new(false)),
             dialoged_result: None,
             feature_probe: inputs.feature_probe,
+            updates: Default::default(),
+            update_window_open: false,
+            update_exit_pending: false,
+            update_startup_marker: None,
         }
     }
 
@@ -803,6 +859,7 @@ impl PanelApp {
             notifier: AvailabilityNotifier::default(),
             tray_wake_installed: false,
             panel_hwnd: None,
+            native_titlebar_theme: None,
             single_instance: None,
             settings_backend: inputs.settings_backend,
             persisted_revision,
@@ -813,6 +870,10 @@ impl PanelApp {
             dialog_busy: Arc::new(AtomicBool::new(false)),
             dialoged_result: None,
             feature_probe: inputs.feature_probe,
+            updates: Default::default(),
+            update_window_open: false,
+            update_exit_pending: false,
+            update_startup_marker: None,
         }
     }
 
@@ -843,6 +904,7 @@ impl PanelApp {
     /// construction. Must be set before `attach_tray` for the registration to reach the backend.
     pub fn set_panel_window(&mut self, hwnd: Option<isize>) {
         self.panel_hwnd = hwnd;
+        self.native_titlebar_theme = None;
     }
 
     /// Wiring seam for tests: attach a native dialog backend (recording fakes in tests). The
@@ -1342,7 +1404,20 @@ impl PanelApp {
         let revision = self.snapshot.settings.revision;
         let save_due = revision != self.persisted_revision;
         let config = if save_due {
-            ConfigV1::from_settings(&self.snapshot.settings)
+            let mut settings = self.snapshot.settings.clone();
+            if matches!(
+                settings.autostart,
+                AutostartStatus::Ready(AutostartKnownState::Drift)
+            ) {
+                // A moved Portable can still save UI preferences. Preserve its loaded intent
+                // without changing the drift observation or writing the registry.
+                settings.autostart = AutostartStatus::Ready(if self.loaded_config.autostart {
+                    AutostartKnownState::Enabled
+                } else {
+                    AutostartKnownState::Disabled
+                });
+            }
+            ConfigV1::from_settings(&settings)
         } else {
             None
         };
@@ -1440,9 +1515,23 @@ impl PanelApp {
     }
 
     pub fn render(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.render_ui(ctx);
+        if !self.render_update_wait(ctx) {
+            self.render_ui(ctx);
+        }
     }
-
+    fn render_update_wait(&self, ctx: &egui::Context) -> bool {
+        if !self.window.explicit_exit
+            && matches!(self.updates.state(), crate::update::UpdateState::Installing)
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label(t(self.language, TextKey::UpdatePreparing));
+                ui.spinner();
+            });
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return true;
+        }
+        false
+    }
     /// Render the same UI without requiring a native window; callers supply their own input.
     #[cfg(debug_assertions)]
     pub fn set_review_histories(
@@ -1461,6 +1550,15 @@ impl PanelApp {
 
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         crate::ui::apply_settings_theme(ctx, self.snapshot.settings.theme);
+        if let Some(hwnd) = self.panel_hwnd {
+            // Use the resolved egui theme, including System, rather than a separate theme
+            // choice. Run on the UI thread after applying the latest settings snapshot.
+            let dark = ctx.style().visuals.dark_mode;
+            if self.native_titlebar_theme != Some((hwnd, dark)) {
+                let _ = dji4g_windows_platform::window_theme::set_titlebar_dark_mode(hwnd, dark);
+                self.native_titlebar_theme = Some((hwnd, dark));
+            }
+        }
         self.sms_compose.observe_snapshot(&self.snapshot);
         self.support_report.poll();
         if let Some(archive) = &mut self.archive {
@@ -1490,6 +1588,11 @@ impl PanelApp {
                 });
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
+                if self.update_exit_pending {
+                    if let Some(tray) = self.tray.as_mut() {
+                        tray.acknowledge_exit();
+                    }
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             return;
@@ -1686,6 +1789,13 @@ impl PanelApp {
                                 self.send(UiCommand::Refresh);
                             }
                             crate::ui::icons::github_project(ui, self.language);
+                            // This row runs right-to-left: the next control is GitHub's left neighbour.
+                            if crate::ui::update::indicator(ui, self.updates.state(), self.language)
+                                .is_some_and(|response| response.clicked())
+                            {
+                                self.update_window_open = true;
+                                self.updates.request_download(ctx);
+                            }
                         });
                     });
                     if compact_header {
@@ -2238,6 +2348,7 @@ impl eframe::App for PanelApp {
         // change made on the settings page, take effect without restarting the panel.
         self.poll_shell_events(ctx);
         self.receive_latest_nonblocking(ctx);
+        self.poll_updates(ctx);
         self.handle_close_request(ctx);
         // Drive native dialogs every frame (not only on snapshot change): a worker may have
         // just finished a box and cleared the busy flag without a state change yet.
@@ -2245,6 +2356,24 @@ impl eframe::App for PanelApp {
         self.sample_rates_on_cadence(SystemTime::now());
         self.sample_temperature_on_observation();
         self.render(ctx, frame);
+        let can_install = self.update_install_idle();
+        match crate::ui::update::progress_window(
+            ctx,
+            self.updates.state(),
+            self.language,
+            &mut self.update_window_open,
+            can_install,
+        ) {
+            crate::ui::update::Action::Download => self.updates.request_download(ctx),
+            crate::ui::update::Action::Install if can_install => self.updates.request_install(ctx),
+            _ => {}
+        }
+        // The first frame has completed successfully; acknowledgement disk I/O stays on a worker.
+        if let Some(marker) = self.update_startup_marker.take() {
+            let _ = std::thread::Builder::new()
+                .name("dji4g-update-startup-ack".into())
+                .spawn(move || crate::update::acknowledge_startup(marker));
+        }
     }
 }
 
@@ -3075,5 +3204,54 @@ mod tests {
         let count = pages.len();
         pages.dedup();
         assert_eq!(pages.len(), count, "each page appears exactly once");
+    }
+}
+
+#[cfg(test)]
+mod update_shutdown_tests {
+    use super::*;
+    use dji4g_application::ReducerState;
+    struct Sink;
+    impl UiCommandSink for Sink {
+        fn try_send(&self, _: UiCommand) -> Result<(), ApplicationUiSendError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn installing_does_not_bypass_explicit_exit_archive_drain() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
+        let mut app = PanelApp::from_snapshot(snapshot, Arc::new(Sink));
+        app.configure_archive(root.path().join("archive.dat"), true);
+        let (updates, _) = crate::update::test_driver(crate::update::UpdateState::Installing);
+        app.updates = updates;
+        app.window.explicit_exit = true;
+        let output = ctx.run(Default::default(), |ctx| {
+            assert!(
+                !app.render_update_wait(ctx),
+                "update spinner must yield to safe archive shutdown"
+            );
+            app.render_ui(ctx);
+        });
+        let mut closed = output
+            .viewport_output
+            .values()
+            .any(|v| v.commands.contains(&egui::ViewportCommand::Close));
+        for _ in 0..100 {
+            if closed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            let output = ctx.run(Default::default(), |ctx| app.render_ui(ctx));
+            closed = output
+                .viewport_output
+                .values()
+                .any(|v| v.commands.contains(&egui::ViewportCommand::Close));
+        }
+        assert!(
+            closed,
+            "close is reissued after the archive worker finishes"
+        );
     }
 }

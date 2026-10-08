@@ -10,7 +10,7 @@ $archive = Join-Path $output $archiveName
 if (Test-Path -LiteralPath $archive) { throw 'Portable archive already exists; use a fresh output directory.' }
 $staging = Join-Path $output ('portable-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging | Out-Null
-foreach ($name in @('dji4g-panel.exe','dji4g-helper.exe')) {
+foreach ($name in @('dji4g-panel.exe','dji4g-helper.exe','dji4g-updater.exe')) {
     $binary = Join-Path $binaryRoot $name
     if (!(Test-Path -LiteralPath $binary)) { throw "Missing release binary: $name" }
     Copy-Item -LiteralPath $binary -Destination $staging

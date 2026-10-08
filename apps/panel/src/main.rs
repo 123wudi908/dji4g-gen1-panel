@@ -39,6 +39,15 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../assets/brand/icon.png");
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let update_failed = args.iter().any(|arg| arg == "--update-failed");
+    let args = args
+        .into_iter()
+        .filter(|arg| arg != "--update-failed")
+        .collect();
+    let (args, update_startup_marker) = match dji4g_panel::update::split_startup_marker(args) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
     let startup = match StartupOptions::parse(args.clone()) {
         Ok(value) => value,
         Err(error) => {
@@ -322,7 +331,12 @@ fn main() {
         native_options,
         Box::new(move |cc| {
             let mut app = PanelApp::new(inputs, cc);
+            app.configure_update_startup_marker(update_startup_marker);
+            if update_failed {
+                app.set_notice(TextKey::UpdateRecoveryNotice);
+            }
             if configure_first_run {
+                app.configure_updates(&cc.egui_ctx);
                 app.configure_onboarding(&config);
                 if let Some(paths) = &paths {
                     app.configure_archive(

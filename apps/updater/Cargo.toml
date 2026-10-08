@@ -1,0 +1,17 @@
+[package]
+name = "dji4g-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+zip = { version = "6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }

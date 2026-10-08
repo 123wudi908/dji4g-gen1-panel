@@ -21,6 +21,7 @@ pub mod sms_archive_crypto;
 mod sms_history;
 pub use sms_history::sms_list_controlled;
 pub mod tray;
+pub mod window_theme;
 
 pub use adapter::*;
 
